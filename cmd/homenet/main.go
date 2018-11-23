@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -40,11 +41,16 @@ func main() {
 		apiOptions = append(apiOptions, api.OptSetLoggerDebug(&debugLogger{}))
 	}
 
+	networkID := config.Get().NetworkID
 	passwordHashHash := string(helpers.Hash([]byte(config.Get().PasswordHash)))
 	homenetServer := api.New(config.Get().ArbitrURL, passwordHashHash, apiOptions...)
-	status, net, err := homenetServer.GetNet(config.Get().NetworkID)
-	if status == http.StatusNotFound {
-		status, net, err = homenetServer.RegisterNet(config.Get().NetworkID)
+	status, net, err := homenetServer.GetNet(networkID)
+	switch status {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		status, net, err = homenetServer.RegisterNet(networkID)
+	default:
+		panic(fmt.Errorf("received an unexpected HTTP status code from the arbitr: %v", status))
 	}
 	fatalIf(err)
 
