@@ -8,14 +8,10 @@ import (
 	"github.com/Sirupsen/logrus"
 	"github.com/denisbrodbeck/machineid"
 
+	"github.com/xaionaro-go/homenet-peer/config"
 	"github.com/xaionaro-go/homenet-peer/helpers"
 	"github.com/xaionaro-go/homenet-peer/vpn"
 	"github.com/xaionaro-go/homenet-server/api"
-)
-
-const (
-	defaultArbitr         = "https://homenet.dx.center/"
-	networkUpdateInterval = time.Second * 10
 )
 
 func fatalIf(err error) {
@@ -24,21 +20,31 @@ func fatalIf(err error) {
 	}
 }
 
-func main() {
-	networkID := os.Getenv("HOMENET_PEER_NETWORK_ID")
+type debugLogger struct{}
 
+func (l *debugLogger) Printf(fmt string, args ...interface{}) {
+	logrus.Debugf(fmt, args...)
+}
+
+func (l *debugLogger) Print(args ...interface{}) {
+	logrus.Debug(args...)
+}
+
+func main() {
 	homenet, err := vpn.New()
 	fatalIf(err)
 
-	arbitr := os.Getenv("HOMENET_ARBITR_URL")
-	if arbitr == "" {
-		arbitr = defaultArbitr
+	var apiOptions api.Options
+	if config.Get().DumpAPICommunications {
+		logrus.SetLevel(logrus.DebugLevel)
+		apiOptions = append(apiOptions, api.OptSetLoggerDebug(&debugLogger{}))
 	}
 
-	homenetServer := api.New(arbitr, string(helpers.Hash([]byte(os.Getenv("HOMENET_PEER_PASSWORDHASH")))))
-	status, net, err := homenetServer.GetNet(networkID)
+	passwordHashHash := string(helpers.Hash([]byte(config.Get().PasswordHash)))
+	homenetServer := api.New(config.Get().ArbitrURL, passwordHashHash, apiOptions...)
+	status, net, err := homenetServer.GetNet(config.Get().NetworkID)
 	if status == http.StatusNotFound {
-		status, net, err = homenetServer.RegisterNet(os.Getenv("HOMENET_PEER_NETWORK_ID"))
+		status, net, err = homenetServer.RegisterNet(config.Get().NetworkID)
 	}
 	fatalIf(err)
 
@@ -59,7 +65,7 @@ func main() {
 	fatalIf(err)
 	fatalIf(homenet.UpdatePeers(peers))
 
-	ticker := time.NewTicker(networkUpdateInterval)
+	ticker := time.NewTicker(config.Get().NetworkUpdateInterval)
 	for {
 		<-ticker.C
 		_, _, err = homenetServer.RegisterPeer(net.GetID(), homenet.GetPeerID(), peerName)
