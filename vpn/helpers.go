@@ -5,7 +5,14 @@ import (
 )
 
 func fatalIf(err error) {
-	if err != nil {
-		logrus.Fatalf("%v", err)
+	if err == nil {
+		return
 	}
+	logrus.Fatalf("%v", err)
+}
+func logIfError(err error) {
+	if err == nil {
+		return
+	}
+	logrus.Errorf("%v", err)
 }

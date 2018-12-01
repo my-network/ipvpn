@@ -24,7 +24,8 @@ const (
 )
 
 var (
-	ErrWrongMask = errors.New("Invalid mask")
+	ErrWrongMask    = errors.New("Invalid mask")
+	ErrPeerNotFound = errors.NotFound.New("peer not found")
 )
 
 type vpn struct {
@@ -125,15 +126,61 @@ func (vpn *vpn) tapReadHandler() {
 		frame := framebuf[:msg.n]
 
 		dstMAC := macSlice(frame.Destination())
-		if dstMAC.IsHomenet() {
-			if !dstMAC.IsBroadcast() {
+
+		isBroadcastDST := false
+		isHomenetDST := dstMAC.IsHomenet()
+		if !isHomenetDST {
+			isBroadcastDST = dstMAC.IsBroadcast()
+			if !isBroadcastDST {
 				continue
 			}
 		}
-		logrus.Printf("Dst: %s\n", frame.Destination())
-		logrus.Printf("Src: %s\n", frame.Source())
-		logrus.Printf("Ethertype: % x\n", frame.Ethertype())
-		logrus.Printf("Payload: % x\n", frame.Payload())
+
+		if isHomenetDST {
+			logIfError(vpn.SendToPeerByIntAlias(dstMAC.GetPeerIntAlias(), frame))
+			continue
+		}
+
+		if isBroadcastDST {
+			vpn.ForeachPeer(func(peer *models.PeerT) bool {
+				logIfError(vpn.SendToPeer(peer, frame))
+				return true
+			})
+			continue
+		}
+
+		panic("It should never reach this line of the code")
+	}
+}
+
+func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
+	logrus.Printf("Peer: %v %v\n", peer.GetIntAlias(), peer.GetID())
+	logrus.Printf("Dst: %s\n", frame.Destination())
+	logrus.Printf("Src: %s\n", frame.Source())
+	logrus.Printf("Ethertype: % x\n", frame.Ethertype())
+	logrus.Printf("Payload: % x\n", frame.Payload())
+	return nil
+}
+
+func (vpn *vpn) SendToPeerByIntAlias(peerIntAlias uint32, frame []byte) error {
+	peer := vpn.GetNetwork().GetPeerByIntAlias(peerIntAlias)
+	if peer == nil {
+		return errors.Wrap(ErrPeerNotFound, "integer alias", peerIntAlias)
+	}
+	return errors.Wrap(vpn.SendToPeer(peer, frame))
+}
+
+func (vpn *vpn) ForeachPeer(fn func(peer *models.PeerT) bool) {
+	homenet := vpn.GetNetwork()
+	myPeerID := homenet.GetPeerID()
+	peers := homenet.GetPeers()
+	for _, peer := range peers {
+		if peer.GetID() == myPeerID {
+			continue
+		}
+		if !fn(peer) {
+			break
+		}
 	}
 }
 
