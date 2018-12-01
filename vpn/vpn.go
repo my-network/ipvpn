@@ -28,13 +28,13 @@ var (
 )
 
 type vpn struct {
-	network   atomic.Value
-	closeChan chan struct{}
-	tapIface  *water.Interface
-	tapLink   tenus.Linker
-	subnet    net.IPNet
-	myAddress net.IP
-	locker    sync.Mutex
+	network         atomic.Value
+	oldPeerIntAlias uint32
+	closeChan       chan struct{}
+	tapIface        *water.Interface
+	tapLink         tenus.Linker
+	subnet          net.IPNet
+	locker          sync.Mutex
 }
 
 func New(subnet net.IPNet, homenet network.Network) (r *vpn, err error) {
@@ -49,8 +49,7 @@ func New(subnet net.IPNet, homenet network.Network) (r *vpn, err error) {
 		return
 	}
 	r.tapLink, err = tenus.NewLinkFrom(r.tapIface.Name())
-	err = r.tapLink.SetLinkUp()
-	if err != nil {
+	if err = r.tapLink.SetLinkUp(); err != nil {
 		return
 	}
 	r.setNetwork(homenet)
@@ -124,6 +123,13 @@ func (vpn *vpn) tapReadHandler() {
 			time.Sleep(time.Second)
 		}
 		frame := framebuf[:msg.n]
+
+		dstMAC := macSlice(frame.Destination())
+		if dstMAC.IsHomenet() {
+			if !dstMAC.IsBroadcast() {
+				continue
+			}
+		}
 		logrus.Printf("Dst: %s\n", frame.Destination())
 		logrus.Printf("Src: %s\n", frame.Source())
 		logrus.Printf("Ethertype: % x\n", frame.Ethertype())
@@ -139,12 +145,20 @@ func (vpn *vpn) Close() {
 	})
 }
 
-func (vpn *vpn) updatePeers(peers models.Peers) error {
-	peerIntAlias := vpn.GetPeerIntAlias()
+func (vpn *vpn) updateMAC(peerIntAlias uint32) error {
+	newMAC := GenerateHomenetMAC(peerIntAlias)
 
+	if err := vpn.tapLink.SetLinkMacAddress(newMAC.String()); err != nil {
+		return errors.Wrap(err)
+	}
+
+	return nil
+}
+
+func (vpn *vpn) updateIPAddress(peerIntAlias uint32) error {
 	maskOnes, maskBits := vpn.subnet.Mask.Size()
 	if peerIntAlias >= 1<<uint32(maskBits-maskOnes) {
-		return ErrWrongMask
+		return errors.Wrap(ErrWrongMask)
 	}
 
 	myAddress := vpn.subnet.IP
@@ -153,12 +167,37 @@ func (vpn *vpn) updatePeers(peers models.Peers) error {
 	}
 	myAddress[len(myAddress)-1] += uint8(peerIntAlias)
 
-	if vpn.myAddress.String() != myAddress.String() {
-		err := vpn.tapLink.SetLinkIp(myAddress, &vpn.subnet)
-		if err != nil {
+	if err := vpn.tapLink.SetLinkIp(myAddress, &vpn.subnet); err != nil {
+		return errors.Wrap(err)
+	}
+
+	return nil
+}
+
+func (vpn *vpn) updatePeerIntAlias(newPeerIntAlias uint32) error {
+	if err := vpn.updateMAC(newPeerIntAlias); err != nil {
+		return errors.Wrap(err)
+	}
+
+	if err := vpn.updateIPAddress(newPeerIntAlias); err != nil {
+		return errors.Wrap(err)
+	}
+
+	if err := vpn.tapLink.SetLinkUp(); err != nil {
+		return errors.Wrap(err)
+	}
+
+	vpn.oldPeerIntAlias = newPeerIntAlias
+	return nil
+}
+
+func (vpn *vpn) updatePeers(peers models.Peers) error {
+	peerIntAlias := vpn.GetPeerIntAlias()
+
+	if vpn.oldPeerIntAlias != peerIntAlias {
+		if err := vpn.updatePeerIntAlias(peerIntAlias); err != nil {
 			return errors.Wrap(err)
 		}
-		vpn.myAddress = myAddress
 	}
 
 	return nil
