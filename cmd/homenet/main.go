@@ -44,6 +44,11 @@ func main() {
 		logrus.Debugf("Configuration == %v", config.Get())
 	}
 
+	var vpnOptions vpn.Options
+	if config.Get().DumpVPNCommunications {
+		vpnOptions = append(vpnOptions, vpn.OptSetLoggerDump(&debugLogger{}))
+	}
+
 	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
 	fatalIf(err)
 

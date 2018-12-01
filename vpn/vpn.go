@@ -36,11 +36,22 @@ type vpn struct {
 	tapLink         tenus.Linker
 	subnet          net.IPNet
 	locker          sync.Mutex
+
+	loggerError Logger
+	loggerDump  Logger
 }
 
-func New(subnet net.IPNet, homenet network.Network) (r *vpn, err error) {
+func New(subnet net.IPNet, homenet network.Network, opts ...Option) (r *vpn, err error) {
 	r = &vpn{
-		subnet: subnet,
+		subnet:      subnet,
+		loggerError: &errorLogger{},
+	}
+
+	for _, optI := range opts {
+		switch opt := optI.(type) {
+		case optSetLoggerDump:
+			r.loggerDump = opt.logger
+		}
 	}
 
 	r.tapIface, err = water.New(water.Config{
@@ -120,7 +131,7 @@ func (vpn *vpn) tapReadHandler() {
 		case msg = <-readChan:
 		}
 		if msg.err != nil {
-			logrus.Errorf("Unable to read from %s: %s", vpn.tapIface.Name(), msg.err)
+			vpn.loggerError.Printf("Unable to read from %s: %s", vpn.tapIface.Name(), msg.err)
 			time.Sleep(time.Second)
 		}
 		frame := framebuf[:msg.n]
@@ -154,11 +165,18 @@ func (vpn *vpn) tapReadHandler() {
 }
 
 func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
-	logrus.Printf("Peer: %v %v\n", peer.GetIntAlias(), peer.GetID())
-	logrus.Printf("Dst: %s\n", frame.Destination())
-	logrus.Printf("Src: %s\n", frame.Source())
-	logrus.Printf("Ethertype: % x\n", frame.Ethertype())
-	logrus.Printf("Payload: % x\n", frame.Payload())
+	logrus.Debugf(`>>>	Peer: %v %v
+	Dst: %s
+	Src: %s
+	Ethertype: % x
+	Payload: % x`+"\n",
+		peer.GetIntAlias(),
+		peer.GetID(),
+		frame.Destination(),
+		frame.Source(),
+		frame.Ethertype(),
+		frame.Payload(),
+	)
 	return nil
 }
 

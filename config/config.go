@@ -17,6 +17,7 @@ type config struct {
 	NetworkSubnet         string        `env:"HOMENET_NETWORK_SUBNET" envDefault:"10.68.88.0/24"`
 	NetworkUpdateInterval time.Duration `env:"HOMENET_NETWORK_UPDATE_INTERVAL" envDefault:"10s"`
 	DumpAPICommunications bool          `env:"HOMENET_NETWORK_DUMP_API"`
+	DumpVPNCommunications bool          `env:"HOMENET_NETWORK_DUMP_VPN"`
 	DumpConfiguration     bool          `env:"HOMENET_DUMP_CONFIG"`
 }
 
