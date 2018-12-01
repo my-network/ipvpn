@@ -1,6 +1,8 @@
 package vpn
 
 import (
+	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -9,28 +11,45 @@ import (
 	"github.com/songgao/packets/ethernet"
 	"github.com/songgao/water"
 
+	"github.com/xaionaro-go/errors"
+	"github.com/xaionaro-go/tenus"
+
 	"github.com/xaionaro-go/homenet-server/models"
 
 	"github.com/xaionaro-go/homenet-peer/network"
 )
 
 const (
-	tapFrameMaxSize = 1500
+	TAPFrameMaxSize = 1500
+)
+
+var (
+	ErrWrongMask = errors.New("Invalid mask")
 )
 
 type vpn struct {
 	network   atomic.Value
 	closeChan chan struct{}
 	tapIface  *water.Interface
+	tapLink   tenus.Linker
+	subnet    net.IPNet
+	myAddress net.IP
 	locker    sync.Mutex
 }
 
-func New(homenet network.Network) (r *vpn, err error) {
-	r = &vpn{}
+func New(subnet net.IPNet, homenet network.Network) (r *vpn, err error) {
+	r = &vpn{
+		subnet: subnet,
+	}
 
 	r.tapIface, err = water.New(water.Config{
 		DeviceType: water.TAP,
 	})
+	if err != nil {
+		return
+	}
+	r.tapLink, err = tenus.NewLinkFrom(r.tapIface.Name())
+	err = r.tapLink.SetLinkUp()
 	if err != nil {
 		return
 	}
@@ -50,12 +69,12 @@ func (vpn *vpn) OnHomenetClose() {
 	vpn.Close()
 }
 
-func (vpn *vpn) OnHomenetUpdatePeers(models.Peers) error {
-	return nil
+func (vpn *vpn) OnHomenetUpdatePeers(peers models.Peers) error {
+	return vpn.updatePeers(peers)
 }
 
 func (vpn *vpn) setNetwork(newNetwork network.Network) {
-	vpn.LockDo(func(){
+	vpn.LockDo(func() {
 		oldNetwork := vpn.GetNetwork()
 		if oldNetwork != nil {
 			oldNetwork.RemoveHooker(vpn)
@@ -77,10 +96,10 @@ func (vpn *vpn) GetNetwork() network.Network {
 
 func (vpn *vpn) tapReadHandler() {
 	var framebuf ethernet.Frame
-	framebuf.Resize(tapFrameMaxSize)
+	framebuf.Resize(TAPFrameMaxSize)
 
 	type readChanMsg struct {
-		n int
+		n   int
 		err error
 	}
 	readChan := make(chan readChanMsg)
@@ -88,7 +107,7 @@ func (vpn *vpn) tapReadHandler() {
 		for vpn.GetNetwork() != nil {
 			n, err := vpn.tapIface.Read([]byte(framebuf)) // TODO: check if this request will be unblocked on vpn.tapIface.Close()
 			readChan <- readChanMsg{
-				n: n,
+				n:   n,
 				err: err,
 			}
 		}
@@ -113,15 +132,42 @@ func (vpn *vpn) tapReadHandler() {
 }
 
 func (vpn *vpn) Close() {
-	vpn.setNetwork(nil)
-	vpn.tapIface.Close()
-	vpn.closeChan <- struct{}{}
+	vpn.LockDo(func() {
+		vpn.setNetwork(nil)
+		vpn.tapIface.Close()
+		vpn.closeChan <- struct{}{}
+	})
 }
 
 func (vpn *vpn) updatePeers(peers models.Peers) error {
+	peerIntAlias := vpn.GetPeerIntAlias()
+
+	maskOnes, maskBits := vpn.subnet.Mask.Size()
+	if peerIntAlias >= 1<<uint32(maskBits-maskOnes) {
+		return ErrWrongMask
+	}
+
+	myAddress := vpn.subnet.IP
+	if uint32(myAddress[len(myAddress)-1])+peerIntAlias > 255 {
+		return fmt.Errorf("Not implemented yet: we can only modify the last octet at the moment")
+	}
+	myAddress[len(myAddress)-1] += uint8(peerIntAlias)
+
+	if vpn.myAddress.String() != myAddress.String() {
+		err := vpn.tapLink.SetLinkIp(myAddress, &vpn.subnet)
+		if err != nil {
+			return errors.Wrap(err)
+		}
+		vpn.myAddress = myAddress
+	}
+
 	return nil
 }
 
 func (vpn *vpn) GetPeerID() string {
 	return vpn.GetNetwork().GetPeerID()
+}
+
+func (vpn *vpn) GetPeerIntAlias() uint32 {
+	return vpn.GetNetwork().GetPeerIntAlias()
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -14,6 +15,10 @@ import (
 	"github.com/xaionaro-go/homenet-peer/network"
 	"github.com/xaionaro-go/homenet-peer/vpn"
 	"github.com/xaionaro-go/homenet-server/api"
+)
+
+const (
+	MachineIDLength = 8
 )
 
 func fatalIf(err error) {
@@ -39,10 +44,13 @@ func main() {
 		logrus.Debugf("Configuration == %v", config.Get())
 	}
 
+	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
+	fatalIf(err)
+
 	homenet, err := network.New()
 	fatalIf(err)
 
-	_, err = vpn.New(homenet)
+	_, err = vpn.New(*subnet, homenet)
 	fatalIf(err)
 
 	var apiOptions api.Options
@@ -65,8 +73,8 @@ func main() {
 
 	hostname, _ := os.Hostname()
 	machineID, _ := machineid.ProtectedID("homenet-peer")
-	if len(machineID) > 8 {
-		machineID = machineID[:8]
+	if len(machineID) > MachineIDLength {
+		machineID = machineID[:MachineIDLength]
 	}
 	peerName := hostname + "_" + machineID
 	if peerName == "_" {
