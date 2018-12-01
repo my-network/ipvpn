@@ -11,6 +11,7 @@ import (
 
 	"github.com/xaionaro-go/homenet-peer/config"
 	"github.com/xaionaro-go/homenet-peer/helpers"
+	"github.com/xaionaro-go/homenet-peer/network"
 	"github.com/xaionaro-go/homenet-peer/vpn"
 	"github.com/xaionaro-go/homenet-server/api"
 )
@@ -38,7 +39,10 @@ func main() {
 		logrus.Debugf("Configuration == %v", config.Get())
 	}
 
-	homenet, err := vpn.New()
+	homenet, err := network.New()
+	fatalIf(err)
+
+	_, err = vpn.New(homenet)
 	fatalIf(err)
 
 	var apiOptions api.Options
