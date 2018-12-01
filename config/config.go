@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +16,13 @@ type config struct {
 	ArbitrURL             string        `env:"HOMENET_ARBITR_URL" envDefault:"https://homenet.dx.center/"`
 	NetworkUpdateInterval time.Duration `env:"HOMENET_NETWORK_UPDATE_INTERVAL" envDefault:"10s"`
 	DumpAPICommunications bool          `env:"HOMENET_NETWORK_DUMP_API"`
+	DumpConfiguration     bool          `env:"HOMENET_DUMP_CONFIG"`
+}
+
+func (cfg config) String() string {
+	json, err := json.MarshalIndent(cfg, "", "\t")
+	panicIf(err)
+	return string(json)
 }
 
 func panicIf(err error) {

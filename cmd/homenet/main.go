@@ -32,12 +32,17 @@ func (l *debugLogger) Print(args ...interface{}) {
 }
 
 func main() {
+	logrus.SetLevel(logrus.DebugLevel)
+
+	if config.Get().DumpConfiguration {
+		logrus.Debugf("Configuration == %v", config.Get())
+	}
+
 	homenet, err := vpn.New()
 	fatalIf(err)
 
 	var apiOptions api.Options
 	if config.Get().DumpAPICommunications {
-		logrus.SetLevel(logrus.DebugLevel)
 		apiOptions = append(apiOptions, api.OptSetLoggerDebug(&debugLogger{}))
 	}
 
@@ -45,6 +50,7 @@ func main() {
 	passwordHashHash := string(helpers.Hash([]byte(config.Get().PasswordHash)))
 	homenetServer := api.New(config.Get().ArbitrURL, passwordHashHash, apiOptions...)
 	status, net, err := homenetServer.GetNet(networkID)
+	fatalIf(err)
 	switch status {
 	case http.StatusOK:
 	case http.StatusNotFound:
@@ -52,7 +58,6 @@ func main() {
 	default:
 		panic(fmt.Errorf("received an unexpected HTTP status code from the arbitr: %v", status))
 	}
-	fatalIf(err)
 
 	hostname, _ := os.Hostname()
 	machineID, _ := machineid.ProtectedID("homenet-peer")
