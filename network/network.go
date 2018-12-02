@@ -18,16 +18,13 @@ import (
 	"github.com/xaionaro-go/homenet-peer/helpers"
 )
 
-var (
-	ErrMyselfNotFound = errors.New("Not found myself in the peers list")
-)
-
 type Hooker interface {
 	OnHomenetClose()
 	OnHomenetUpdatePeers(models.Peers) error
 }
 
 type network struct {
+	negotiator      Negotiator
 	peerID          string
 	peer            *models.PeerT
 	peers           atomic.Value
@@ -39,6 +36,7 @@ type network struct {
 }
 
 type Network interface {
+	SetNegotiator(negotiator Negotiator)
 	GetPeers() models.Peers
 	UpdatePeers(models.Peers) error
 	GetPeerID() string
@@ -61,7 +59,7 @@ func (homenet *network) LockDo(fn func()) {
 	fn()
 }
 
-func New() (Network, error) {
+func New(negotiator Negotiator) (Network, error) {
 	homeDir, err := homedir.Dir()
 	if err != nil {
 		return nil, err
@@ -74,10 +72,17 @@ func New() (Network, error) {
 	r := &network{
 		cypher:          cypherInstance,
 		peerIntAliasMap: atomicmap.New(),
+		negotiator:      negotiator,
 	}
 	r.peerID = helpers.ToHEX(r.cypher.GetKeys().Public)
 
 	return r, nil
+}
+
+func (homenet *network) SetNegotiator(negotiator Negotiator) {
+	homenet.LockDo(func() {
+		homenet.negotiator = negotiator
+	})
 }
 
 func (homenet *network) Close() {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/xaionaro-go/homenet-peer/config"
 	"github.com/xaionaro-go/homenet-peer/helpers"
+	"github.com/xaionaro-go/homenet-peer/negotiator"
 	"github.com/xaionaro-go/homenet-peer/network"
 	"github.com/xaionaro-go/homenet-peer/vpn"
 	"github.com/xaionaro-go/homenet-server/api"
@@ -44,20 +45,6 @@ func main() {
 		logrus.Debugf("Configuration == %v", config.Get())
 	}
 
-	var vpnOptions vpn.Options
-	if config.Get().DumpVPNCommunications {
-		vpnOptions = append(vpnOptions, vpn.OptSetLoggerDump(&debugLogger{}))
-	}
-
-	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
-	fatalIf(err)
-
-	homenet, err := network.New()
-	fatalIf(err)
-
-	_, err = vpn.New(*subnet, homenet)
-	fatalIf(err)
-
 	var apiOptions api.Options
 	if config.Get().DumpAPICommunications {
 		apiOptions = append(apiOptions, api.OptSetLoggerDebug(&debugLogger{}))
@@ -66,15 +53,31 @@ func main() {
 	networkID := config.Get().NetworkID
 	passwordHashHash := string(helpers.Hash([]byte(config.Get().PasswordHash)))
 	homenetServer := api.New(config.Get().ArbitrURL, passwordHashHash, apiOptions...)
-	status, net, err := homenetServer.GetNet(networkID)
+	status, netInfo, err := homenetServer.GetNet(networkID)
 	fatalIf(err)
 	switch status {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		status, net, err = homenetServer.RegisterNet(networkID)
+		status, netInfo, err = homenetServer.RegisterNet(networkID)
 	default:
 		panic(fmt.Errorf("received an unexpected HTTP status code from the arbitr: %v", status))
 	}
+
+	var vpnOptions vpn.Options
+	if config.Get().DumpVPNCommunications {
+		vpnOptions = append(vpnOptions, vpn.OptSetLoggerDump(&debugLogger{}))
+	}
+
+	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
+	fatalIf(err)
+
+	homenet, err := network.New(nil)
+	fatalIf(err)
+
+	homenet.SetNegotiator(negotiator.New(config.Get().NetworkUpdateInterval, homenetServer, networkID, homenet))
+
+	_, err = vpn.New(*subnet, homenet)
+	fatalIf(err)
 
 	hostname, _ := os.Hostname()
 	machineID, _ := machineid.ProtectedID("homenet-peer")
@@ -86,23 +89,23 @@ func main() {
 		peerName = ""
 	}
 
-	_, _, err = homenetServer.RegisterPeer(net.GetID(), homenet.GetPeerID(), peerName)
+	_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName)
 	fatalIf(err)
 
-	_, peers, err := homenetServer.GetPeers(net.GetID())
+	_, peers, err := homenetServer.GetPeers(netInfo.GetID())
 	fatalIf(err)
 	fatalIf(homenet.UpdatePeers(peers))
 
 	ticker := time.NewTicker(config.Get().NetworkUpdateInterval)
 	for {
 		<-ticker.C
-		_, _, err = homenetServer.RegisterPeer(net.GetID(), homenet.GetPeerID(), peerName)
+		_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName)
 		if err != nil {
-			logrus.Errorf("homenetServer.RegisterPeer(%s, %s): %s", net.GetID(), homenet.GetPeerID(), err.Error())
+			logrus.Errorf("homenetServer.RegisterPeer(%s, %s): %s", netInfo.GetID(), homenet.GetPeerID(), err.Error())
 		}
-		_, peers, err := homenetServer.GetPeers(net.GetID())
+		_, peers, err := homenetServer.GetPeers(netInfo.GetID())
 		if err != nil {
-			logrus.Errorf("homenetServer.GetPeers(%s): %s", net.GetID(), err.Error())
+			logrus.Errorf("homenetServer.GetPeers(%s): %s", netInfo.GetID(), err.Error())
 		}
 		err = homenet.UpdatePeers(peers)
 		if err != nil {

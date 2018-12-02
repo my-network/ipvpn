@@ -171,7 +171,7 @@ func (vpn *vpn) ifDump(fn func(Logger)) {
 }
 
 func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
-	vpn.ifDump(func(log Logger){
+	vpn.ifDump(func(log Logger) {
 		log.Printf(`>>>	Peer: %v %v
 	Dst: %s
 	Src: %s
