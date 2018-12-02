@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/songgao/packets/ethernet"
 	"github.com/songgao/water"
 
@@ -164,19 +163,28 @@ func (vpn *vpn) tapReadHandler() {
 	}
 }
 
+func (vpn *vpn) ifDump(fn func(Logger)) {
+	if vpn.loggerDump == nil {
+		return
+	}
+	fn(vpn.loggerDump)
+}
+
 func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
-	logrus.Debugf(`>>>	Peer: %v %v
+	vpn.ifDump(func(log Logger){
+		log.Printf(`>>>	Peer: %v %v
 	Dst: %s
 	Src: %s
 	Ethertype: % x
 	Payload: % x`+"\n",
-		peer.GetIntAlias(),
-		peer.GetID(),
-		frame.Destination(),
-		frame.Source(),
-		frame.Ethertype(),
-		frame.Payload(),
-	)
+			peer.GetIntAlias(),
+			peer.GetID(),
+			frame.Destination(),
+			frame.Source(),
+			frame.Ethertype(),
+			frame.Payload(),
+		)
+	})
 	return nil
 }
 
