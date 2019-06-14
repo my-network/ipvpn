@@ -2,8 +2,8 @@ package negotiator
 
 import (
 	"net/http"
-	"time"
 	"sync"
+	"time"
 
 	"github.com/xaionaro-go/homenet-server/models"
 
