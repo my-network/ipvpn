@@ -3,6 +3,7 @@ package network
 // TODO: consider https://github.com/perlin-network/noise
 
 import (
+	"net"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,8 @@ import (
 	"github.com/xaionaro-go/atomicmap"
 	"github.com/xaionaro-go/errors"
 
+
+	"github.com/xaionaro-go/homenet-server/iface"
 	"github.com/xaionaro-go/homenet-server/models"
 
 	"github.com/xaionaro-go/homenet-peer/cypher"
@@ -24,19 +27,20 @@ type Hooker interface {
 }
 
 type network struct {
-	negotiator      Negotiator
+	connector      Connector
 	peerID          string
 	peer            *models.PeerT
 	peers           atomic.Value
 	cypher          *cypher.CypherT
 	locker          sync.RWMutex
 	peerIntAliasMap atomicmap.Map
+	connectionsMap  atomicmap.Map
 
 	hookers []Hooker
 }
 
 type Network interface {
-	SetNegotiator(negotiator Negotiator)
+	SetConnector(connector Connector)
 	GetPeers() models.Peers
 	UpdatePeers(models.Peers) error
 	GetPeerID() string
@@ -59,7 +63,7 @@ func (homenet *network) LockDo(fn func()) {
 	fn()
 }
 
-func New(negotiator Negotiator) (Network, error) {
+func New() (Network, error) {
 	homeDir, err := homedir.Dir()
 	if err != nil {
 		return nil, err
@@ -72,16 +76,16 @@ func New(negotiator Negotiator) (Network, error) {
 	r := &network{
 		cypher:          cypherInstance,
 		peerIntAliasMap: atomicmap.New(),
-		negotiator:      negotiator,
+		connectionsMap:  atomicmap.New(),
 	}
 	r.peerID = helpers.ToHEX(r.cypher.GetKeys().Public)
 
 	return r, nil
 }
 
-func (homenet *network) SetNegotiator(negotiator Negotiator) {
+func (homenet *network) SetConnector(connector Connector) {
 	homenet.LockDo(func() {
-		homenet.negotiator = negotiator
+		homenet.connector = connector
 	})
 }
 
@@ -128,6 +132,36 @@ func (homenet *network) GetPeers() models.Peers {
 	return peers.(models.Peers)
 }
 
+func (homenet *network) GetConnectionTo(peer iface.Peer) net.Conn {
+	conn, _ := homenet.connectionsMap.Get(peer.GetID())
+	if conn == nil {
+		return nil
+	}
+	return conn.(net.Conn)
+}
+
+func (homenet *network) EstablishConnectionTo(peer iface.Peer) net.Conn {
+	if conn := homenet.GetConnectionTo(peer); conn != nil {
+		// We don't need to do anything if we already have a working connection
+		return conn
+	}
+
+	conn, err := homenet.connector.NewConnection(homenet.peer, peer, homenet.cypher.NewSession(peer.GetID()))
+	if conn == nil || err != nil {
+		homenet.loggerError.Printf("I was unable to connect to %v: err = %v", peer.GetID(), err)
+		return nil
+	}
+
+	oldConn := homenet.connections.Swap(peer.GetID(), conn)
+	if oldConn != nil {
+		// If somebody already putted a connection for this peer in an other goroutined, then we need to close it :(
+		// It was somekind of a race condition. And here we are cleaning things up.
+		oldConn.Close()
+	}
+
+	return conn
+}
+
 func (homenet *network) UpdatePeers(peers models.Peers) (err error) {
 	homenet.RLockDo(func() {
 		oldPeers := homenet.GetPeers()
@@ -145,14 +179,17 @@ func (homenet *network) UpdatePeers(peers models.Peers) (err error) {
 			}
 			homenet.peerIntAliasMap.Set(peerID, peer)
 		}
-		for removePeerID, _ := range removePeerIDs.Keys() {
-			homenet.peerIntAliasMap.Unset(removePeerID)
-		}
 		if !foundMyself {
 			err = errors.Wrap(ErrMyselfNotFound)
 			return
 		}
+		for removePeerID, _ := range removePeerIDs.Keys() {
+			homenet.peerIntAliasMap.Unset(removePeerID)
+		}
 		homenet.peers.Store(peers)
+		for _, peer := range peers {
+			go homenet.EstablishConnectionTo(peer)
+		}
 		for _, hooker := range homenet.hookers {
 			if err = hooker.OnHomenetUpdatePeers(peers); err != nil {
 				return

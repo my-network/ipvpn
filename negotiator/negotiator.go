@@ -5,6 +5,8 @@ import (
 	"time"
 	"sync"
 
+	"github.com/xaionaro-go/errors"
+
 	"github.com/xaionaro-go/homenet-server/models"
 
 	"github.com/xaionaro-go/homenet-peer/network"
@@ -12,6 +14,8 @@ import (
 
 type API interface {
 	GetNegotiationMessages(networkID, peerIDTo string) (int, map[string]models.NegotiationMessageT, error)
+	GetNegotiationMessage(networkID, peerIDTo, peerIDFrom string) (int, *models.NegotiationMessageT, error)
+	SetNegotiationMessage(networkID, peerIDTo, peerIDFrom string, msg *models.NegotiationMessageT) (int, *models.NegotiationMessageT, error)
 }
 
 type GetPeerIDer interface {
@@ -70,7 +74,7 @@ func (n *negotiator) fetchNegotiationMessagesLoop() {
 	}
 }
 
-func (n *negotiator) GetNegotiatorMessage(peerIDTo, peerIDFrom string) (msg *models.NegotiationMessageT, err error) {
+func (n *negotiator) GetNegotiationMessage(peerIDTo, peerIDFrom string) (msg *models.NegotiationMessageT, err error) {
 	n.LockDo(func() {
 		msg = &[]models.NegotiationMessageT{n.msgMap[peerIDFrom]}[0]
 	})
@@ -78,4 +82,15 @@ func (n *negotiator) GetNegotiatorMessage(peerIDTo, peerIDFrom string) (msg *mod
 		err = network.ErrNotReady
 	}
 	return
+}
+
+func (n *negotiator) SetNegotiationMessage(peerIDTo, peerIDFrom string, msg *models.NegotiationMessageT) error {
+	status, _, err := n.api.SetNegotiationMessage(n.networkID, peerIDTo, peerIDFrom, msg)
+	if err != nil {
+		return errors.Wrap(err)
+	}
+	if status != 200 {
+		return errors.UnexpectedHTTPStatusCode.Wrap(status)
+	}
+	return nil
 }

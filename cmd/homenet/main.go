@@ -71,7 +71,7 @@ func main() {
 	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
 	fatalIf(err)
 
-	homenet, err := network.New(nil)
+	homenet, err := network.New()
 	fatalIf(err)
 
 	homenet.SetNegotiator(negotiator.New(config.Get().NetworkUpdateInterval, homenetServer, networkID, homenet))
