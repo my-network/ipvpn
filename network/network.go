@@ -165,7 +165,7 @@ func (homenet *network) EstablishConnectionTo(peer iface.Peer) net.Conn {
 func (homenet *network) UpdatePeers(peers models.Peers) (err error) {
 	homenet.RLockDo(func() {
 		oldPeers := homenet.GetPeers()
-		removePeerIDs := atomicmap.NewWithArgs(uint64(len(oldPeers))*3/2+1, nil) // it's just faster than Go's bultin maps
+		removePeerIDs := atomicmap.NewWithArgs(uint64(len(oldPeers))*3/2 + 1) // it's just faster than Go's bultin maps
 		for _, peer := range oldPeers {
 			removePeerIDs.Set(peer.GetID(), struct{}{})
 		}
