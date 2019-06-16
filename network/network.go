@@ -74,6 +74,10 @@ func New(connector Connector, logger Logger) (*Network, error) {
 	return r, nil
 }
 
+func (homenet *Network) GetIdentity() *secureio.Identity {
+	return homenet.identity
+}
+
 func (homenet *Network) SetConnector(connector Connector) {
 	homenet.LockDo(func() {
 		homenet.connector = connector
@@ -183,7 +187,7 @@ func (homenet *Network) logError(err error) {
 	if err == nil {
 		return
 	}
-	homenet.logger.Error("[homenet-network] got error: %v", err)
+	homenet.logger.Error("[homenet-network] got error: ", err)
 }
 
 func (homenet *Network) UpdatePeers(peers models.Peers) (err error) {
@@ -196,7 +200,7 @@ func (homenet *Network) UpdatePeers(peers models.Peers) (err error) {
 		foundMyself := false
 		for _, peer := range peers {
 			peerID := peer.GetID()
-			homenet.logError(removePeerIDs.Unset(peerID))
+			_ = removePeerIDs.Unset(peerID)
 			if peerID == homenet.GetPeerID() {
 				homenet.peer = peer
 				foundMyself = true

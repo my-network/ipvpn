@@ -2,16 +2,18 @@ package main
 
 import (
 	"fmt"
-	"github.com/xaionaro-go/homenet-peer/connector"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/denisbrodbeck/machineid"
 
 	"github.com/xaionaro-go/homenet-peer/config"
+	"github.com/xaionaro-go/homenet-peer/connector"
 	"github.com/xaionaro-go/homenet-peer/helpers"
 	"github.com/xaionaro-go/homenet-peer/negotiator"
 	"github.com/xaionaro-go/homenet-peer/network"
@@ -25,7 +27,7 @@ const (
 
 func fatalIf(err error) {
 	if err != nil {
-		logrus.Panicf("%s", err.Error())
+		logrus.Fatalf("%s", err.Error())
 	}
 }
 
@@ -51,8 +53,14 @@ func main() {
 		apiOptions = append(apiOptions, api.OptSetLoggerDebug(&debugLogger{}))
 	}
 
+	passwordFile := config.Get().PasswordFile
+	password, err := ioutil.ReadFile(passwordFile)
+	if err != nil {
+		panic(fmt.Errorf(`cannot read the password file "%v"`, passwordFile))
+	}
+
 	networkID := config.Get().NetworkID
-	passwordHashHash := string(helpers.Hash([]byte(config.Get().PasswordHash)))
+	passwordHashHash := string(helpers.Hash([]byte(strings.Trim(string(password), " \t\n\r"))))
 	homenetServer := api.New(config.Get().ArbitrURL, passwordHashHash, apiOptions...)
 	status, netInfo, err := homenetServer.GetNet(networkID)
 	fatalIf(err)
@@ -79,7 +87,7 @@ func main() {
 
 	homenet.SetConnector(connectorInstance)
 
-	_, err = vpn.New(*subnet, homenet)
+	_, err = vpn.New(*subnet, homenet, vpnOptions...)
 	fatalIf(err)
 
 	hostname, _ := os.Hostname()
@@ -92,7 +100,7 @@ func main() {
 		peerName = ""
 	}
 
-	_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName)
+	_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName, homenet.GetIdentity().Keys.Public)
 	fatalIf(err)
 
 	_, peers, err := homenetServer.GetPeers(netInfo.GetID())
@@ -102,7 +110,7 @@ func main() {
 	ticker := time.NewTicker(config.Get().NetworkUpdateInterval)
 	for {
 		<-ticker.C
-		_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName)
+		_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName, homenet.GetIdentity().Keys.Public)
 		if err != nil {
 			logrus.Errorf("homenetServer.RegisterPeer(%s, %s): %s", netInfo.GetID(), homenet.GetPeerID(), err.Error())
 		}

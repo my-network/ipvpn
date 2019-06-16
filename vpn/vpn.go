@@ -41,6 +41,9 @@ type vpn struct {
 }
 
 func New(subnet net.IPNet, homenet *network.Network, opts ...Option) (r *vpn, err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
 	r = &vpn{
 		subnet:      subnet,
 		loggerError: &errorLogger{},
@@ -53,16 +56,33 @@ func New(subnet net.IPNet, homenet *network.Network, opts ...Option) (r *vpn, er
 		}
 	}
 
+	r.ifDump(func(log Logger) {
+		log.Printf("creating network interface")
+	})
 	r.tapIface, err = water.New(water.Config{
 		DeviceType: water.TAP,
+	})
+	r.ifDump(func(log Logger) {
+		log.Printf("created network interface: %v", r.tapIface.Name())
 	})
 	if err != nil {
 		return
 	}
-	r.tapLink, err = tenus.NewLinkFrom(r.tapIface.Name())
+	r.ifDump(func(log Logger) {
+		log.Printf("creating network link")
+	})
+	if r.tapLink, err = tenus.NewLinkFrom(r.tapIface.Name()); err != nil {
+		return
+	}
+	r.ifDump(func(log Logger) {
+		log.Printf("UP-ing network link")
+	})
 	if err = r.tapLink.SetLinkUp(); err != nil {
 		return
 	}
+	r.ifDump(func(log Logger) {
+		log.Printf("TAP-device is ready: %v", r.tapLink.NetInterface())
+	})
 	r.setNetwork(homenet)
 
 	go r.tapReadHandler()
@@ -114,6 +134,9 @@ func (vpn *vpn) tapReadHandler() {
 	}
 	readChan := make(chan readChanMsg)
 	go func() {
+		vpn.ifDump(func(log Logger) {
+			log.Printf("started the reader")
+		})
 		for vpn.GetNetwork() != nil {
 			n, err := vpn.tapIface.Read([]byte(framebuf)) // TODO: check if this request will be unblocked on vpn.tapIface.Close()
 			readChan <- readChanMsg{
@@ -121,6 +144,9 @@ func (vpn *vpn) tapReadHandler() {
 				err: err,
 			}
 		}
+		vpn.ifDump(func(log Logger) {
+			log.Printf("stopped the reader")
+		})
 	}()
 	for vpn.GetNetwork() != nil {
 		var msg readChanMsg
@@ -137,21 +163,26 @@ func (vpn *vpn) tapReadHandler() {
 
 		dstMAC := macSlice(frame.Destination())
 
-		isBroadcastDST := false
-		isHomenetDST := dstMAC.IsHomenet()
-		if !isHomenetDST {
-			isBroadcastDST = dstMAC.IsBroadcast()
-			if !isBroadcastDST {
-				continue
-			}
+		isBroadcastDst := false
+		isHomenetDst := dstMAC.IsHomenet()
+		if !isHomenetDst {
+			isBroadcastDst = dstMAC.IsBroadcast()
 		}
 
-		if isHomenetDST {
+		vpn.ifDump(func(log Logger) {
+			log.Printf("received a frame on the TAP-device: isHomenetDST: %v, isBroadcastDST: %v, length: %v", isHomenetDst, isBroadcastDst, msg.n)
+		})
+
+		if !isHomenetDst && !isBroadcastDst {
+			continue
+		}
+
+		if isHomenetDst {
 			logIfError(vpn.SendToPeerByIntAlias(dstMAC.GetPeerIntAlias(), frame))
 			continue
 		}
 
-		if isBroadcastDST {
+		if isBroadcastDst {
 			vpn.ForeachPeer(func(peer *models.PeerT) bool {
 				logIfError(vpn.SendToPeer(peer, frame))
 				return true
