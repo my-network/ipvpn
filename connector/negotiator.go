@@ -5,5 +5,5 @@ import (
 )
 
 type Negotiator interface {
-	NegotiateWith(peerIDTo string) (*models.NegotiationMessageT, *models.NegotiationMessageT, error)
+	NegotiateWith(peerIDTo string) (*models.NegotiationMessage, *models.NegotiationMessage, error)
 }

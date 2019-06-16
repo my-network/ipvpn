@@ -44,7 +44,7 @@ func (connector *connector) NewConnection(peerLocal, peerRemote iface.Peer) (net
 
 func (connector *connector) newConnection(
 	peerLocal, peerRemote iface.Peer,
-	negotiationMsgLocal, negotiationMsgRemote *models.NegotiationMessageT,
+	negotiationMsgLocal, negotiationMsgRemote *models.NegotiationMessage,
 ) (net.Conn, error) {
 	// This's actually a wrong method to detect if the remote host is in the same network with you.
 	// It may be better to use broadcast requests or something else. But for now this is good enough :)
