@@ -2,7 +2,6 @@ package connector
 
 import (
 	"net"
-	"syscall"
 	"time"
 
 	"github.com/xaionaro-go/errors"
@@ -54,12 +53,15 @@ func (conn *Connection) startListening() error {
 	return errors.NotImplemented.New(conn.protocol)
 }
 
-func (conn *Connection) Dial() error {
+func (conn *Connection) Dial() (err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
+
 	if err := conn.startListening(); err != nil {
 		return errors.Wrap(err)
 	}
 
-	var err error
 	switch conn.protocol {
 	case protocolUDP:
 		var realConn *net.UDPConn
@@ -74,29 +76,17 @@ func (conn *Connection) Dial() error {
 			},
 		)
 
-		if err == nil {
-			// Don't fragment
-			var syscallConn syscall.RawConn
-			syscallConn, err = realConn.SyscallConn()
-			if err != nil {
-				err = errors.Wrap(err)
-			} else {
-				err2 := errors.Wrap(syscallConn.Control(func(fd uintptr) {
-					err = errors.Wrap(syscall.SetsockoptByte(int(fd), syscall.IP_MTU_DISCOVER, syscall.IP_PMTUDISC_DO, 1))
-				}))
-				if err == nil {
-					err = err2
-				}
-			}
+		if err != nil {
+			return
+		}
+
+		if err = udpSetNoFragment(realConn); err != nil {
+			return
 		}
 
 		conn.Conn = realConn
 	default:
 		return errors.NotImplemented.New(conn.protocol)
-	}
-
-	if err != nil {
-		return errors.Wrap(err)
 	}
 
 	waitingForAnswer := true

@@ -168,7 +168,7 @@ func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) i
 	homenet.logger.Debugf("establishing a connection to %v %v", peer.GetIntAlias(), peer.GetID())
 	realConn, err := homenet.connector.NewConnection(homenet.peer, peer)
 	if realConn == nil || err != nil {
-		homenet.logger.Infof("we were unable to connect to %v: err == %v", peer.GetID(), errors.Wrap(err).InitialError().ErrorShort())
+		homenet.logger.Infof("we were unable to connect to %v: realConn is nil: %v;  err == %v", peer.GetID(), realConn == nil, err)
 		go func() {
 			time.Sleep(connectionRetryInitialDelay * time.Duration(1<<tryNumber))
 			homenet.establishConnectionTo(peer, tryNumber+1)

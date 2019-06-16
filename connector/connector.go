@@ -25,21 +25,21 @@ func New(negotiator Negotiator, logger Logger) *connector {
 	}
 }
 
-func (connector *connector) NewConnection(peerLocal, peerRemote iface.Peer) (net.Conn, error) {
+func (connector *connector) NewConnection(peerLocal, peerRemote iface.Peer) (conn net.Conn, err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
 	connector.logger.Debugf("negotiation starts: local:%v; remote:%v", peerLocal.GetIntAlias(), peerRemote.GetIntAlias())
 	negotiationMsgLocal, negotiationMsgRemote, err := connector.negotiator.NegotiateWith(peerRemote.GetID())
 	connector.logger.Debugf("negotiation ended: local:%v:%v; remote:%v:%v; err:%v", peerLocal.GetIntAlias(), negotiationMsgLocal, peerRemote.GetIntAlias(), negotiationMsgRemote, err)
 	if negotiationMsgRemote == nil || string(negotiationMsgRemote.Protocol) == "" {
-		return nil, ErrNotNegotiatedYet.Wrap()
+		return nil, ErrNotNegotiatedYet
 	}
 	if err != nil {
-		return nil, errors.Wrap(err)
+		return
 	}
-	conn, err := connector.newConnection(peerLocal, peerRemote, negotiationMsgLocal, negotiationMsgRemote)
-	if err != nil {
-		return nil, errors.Wrap(err)
-	}
-	return conn, nil
+	connector.logger.Debugf("making a connection: local:%v; remote:%v", peerLocal.GetIntAlias(), peerRemote.GetIntAlias())
+	return connector.newConnection(peerLocal, peerRemote, negotiationMsgLocal, negotiationMsgRemote)
 }
 
 func (connector *connector) newConnection(

@@ -127,6 +127,9 @@ func (n *Negotiator) getProposal(peerIDTo string) *models.NegotiationMessage {
 }
 
 func (n *Negotiator) NegotiateWith(peerIDTo string) (localMsg *models.NegotiationMessage, remoteMsg *models.NegotiationMessage, err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
 	localMsg = n.getProposal(peerIDTo)
 	err = n.SetNegotiationMessage(peerIDTo, n.getPeerIDer.GetPeerID(), localMsg)
 	if err != nil {
