@@ -9,18 +9,29 @@ import (
 	"github.com/xaionaro-go/homenet-server/models"
 )
 
+var (
+	ErrNotNegotiatedYet = errors.UnknownProtocol.New("not negotiated, yet")
+)
+
 type connector struct {
 	negotiator Negotiator
+	logger     Logger
 }
 
-func New(negotiator Negotiator) *connector {
+func New(negotiator Negotiator, logger Logger) *connector {
 	return &connector{
 		negotiator: negotiator,
+		logger:     logger,
 	}
 }
 
 func (connector *connector) NewConnection(peerLocal, peerRemote iface.Peer) (net.Conn, error) {
+	connector.logger.Debugf("negotiation starts: local:%v; remote:%v", peerLocal.GetIntAlias(), peerRemote.GetIntAlias())
 	negotiationMsgLocal, negotiationMsgRemote, err := connector.negotiator.NegotiateWith(peerRemote.GetID())
+	connector.logger.Debugf("negotiation ended: local:%v:%v; remote:%v:%v; err:%v", peerLocal.GetIntAlias(), negotiationMsgLocal, peerRemote.GetIntAlias(), negotiationMsgRemote, err)
+	if negotiationMsgRemote == nil || string(negotiationMsgRemote.Protocol) == "" {
+		return nil, ErrNotNegotiatedYet.Wrap()
+	}
 	if err != nil {
 		return nil, errors.Wrap(err)
 	}

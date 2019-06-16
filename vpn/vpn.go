@@ -25,6 +25,7 @@ const (
 var (
 	ErrWrongMask    = errors.New("Invalid mask")
 	ErrPeerNotFound = errors.NotFound.New("peer not found")
+	ErrNoConnection = errors.CannotSendData.New("there's no established connection, yet")
 )
 
 type vpn struct {
@@ -135,7 +136,7 @@ func (vpn *vpn) tapReadHandler() {
 	readChan := make(chan readChanMsg)
 	go func() {
 		vpn.ifDump(func(log Logger) {
-			log.Printf("started the reader")
+			log.Printf("started the TAP-reader")
 		})
 		for vpn.GetNetwork() != nil {
 			n, err := vpn.tapIface.Read([]byte(framebuf)) // TODO: check if this request will be unblocked on vpn.tapIface.Close()
@@ -145,7 +146,7 @@ func (vpn *vpn) tapReadHandler() {
 			}
 		}
 		vpn.ifDump(func(log Logger) {
-			log.Printf("stopped the reader")
+			log.Printf("stopped the TAP-reader")
 		})
 	}()
 	for vpn.GetNetwork() != nil {
@@ -216,7 +217,18 @@ func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
 			frame.Payload(),
 		)
 	})
-	return nil
+
+	homenet := vpn.GetNetwork()
+	conn := homenet.GetConnectionTo(peer)
+	if conn == nil {
+		vpn.ifDump(func(log Logger) {
+			log.Printf("there's no active connection to peer %v, yet :(", peer.GetID())
+		})
+		return ErrNoConnection
+	}
+
+	_, err := conn.Write(frame)
+	return err
 }
 
 func (vpn *vpn) SendToPeerByIntAlias(peerIntAlias uint32, frame []byte) error {

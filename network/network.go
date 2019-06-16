@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mitchellh/go-homedir"
 
@@ -19,6 +20,10 @@ import (
 	"github.com/xaionaro-go/homenet-server/models"
 
 	"github.com/xaionaro-go/homenet-peer/helpers"
+)
+
+const (
+	connectionRetryInitialDelay = 5 * time.Second
 )
 
 type Hooker interface {
@@ -154,30 +159,39 @@ func (errHandler *sessionErrorHandler) Debugf(fm string, args ...interface{}) {
 	errHandler.homenet.logger.Debugf(fm, args)
 }
 
-func (homenet *Network) EstablishConnectionTo(peer iface.Peer) io.ReadWriteCloser {
+func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) io.ReadWriteCloser {
 	if conn := homenet.GetConnectionTo(peer); conn != nil {
 		// We don't need to do anything if we already have a working connection
 		return conn
 	}
 
+	homenet.logger.Debugf("establishing a connection to %v %v", peer.GetIntAlias(), peer.GetID())
 	realConn, err := homenet.connector.NewConnection(homenet.peer, peer)
 	if realConn == nil || err != nil {
-		homenet.logger.Error("I was unable to connect to ", peer.GetID(), ": err == ", err)
+		homenet.logger.Infof("we were unable to connect to %v: err == %v", peer.GetID(), errors.Wrap(err).InitialError().ErrorShort())
+		go func() {
+			time.Sleep(connectionRetryInitialDelay * time.Duration(1<<tryNumber))
+			homenet.establishConnectionTo(peer, tryNumber+1)
+		}()
 		return nil
 	}
+
+	homenet.logger.Debugf("securing the connection to %v %v", peer.GetIntAlias(), peer.GetID())
 	conn := homenet.identity.NewSession(secureio.NewRemoteIdentityFromPublicKey(peer.GetPublicKey()), realConn, &sessionErrorHandler{
 		homenet,
 		peer,
 	})
 
+	homenet.logger.Debugf("saving the connection to %v %v", peer.GetIntAlias(), peer.GetID())
 	oldConn, err := homenet.connectionsMap.Swap(peer.GetID(), conn)
 	if oldConn != nil {
 		// If somebody already putted a connection for this peer (while another goroutine), then we need to close it :(
 		// It was somekind of a race condition. And here we are cleaning things up.
+		homenet.logger.Debugf("closing the previous connection to %v %v", peer.GetIntAlias(), peer.GetID())
 		_ = oldConn.(io.Closer).Close()
 	}
 	if err != nil {
-
+		homenet.logError(errors.Wrap(err))
 	}
 
 	return conn
@@ -205,18 +219,21 @@ func (homenet *Network) UpdatePeers(peers models.Peers) (err error) {
 				homenet.peer = peer
 				foundMyself = true
 			}
-			homenet.logError(homenet.peerIntAliasMap.Set(peerID, peer))
+			homenet.logError(errors.Wrap(homenet.peerIntAliasMap.Set(peerID, peer)))
 		}
 		if !foundMyself {
 			err = errors.Wrap(ErrMyselfNotFound)
 			return
 		}
 		for removePeerID := range removePeerIDs.Keys() {
-			homenet.logError(homenet.peerIntAliasMap.Unset(removePeerID))
+			homenet.logError(errors.Wrap(homenet.peerIntAliasMap.Unset(removePeerID)))
 		}
 		homenet.peers.Store(peers)
 		for _, peer := range peers {
-			go homenet.EstablishConnectionTo(peer)
+			if peer.GetID() == homenet.GetPeerID() {
+				continue
+			}
+			go homenet.establishConnectionTo(peer, 0)
 		}
 		for _, hooker := range homenet.hookers {
 			if err = hooker.OnHomenetUpdatePeers(peers); err != nil {

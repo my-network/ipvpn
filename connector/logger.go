@@ -1,4 +1,4 @@
-package negotiator
+package connector
 
 type Logger interface {
 	Error(...interface{})

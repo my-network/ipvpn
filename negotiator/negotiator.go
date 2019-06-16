@@ -12,6 +12,10 @@ import (
 	"github.com/xaionaro-go/homenet-peer/network"
 )
 
+const (
+	negotiationTimeout = time.Second * 15
+)
+
 type API interface {
 	GetNegotiationMessages(networkID, peerIDTo string) (int, map[string]models.NegotiationMessageT, error)
 	GetNegotiationMessage(networkID, peerIDTo, peerIDFrom string) (int, *models.NegotiationMessageT, error)
@@ -28,18 +32,18 @@ type Negotiator struct {
 	interval    time.Duration
 	networkID   string
 	getPeerIDer GetPeerIDer
-	loggerError Logger
+	logger      Logger
 	msgMap      map[string]models.NegotiationMessageT
 	stopChan    chan struct{}
 }
 
-func New(interval time.Duration, api API, networkID string, getPeerIDer GetPeerIDer) *Negotiator {
+func New(interval time.Duration, api API, networkID string, getPeerIDer GetPeerIDer, logger Logger) *Negotiator {
 	n := &Negotiator{
 		api:         api,
 		interval:    interval,
 		networkID:   networkID,
 		getPeerIDer: getPeerIDer,
-		loggerError: &errorLogger{},
+		logger:      logger,
 		msgMap:      map[string]models.NegotiationMessageT{},
 		stopChan:    make(chan struct{}),
 	}
@@ -50,11 +54,32 @@ func New(interval time.Duration, api API, networkID string, getPeerIDer GetPeerI
 
 func (n *Negotiator) lockDo(fn func()) {
 	n.locker.Lock()
-	defer n.locker.Lock()
+	defer n.locker.Unlock()
 	fn()
 }
 
+func (n *Negotiator) fetchNegotiationMessages() {
+	n.logger.Debugf("fetching new negotiation messages")
+	httpCode, msgMap, err := n.api.GetNegotiationMessages(n.networkID, n.getPeerIDer.GetPeerID())
+	n.logger.Debugf("endof <fetching new negotiation messages>: %v %v %v", httpCode, err, msgMap)
+	if err != nil {
+		n.logger.Error(err)
+		return
+	}
+	switch httpCode {
+	case http.StatusOK:
+	default:
+		n.logger.Error("Unexpected HTTP code:", httpCode)
+		return
+	}
+
+	n.lockDo(func() {
+		n.msgMap = msgMap
+	})
+}
+
 func (n *Negotiator) fetchNegotiationMessagesLoop() {
+	n.fetchNegotiationMessages()
 	ticker := time.NewTicker(n.interval)
 	for {
 		select {
@@ -63,21 +88,7 @@ func (n *Negotiator) fetchNegotiationMessagesLoop() {
 			return
 		case <-ticker.C:
 		}
-		httpCode, msgMap, err := n.api.GetNegotiationMessages(n.networkID, n.getPeerIDer.GetPeerID())
-		if err != nil {
-			n.loggerError.Printf("%v", err)
-			continue
-		}
-		switch httpCode {
-		case http.StatusOK:
-		default:
-			n.loggerError.Printf("Unexpected HTTP code: %v", httpCode)
-			continue
-		}
-
-		n.lockDo(func() {
-			n.msgMap = msgMap
-		})
+		n.fetchNegotiationMessages()
 	}
 }
 
@@ -102,11 +113,37 @@ func (n *Negotiator) SetNegotiationMessage(peerIDTo, peerIDFrom string, msg *mod
 	return nil
 }
 
+func (n *Negotiator) getProposal() *models.NegotiationMessageT {
+	return &models.NegotiationMessageT{
+		Protocol:     models.ProtocolUDP,
+		SourcePort:   51476,
+		LocalAddress: nil,
+	}
+}
+
 func (n *Negotiator) NegotiateWith(peerIDTo string) (localMsg *models.NegotiationMessageT, remoteMsg *models.NegotiationMessageT, err error) {
+	localMsg = n.getProposal()
+	err = n.SetNegotiationMessage(peerIDTo, n.getPeerIDer.GetPeerID(), localMsg)
+	if err != nil {
+		return
+	}
+	start := time.Now()
 	n.lockDo(func() {
-		localMsg = &[]models.NegotiationMessageT{n.msgMap[n.getPeerIDer.GetPeerID()]}[0]
 		remoteMsg = &[]models.NegotiationMessageT{n.msgMap[peerIDTo]}[0]
 	})
+	if remoteMsg.Protocol != "" {
+		return
+	}
+	for {
+		remoteMsg, err = n.GetNegotiationMessage(peerIDTo, n.getPeerIDer.GetPeerID())
+		if remoteMsg.Protocol != "" || err != nil {
+			return
+		}
+		if time.Since(start) > negotiationTimeout {
+			return
+		}
+		time.Sleep(time.Second)
+	}
 	return
 }
 

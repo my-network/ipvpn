@@ -80,10 +80,12 @@ func main() {
 	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
 	fatalIf(err)
 
-	homenet, err := network.New(nil, &logger{})
+	netLogger := &logger{config.Get().DumpNetworkCommunications}
+
+	homenet, err := network.New(nil, netLogger)
 	fatalIf(err)
 
-	connectorInstance := connector.New(negotiator.New(config.Get().NetworkUpdateInterval, homenetServer, networkID, homenet))
+	connectorInstance := connector.New(negotiator.New(config.Get().NetworkUpdateInterval, homenetServer, networkID, homenet, netLogger), netLogger)
 
 	homenet.SetConnector(connectorInstance)
 

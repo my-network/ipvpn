@@ -11,14 +11,15 @@ import (
 var configInstance atomic.Value
 
 type config struct {
-	NetworkID             string        `env:"HOMENET_PEER_NETWORK_ID"`
-	PasswordFile          string        `env:"HOMENET_PEER_PASSWORD_FILE"`
-	ArbitrURL             string        `env:"HOMENET_ARBITR_URL" envDefault:"https://homenet.dx.center/"`
-	NetworkSubnet         string        `env:"HOMENET_NETWORK_SUBNET" envDefault:"10.68.0.0/16"`
-	NetworkUpdateInterval time.Duration `env:"HOMENET_NETWORK_UPDATE_INTERVAL" envDefault:"10s"`
-	DumpAPICommunications bool          `env:"HOMENET_NETWORK_DUMP_API"`
-	DumpVPNCommunications bool          `env:"HOMENET_NETWORK_DUMP_VPN"`
-	DumpConfiguration     bool          `env:"HOMENET_DUMP_CONFIG"`
+	NetworkID                 string        `env:"HOMENET_PEER_NETWORK_ID"`
+	PasswordFile              string        `env:"HOMENET_PEER_PASSWORD_FILE"`
+	ArbitrURL                 string        `env:"HOMENET_ARBITR_URL" envDefault:"https://homenet.dx.center/"`
+	NetworkSubnet             string        `env:"HOMENET_NETWORK_SUBNET" envDefault:"10.68.0.0/16"`
+	NetworkUpdateInterval     time.Duration `env:"HOMENET_NETWORK_UPDATE_INTERVAL" envDefault:"3600s"`
+	DumpAPICommunications     bool          `env:"HOMENET_NETWORK_DUMP_API"`
+	DumpVPNCommunications     bool          `env:"HOMENET_NETWORK_DUMP_VPN"`
+	DumpNetworkCommunications bool          `env:"HOMENET_NETWORK_DUMP_MESH"`
+	DumpConfiguration         bool          `env:"HOMENET_DUMP_CONFIG"`
 }
 
 func (cfg config) String() string {
