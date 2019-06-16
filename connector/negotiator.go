@@ -1,9 +1,9 @@
 package connector
 
 import (
-	"github.com/xaionaro-go/homenet-server/iface"
+	"github.com/xaionaro-go/homenet-server/models"
 )
 
 type Negotiator interface {
-	NegotiateWith(peerIDTo string) (iface.NegotiationMessage, iface.NegotiationMessage, error)
+	NegotiateWith(peerIDTo string) (*models.NegotiationMessageT, *models.NegotiationMessageT, error)
 }

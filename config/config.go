@@ -14,7 +14,7 @@ type config struct {
 	NetworkID             string        `env:"HOMENET_PEER_NETWORK_ID"`
 	PasswordHash          string        `env:"HOMENET_PEER_PASSWORDHASH"`
 	ArbitrURL             string        `env:"HOMENET_ARBITR_URL" envDefault:"https://homenet.dx.center/"`
-	NetworkSubnet         string        `env:"HOMENET_NETWORK_SUBNET" envDefault:"10.68.88.0/24"`
+	NetworkSubnet         string        `env:"HOMENET_NETWORK_SUBNET" envDefault:"10.68.0.0/16"`
 	NetworkUpdateInterval time.Duration `env:"HOMENET_NETWORK_UPDATE_INTERVAL" envDefault:"10s"`
 	DumpAPICommunications bool          `env:"HOMENET_NETWORK_DUMP_API"`
 	DumpVPNCommunications bool          `env:"HOMENET_NETWORK_DUMP_VPN"`

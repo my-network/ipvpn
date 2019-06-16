@@ -40,7 +40,7 @@ type vpn struct {
 	loggerDump  Logger
 }
 
-func New(subnet net.IPNet, homenet network.Network, opts ...Option) (r *vpn, err error) {
+func New(subnet net.IPNet, homenet *network.Network, opts ...Option) (r *vpn, err error) {
 	r = &vpn{
 		subnet:      subnet,
 		loggerError: &errorLogger{},
@@ -83,7 +83,7 @@ func (vpn *vpn) OnHomenetUpdatePeers(peers models.Peers) error {
 	return vpn.updatePeers(peers)
 }
 
-func (vpn *vpn) setNetwork(newNetwork network.Network) {
+func (vpn *vpn) setNetwork(newNetwork *network.Network) {
 	vpn.LockDo(func() {
 		oldNetwork := vpn.GetNetwork()
 		if oldNetwork != nil {
@@ -96,12 +96,12 @@ func (vpn *vpn) setNetwork(newNetwork network.Network) {
 	})
 }
 
-func (vpn *vpn) GetNetwork() network.Network {
+func (vpn *vpn) GetNetwork() *network.Network {
 	net := vpn.network.Load()
 	if net == nil {
 		return nil
 	}
-	return net.(network.Network)
+	return net.(*network.Network)
 }
 
 func (vpn *vpn) tapReadHandler() {

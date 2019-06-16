@@ -7,6 +7,6 @@ import (
 
 func TestConnectionType(t *testing.T) {
 	var conn net.Conn
-	conn = *connection{}
+	conn = &Connection{}
 	_ = conn
 }

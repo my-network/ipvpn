@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/xaionaro-go/homenet-peer/connector"
 	"net"
 	"net/http"
 	"os"
@@ -71,10 +72,12 @@ func main() {
 	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
 	fatalIf(err)
 
-	homenet, err := network.New()
+	homenet, err := network.New(nil, &logger{})
 	fatalIf(err)
 
-	homenet.SetNegotiator(negotiator.New(config.Get().NetworkUpdateInterval, homenetServer, networkID, homenet))
+	connectorInstance := connector.New(negotiator.New(config.Get().NetworkUpdateInterval, homenetServer, networkID, homenet))
+
+	homenet.SetConnector(connectorInstance)
 
 	_, err = vpn.New(*subnet, homenet)
 	fatalIf(err)

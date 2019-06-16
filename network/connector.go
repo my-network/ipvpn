@@ -4,10 +4,8 @@ import (
 	"net"
 
 	"github.com/xaionaro-go/homenet-server/iface"
-
-	"github.com/xaionaro-go/homenet-peer/filters"
 )
 
 type Connector interface {
-	NewConnection(peerLocal, peerRemote iface.Peer, filters ...filters.Filter) (net.Conn, error)
+	NewConnection(peerLocal, peerRemote iface.Peer) (net.Conn, error)
 }
