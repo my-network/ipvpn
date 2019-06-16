@@ -170,7 +170,7 @@ func (vpn *vpn) tapReadHandler() {
 		}
 
 		vpn.ifDump(func(log Logger) {
-			log.Printf("received a frame on the TAP-device: isHomenetDST: %v, isBroadcastDST: %v, length: %v", isHomenetDst, isBroadcastDst, msg.n)
+			log.Printf("received a frame on the TAP-device: isHomenetDst: %v, isBroadcastDst: %v, length: %v", isHomenetDst, isBroadcastDst, msg.n)
 		})
 
 		if !isHomenetDst && !isBroadcastDst {
