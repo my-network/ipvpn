@@ -71,6 +71,7 @@ func (connector *connector) newConnection(
 	}
 
 	conn := NewConnection(
+		connector.logger,
 		proto,
 		Endpoint{
 			Port: negotiationMsgLocal.SourcePort,
@@ -81,7 +82,17 @@ func (connector *connector) newConnection(
 		},
 	)
 
-	err := conn.Dial()
+	doDial := peerLocal.GetIntAlias() > peerRemote.GetIntAlias()
+	if negotiationMsgLocal.RequireReverseDirection || negotiationMsgRemote.RequireReverseDirection {
+		doDial = !doDial
+	}
+
+	var err error
+	if doDial {
+		err = errors.Wrap(conn.Dial())
+	} else {
+		err = errors.Wrap(conn.Listen())
+	}
 	if err != nil {
 		return nil, errors.Wrap(err)
 	}

@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,9 @@ const (
 var (
 	ErrWrongMask    = errors.New("Invalid mask")
 	ErrPeerNotFound = errors.NotFound.New("peer not found")
-	ErrNoConnection = errors.CannotSendData.New("there's no established connection, yet")
+	ErrNoPath       = errors.CannotSendData.New("there's no established path, yet")
+	ErrPartialWrite = errors.New("partial write")
+	ErrEmptyPayload = errors.New("empty payload")
 )
 
 type vpn struct {
@@ -36,6 +39,7 @@ type vpn struct {
 	tapLink         tenus.Linker
 	subnet          net.IPNet
 	locker          sync.Mutex
+	writerMap       map[string]io.Writer
 
 	loggerError Logger
 	loggerDump  Logger
@@ -47,6 +51,7 @@ func New(subnet net.IPNet, homenet *network.Network, opts ...Option) (r *vpn, er
 	}()
 	r = &vpn{
 		subnet:      subnet,
+		writerMap:   make(map[string]io.Writer),
 		loggerError: &errorLogger{},
 	}
 
@@ -114,7 +119,32 @@ func (vpn *vpn) setNetwork(newNetwork *network.Network) {
 		vpn.network.Store(newNetwork)
 
 		newNetwork.AddHooker(vpn)
+		newNetwork.SetServiceHandler(network.ServiceID_vpn, vpn)
 	})
+}
+
+var (
+	framebufPool = sync.Pool{
+		New: func() interface{} {
+			buf := make(ethernet.Frame, TAPFrameMaxSize)
+			return &buf
+		},
+	}
+)
+
+func (vpn *vpn) Handle(authorID uint32, payload []byte) error {
+	vpn.ifDump(func(log Logger) {
+		log.Printf("sending to the TAP-device: %v", payload)
+	})
+	n, err := vpn.tapIface.Write(payload)
+	if n != len(payload) && err == nil {
+		err = ErrPartialWrite.Wrap(authorID, n, payload)
+	}
+	if err != nil {
+		return errors.Wrap(err)
+	}
+
+	return nil
 }
 
 func (vpn *vpn) GetNetwork() *network.Network {
@@ -171,7 +201,7 @@ func (vpn *vpn) tapReadHandler() {
 		}
 
 		vpn.ifDump(func(log Logger) {
-			log.Printf("received a frame on the TAP-device: isHomenetDst: %v, isBroadcastDst: %v, length: %v", isHomenetDst, isBroadcastDst, msg.n)
+			log.Printf("received a frame for %v on the TAP-device: isHomenetDst: %v, isBroadcastDst: %v, length: %v", dstMAC.String(), isHomenetDst, isBroadcastDst, msg.n)
 		})
 
 		if !isHomenetDst && !isBroadcastDst {
@@ -218,16 +248,19 @@ func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
 		)
 	})
 
-	homenet := vpn.GetNetwork()
-	conn := homenet.GetConnectionTo(peer)
-	if conn == nil {
-		vpn.ifDump(func(log Logger) {
-			log.Printf("there's no active connection to peer %v, yet :(", peer.GetID())
-		})
-		return ErrNoConnection
+	writer := vpn.writerMap[peer.GetID()]
+	if writer == nil {
+		writer = vpn.GetNetwork().GetPipeTo(peer, network.ServiceID_vpn)
+		if writer == nil {
+			vpn.ifDump(func(log Logger) {
+				log.Printf("there's no path to peer %v, yet :(", peer.GetID())
+			})
+			return ErrNoPath
+		}
+		vpn.writerMap[peer.GetID()] = writer
 	}
 
-	_, err := conn.Write(frame)
+	_, err := writer.Write(frame)
 	return err
 }
 

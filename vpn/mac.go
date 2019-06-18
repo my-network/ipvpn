@@ -70,7 +70,7 @@ func (mac mac) GetFrom(idx int) []byte {
 	return mac[idx:]
 }
 func (mac mac) IsHomenet() bool {
-	return mac[0] == MagicMACOctet0 && mac[1] == MagicMACOctet1
+	return mac[0] == MagicMACOctet0|0x02 && mac[1] == MagicMACOctet1
 }
 func (mac mac) IsBroadcast() bool {
 	for i := 0; i < macSize; i++ {
@@ -115,7 +115,7 @@ func (mac macSlice) GetFrom(idx int) []byte {
 }
 
 func (mac macSlice) IsHomenet() bool {
-	return mac[0] == MagicMACOctet0 && mac[1] == MagicMACOctet1
+	return mac[0] == MagicMACOctet0|0x02 && mac[1] == MagicMACOctet1
 }
 func (mac macSlice) IsBroadcast() bool {
 	for i := 0; i < macSize; i++ {

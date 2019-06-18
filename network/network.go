@@ -5,9 +5,11 @@ package network
 import (
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/mitchellh/go-homedir"
@@ -23,7 +25,9 @@ import (
 )
 
 const (
-	connectionRetryInitialDelay = 5 * time.Second
+	connectionRetryInitialDelay = time.Second
+	refusedTryLimit             = 30
+	signatureTryLimit           = 3
 )
 
 type Hooker interface {
@@ -31,16 +35,23 @@ type Hooker interface {
 	OnHomenetUpdatePeers(models.Peers) error
 }
 
+type Handler interface {
+	Handle(authorID uint32, payload []byte) error
+}
+
 type Network struct {
-	connector       Connector
-	peerID          string
-	peer            *models.PeerT
-	peers           atomic.Value
-	identity        *secureio.Identity
-	locker          sync.RWMutex
-	peerIntAliasMap atomicmap.Map
-	connectionsMap  atomicmap.Map
-	logger          Logger
+	connector            Connector
+	peerID               string
+	peer                 *models.PeerT
+	peers                atomic.Value
+	identity             *secureio.Identity
+	locker               sync.RWMutex
+	peerIntAliasMap      atomicmap.Map
+	directConnectionsMap atomicmap.Map
+	routersMap           atomicmap.Map
+	pathMap              atomicmap.Map
+	logger               Logger
+	serviceHandler       map[ServiceID]Handler
 
 	hookers []Hooker
 }
@@ -68,11 +79,14 @@ func New(connector Connector, logger Logger) (*Network, error) {
 	}
 
 	r := &Network{
-		connector:       connector,
-		logger:          logger,
-		identity:        identity,
-		peerIntAliasMap: atomicmap.New(),
-		connectionsMap:  atomicmap.New(),
+		connector:            connector,
+		logger:               logger,
+		identity:             identity,
+		peerIntAliasMap:      atomicmap.New(),
+		directConnectionsMap: atomicmap.New(),
+		routersMap:           atomicmap.New(),
+		pathMap:              atomicmap.New(),
+		serviceHandler:       make(map[ServiceID]Handler),
 	}
 	r.peerID = helpers.ToHEX(r.identity.Keys.Public)
 
@@ -105,6 +119,10 @@ func (homenet *Network) GetPeerByIntAlias(peerIntAlias uint32) *models.PeerT {
 	return r.(*models.PeerT)
 }
 
+func (homenet *Network) SetServiceHandler(serviceID ServiceID, handler Handler) {
+	homenet.serviceHandler[serviceID] = handler
+}
+
 func (homenet *Network) AddHooker(newHooker Hooker) {
 	homenet.LockDo(func() {
 		homenet.hookers = append(homenet.hookers, newHooker)
@@ -132,37 +150,106 @@ func (homenet *Network) GetPeers() models.Peers {
 	return peers.(models.Peers)
 }
 
-func (homenet *Network) GetConnectionTo(peer iface.Peer) net.Conn {
-	conn, _ := homenet.connectionsMap.Get(peer.GetID())
+func (homenet *Network) GetPathTo(peer iface.Peer) *Path {
+	path, _ := homenet.pathMap.Get(peer.GetID())
+	if path == nil {
+		return nil
+	}
+	return path.(*Path)
+}
+
+func (homenet *Network) GetPipeTo(peer iface.Peer, serviceID ServiceID) io.ReadWriter {
+	path := homenet.GetPathTo(peer)
+	if path == nil {
+		return nil
+	}
+	return path.GetReadWriter(serviceID)
+}
+
+func (homenet *Network) GetDirectConnectionTo(peer iface.Peer) io.ReadWriteCloser {
+	conn, _ := homenet.directConnectionsMap.Get(peer.GetID())
 	if conn == nil {
 		return nil
 	}
-	return conn.(net.Conn)
+	return conn.(io.ReadWriteCloser)
 }
 
 type sessionErrorHandler struct {
-	homenet *Network
-	peer    iface.Peer
+	isClosed           uint32
+	homenet            *Network
+	peer               iface.Peer
+	refusedTryNumber   uint
+	tryNumber          uint
+	signatureTryNumber uint
+}
+
+func (errHandler *sessionErrorHandler) considerFail(sess *secureio.Session) {
+	atomic.StoreUint32(&errHandler.isClosed, 1)
+	errHandler.homenet.logger.Debugf("sessionErrorHandler: considerFail")
+	_ = errHandler.homenet.directConnectionsMap.Unset(errHandler.peer.GetID())
+	_ = sess.Close()
+
+	go func() {
+		delayBeforeRetry := connectionRetryInitialDelay //* time.Duration(1<<errHandler.tryNumber)
+		errHandler.homenet.logger.Debugf("retry (try: %v) in %v...", errHandler.tryNumber, delayBeforeRetry)
+		time.Sleep(delayBeforeRetry)
+		errHandler.homenet.establishConnectionTo(errHandler.peer, errHandler.tryNumber+1)
+	}()
+}
+
+func (errHandler *sessionErrorHandler) IsClosed() bool {
+	return atomic.LoadUint32(&errHandler.isClosed) != 0
 }
 
 func (errHandler *sessionErrorHandler) Error(sess *secureio.Session, err error) {
+	if errHandler.IsClosed() {
+		return
+	}
+	err = err.(errors.SmartError).OriginalError()
+	errHandler.homenet.logger.Debugf("sessionErrorHandler: %T:%v", err, err)
+	if netErr, ok := err.(*net.OpError); ok {
+		errHandler.homenet.logger.Debugf("sessionErrorHandler: net error: %T:%v", netErr.Err, netErr.Err)
+		if osErr, ok := netErr.Err.(*os.SyscallError); ok {
+			errHandler.homenet.logger.Debugf("sessionErrorHandler: net os error: %T:%v", osErr.Err, osErr.Err)
+			if osErr.Err == syscall.ECONNREFUSED {
+				errHandler.refusedTryNumber++
+				if errHandler.refusedTryNumber < refusedTryLimit {
+					errHandler.homenet.logger.Debugf("connection refused by remote side, retry.")
+					return
+				}
+				errHandler.homenet.logger.Infof("connection refused by remote side")
+				errHandler.considerFail(sess)
+				return
+			}
+		}
+	}
+	if err == secureio.ErrInvalidSignature {
+		errHandler.signatureTryNumber++
+		if errHandler.signatureTryNumber < signatureTryLimit {
+			errHandler.homenet.logger.Infof("invalid signature, retry.")
+			return
+		}
+		errHandler.homenet.logger.Infof("invalid signature.")
+		errHandler.considerFail(sess)
+		return
+	}
+
 	errHandler.homenet.logger.Error(err)
-	_ = errHandler.homenet.connectionsMap.Unset(errHandler.peer.GetID())
-	_ = sess.Close()
+	errHandler.considerFail(sess)
 }
 
 func (errHandler *sessionErrorHandler) Infof(fm string, args ...interface{}) {
-	errHandler.homenet.logger.Infof(fm, args)
+	errHandler.homenet.logger.Infof(fm, args...)
 }
 
 func (errHandler *sessionErrorHandler) Debugf(fm string, args ...interface{}) {
-	errHandler.homenet.logger.Debugf(fm, args)
+	errHandler.homenet.logger.Debugf(fm, args...)
 }
 
-func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) io.ReadWriteCloser {
-	if conn := homenet.GetConnectionTo(peer); conn != nil {
+func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) {
+	if conn := homenet.GetDirectConnectionTo(peer); conn != nil {
 		// We don't need to do anything if we already have a working connection
-		return conn
+		return
 	}
 
 	homenet.logger.Debugf("establishing a connection to %v %v", peer.GetIntAlias(), peer.GetID())
@@ -173,17 +260,35 @@ func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) i
 			time.Sleep(connectionRetryInitialDelay * time.Duration(1<<tryNumber))
 			homenet.establishConnectionTo(peer, tryNumber+1)
 		}()
-		return nil
+		return
 	}
 
 	homenet.logger.Debugf("securing the connection to %v %v", peer.GetIntAlias(), peer.GetID())
+	if len(peer.GetPublicKey()) == 0 {
+		homenet.logger.Error("peer's public key is empty")
+		return
+	}
 	conn := homenet.identity.NewSession(secureio.NewRemoteIdentityFromPublicKey(peer.GetPublicKey()), realConn, &sessionErrorHandler{
-		homenet,
-		peer,
+		homenet:   homenet,
+		peer:      peer,
+		tryNumber: tryNumber,
 	})
 
 	homenet.logger.Debugf("saving the connection to %v %v", peer.GetIntAlias(), peer.GetID())
-	oldConn, err := homenet.connectionsMap.Swap(peer.GetID(), conn)
+	homenet.saveDirectConnection(peer, conn)
+
+	return
+}
+
+func (homenet *Network) logError(err error) {
+	if err == nil {
+		return
+	}
+	homenet.logger.Error("[homenet-network] got error: ", err)
+}
+
+func (homenet *Network) saveDirectConnection(peer iface.Peer, conn io.ReadWriteCloser) {
+	oldConn, err := homenet.directConnectionsMap.Swap(peer.GetID(), conn)
 	if oldConn != nil {
 		// If somebody already putted a connection for this peer (while another goroutine), then we need to close it :(
 		// It was somekind of a race condition. And here we are cleaning things up.
@@ -194,14 +299,41 @@ func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) i
 		homenet.logError(errors.Wrap(err))
 	}
 
-	return conn
+	homenet.setupRouter(peer, conn)
+	homenet.updatePaths()
 }
 
-func (homenet *Network) logError(err error) {
-	if err == nil {
-		return
+func (homenet *Network) setupRouter(peer iface.Peer, conn io.ReadWriteCloser) {
+	router := NewRouter(homenet, peer, conn)
+	oldRouter, _ := homenet.routersMap.Swap(peer.GetID(), router)
+	if oldRouter != nil {
+		_ = oldRouter.(*Router).Close()
 	}
-	homenet.logger.Error("[homenet-network] got error: ", err)
+}
+
+func (homenet *Network) updatePaths() {
+	for _, peer := range homenet.GetPeers() {
+		pathI, _ := homenet.pathMap.Get(peer.GetID())
+		if pathI != nil {
+			path := pathI.(*Path)
+			if path.IsValid() {
+				continue
+			} else {
+				_ = homenet.pathMap.Set(peer.GetID(), nil)
+			}
+		}
+
+		var router *Router
+		routerI, _ := homenet.routersMap.Get(peer.GetID())
+		if routerI == nil {
+			continue
+		}
+		router = routerI.(*Router)
+		oldPath, _ := homenet.pathMap.Swap(peer.GetID(), NewPath(peer, router))
+		if oldPath != nil {
+			_ = oldPath.(*Path).Close()
+		}
+	}
 }
 
 func (homenet *Network) UpdatePeers(peers models.Peers) (err error) {
