@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/xaionaro-go/homenet-server/errors"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -31,6 +32,12 @@ func fatalIf(err error) {
 	}
 }
 
+func errorIf(err error) {
+	if err != nil {
+		logrus.Error(err)
+	}
+}
+
 type debugLogger struct{}
 
 func (l *debugLogger) Printf(fmt string, args ...interface{}) {
@@ -53,13 +60,20 @@ func main() {
 		apiOptions = append(apiOptions, api.OptSetLoggerDebug(&debugLogger{}))
 	}
 
+	networkID := config.Get().NetworkID
+
+	if strings.HasPrefix(networkID, `readfile:`) {
+		networkIDBytes, err := ioutil.ReadFile(networkID[len(`readfile:`)-1:])
+		fatalIf(err)
+		networkID = string(networkIDBytes)
+	}
+
 	passwordFile := config.Get().PasswordFile
 	password, err := ioutil.ReadFile(passwordFile)
 	if err != nil {
 		panic(fmt.Errorf(`cannot read the password file "%v"`, passwordFile))
 	}
 
-	networkID := config.Get().NetworkID
 	passwordHashHash := string(helpers.Hash([]byte(strings.Trim(string(password), " \t\n\r"))))
 	homenetServer := api.New(config.Get().ArbitrURL, passwordHashHash, apiOptions...)
 	status, netInfo, err := homenetServer.GetNet(networkID)
@@ -102,25 +116,33 @@ func main() {
 		peerName = ""
 	}
 
+	peers, err := network.ParsePeersFromFile(config.Get().PeersFile)
+	if err == nil {
+		fatalIf(homenet.UpdatePeers(peers))
+	}
+
 	_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName, homenet.GetIdentity().Keys.Public)
 	fatalIf(err)
 
-	_, peers, err := homenetServer.GetPeers(netInfo.GetID())
-	fatalIf(err)
-	fatalIf(homenet.UpdatePeers(peers))
+	_, peers, err = homenetServer.GetPeers(netInfo.GetID())
+	errorIf(errors.Wrap(err))
+	if err == nil {
+		errorIf(errors.Wrap(network.SavePeersToFile(config.Get().PeersFile, peers)))
+		errorIf(errors.Wrap(homenet.UpdatePeers(peers)))
+	}
 
 	ticker := time.NewTicker(config.Get().NetworkUpdateInterval)
 	for {
 		<-ticker.C
 		_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName, homenet.GetIdentity().Keys.Public)
-		if err != nil {
-			logrus.Errorf("homenetServer.RegisterPeer(%s, %s): %s", netInfo.GetID(), homenet.GetPeerID(), err.Error())
-		}
+		errorIf(errors.Wrap(err))
 		_, peers, err := homenetServer.GetPeers(netInfo.GetID())
 		if err != nil {
 			logrus.Errorf("homenetServer.GetPeers(%s): %s", netInfo.GetID(), err.Error())
+			continue
 		}
-		err = homenet.UpdatePeers(peers)
+		errorIf(errors.Wrap(network.SavePeersToFile(config.Get().PeersFile, peers)))
+		errorIf(errors.Wrap(homenet.UpdatePeers(peers)))
 		if err != nil {
 			logrus.Errorf("homenet.UpdatePeers(): %s", err.Error())
 		}

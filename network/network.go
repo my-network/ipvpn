@@ -3,7 +3,9 @@ package network
 // TODO: consider https://github.com/perlin-network/noise
 
 import (
+	"encoding/json"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -46,7 +48,7 @@ type Network struct {
 	peers                atomic.Value
 	identity             *secureio.Identity
 	locker               sync.RWMutex
-	peerIntAliasMap      atomicmap.Map
+	peerIntAliasMap      atomic.Value
 	directConnectionsMap atomicmap.Map
 	routersMap           atomicmap.Map
 	pathMap              atomicmap.Map
@@ -82,12 +84,12 @@ func New(connector Connector, logger Logger) (*Network, error) {
 		connector:            connector,
 		logger:               logger,
 		identity:             identity,
-		peerIntAliasMap:      atomicmap.New(),
 		directConnectionsMap: atomicmap.New(),
 		routersMap:           atomicmap.New(),
 		pathMap:              atomicmap.New(),
 		serviceHandler:       make(map[ServiceID]Handler),
 	}
+	r.peerIntAliasMap.Store(atomicmap.New())
 	r.peerID = helpers.ToHEX(r.identity.Keys.Public)
 
 	return r, nil
@@ -112,7 +114,7 @@ func (homenet *Network) Close() {
 }
 
 func (homenet *Network) GetPeerByIntAlias(peerIntAlias uint32) *models.PeerT {
-	r, _ := homenet.peerIntAliasMap.Get(peerIntAlias)
+	r, _ := homenet.peerIntAliasMap.Load().(atomicmap.Map).Get(peerIntAlias)
 	if r == nil {
 		return nil
 	}
@@ -187,6 +189,8 @@ func (errHandler *sessionErrorHandler) considerFail(sess *secureio.Session) {
 	atomic.StoreUint32(&errHandler.isClosed, 1)
 	errHandler.homenet.logger.Debugf("sessionErrorHandler: considerFail")
 	_ = errHandler.homenet.directConnectionsMap.Unset(errHandler.peer.GetID())
+	_ = errHandler.homenet.routersMap.Unset(errHandler.peer.GetID())
+	_ = errHandler.homenet.pathMap.Unset(errHandler.peer.GetID())
 	_ = sess.Close()
 
 	go func() {
@@ -318,8 +322,6 @@ func (homenet *Network) updatePaths() {
 			path := pathI.(*Path)
 			if path.IsValid() {
 				continue
-			} else {
-				_ = homenet.pathMap.Set(peer.GetID(), nil)
 			}
 		}
 
@@ -336,29 +338,38 @@ func (homenet *Network) updatePaths() {
 	}
 }
 
+func ParsePeersFromFile(filePath string) (result models.Peers, err error) {
+	b, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+	err = json.Unmarshal(b, &result)
+	return
+}
+
+func SavePeersToFile(filePath string, peers models.Peers) error {
+	b, err := json.Marshal(peers)
+	if err != nil {
+		return errors.Wrap(err)
+	}
+	return ioutil.WriteFile(filePath, b, 0640)
+}
+
 func (homenet *Network) UpdatePeers(peers models.Peers) (err error) {
 	homenet.RLockDo(func() {
-		oldPeers := homenet.GetPeers()
-		removePeerIDs := atomicmap.NewWithArgs(uint64(len(oldPeers))*3/2 + 1) // it's just faster than Go's bultin maps
-		for _, peer := range oldPeers {
-			homenet.logError(removePeerIDs.Set(peer.GetID(), struct{}{}))
-		}
+		newIntAliasMap := atomicmap.NewWithArgs(uint64(len(peers))*3/2 + 1)
 		foundMyself := false
 		for _, peer := range peers {
-			peerID := peer.GetID()
-			_ = removePeerIDs.Unset(peerID)
-			if peerID == homenet.GetPeerID() {
+			if peer.GetID() == homenet.GetPeerID() {
 				homenet.peer = peer
 				foundMyself = true
 			}
-			homenet.logError(errors.Wrap(homenet.peerIntAliasMap.Set(peerID, peer)))
+			homenet.logError(errors.Wrap(newIntAliasMap.Set(peer.GetIntAlias(), peer)))
 		}
+		homenet.peerIntAliasMap.Store(newIntAliasMap)
 		if !foundMyself {
 			err = errors.Wrap(ErrMyselfNotFound)
 			return
-		}
-		for removePeerID := range removePeerIDs.Keys() {
-			homenet.logError(errors.Wrap(homenet.peerIntAliasMap.Unset(removePeerID)))
 		}
 		homenet.peers.Store(peers)
 		for _, peer := range peers {

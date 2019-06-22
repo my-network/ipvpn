@@ -68,22 +68,23 @@ func New(subnet net.IPNet, homenet *network.Network, opts ...Option) (r *vpn, er
 	r.tapIface, err = water.New(water.Config{
 		DeviceType: water.TAP,
 	})
-	r.ifDump(func(log Logger) {
-		log.Printf("created network interface: %v", r.tapIface.Name())
-	})
 	if err != nil {
 		return
 	}
 	r.ifDump(func(log Logger) {
+		log.Printf("created network interface: %v", r.tapIface.Name())
 		log.Printf("creating network link")
 	})
 	if r.tapLink, err = tenus.NewLinkFrom(r.tapIface.Name()); err != nil {
 		return
 	}
 	r.ifDump(func(log Logger) {
-		log.Printf("UP-ing network link")
+		log.Printf("UP-ing network link and setting the MTU")
 	})
 	if err = r.tapLink.SetLinkUp(); err != nil {
+		return
+	}
+	if err = r.tapLink.SetLinkMTU(800); err != nil {
 		return
 	}
 	r.ifDump(func(log Logger) {
@@ -232,7 +233,7 @@ func (vpn *vpn) ifDump(fn func(Logger)) {
 	fn(vpn.loggerDump)
 }
 
-func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
+func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) (err error) {
 	vpn.ifDump(func(log Logger) {
 		log.Printf(`>>>	Peer: %v %v
 	Dst: %s
@@ -248,20 +249,49 @@ func (vpn *vpn) SendToPeer(peer *models.PeerT, frame ethernet.Frame) error {
 		)
 	})
 
-	writer := vpn.writerMap[peer.GetID()]
-	if writer == nil {
-		writer = vpn.GetNetwork().GetPipeTo(peer, network.ServiceID_vpn)
-		if writer == nil {
-			vpn.ifDump(func(log Logger) {
-				log.Printf("there's no path to peer %v, yet :(", peer.GetID())
-			})
-			return ErrNoPath
-		}
-		vpn.writerMap[peer.GetID()] = writer
+	var writer io.Writer
+	writer, err = vpn.getPipeTo(peer)
+	if err != nil {
+		return errors.Wrap(err)
 	}
 
-	_, err := writer.Write(frame)
+	_, err = writer.Write(frame)
+	if err != nil {
+		vpn.resetPipeTo(peer)
+		writer, err = vpn.getPipeTo(peer)
+		if err != nil {
+			return errors.Wrap(err)
+		}
+		_, err = writer.Write(frame)
+		if err != nil {
+			err = errors.Wrap(err)
+		}
+	}
 	return err
+}
+
+func (vpn *vpn) getPipeTo(peer *models.PeerT) (writer io.Writer, err error) {
+	writer = vpn.writerMap[peer.GetID()]
+	if writer != nil {
+		return
+	}
+
+	writer = vpn.GetNetwork().GetPipeTo(peer, network.ServiceID_vpn)
+	if writer == nil {
+		vpn.ifDump(func(log Logger) {
+			log.Printf("there's no path to peer %v, yet :(", peer.GetID())
+		})
+		return nil, errors.Wrap(ErrNoPath)
+	}
+	vpn.writerMap[peer.GetID()] = writer
+	return
+}
+
+func (vpn *vpn) resetPipeTo(peer *models.PeerT) {
+	vpn.ifDump(func(log Logger) {
+		log.Printf("resetPipeTo %v", peer.GetIntAlias())
+	})
+	vpn.writerMap[peer.GetID()] = nil
 }
 
 func (vpn *vpn) SendToPeerByIntAlias(peerIntAlias uint32, frame []byte) error {
