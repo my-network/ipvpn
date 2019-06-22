@@ -19,6 +19,7 @@ type ServiceID uint16
 
 const (
 	ServiceID_undefined = ServiceID(iota)
+	ServiceID_internal
 	ServiceID_vpn
 	ServiceID_proxy
 	ServiceID_term

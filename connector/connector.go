@@ -5,7 +5,6 @@ import (
 
 	"github.com/xaionaro-go/errors"
 
-	"github.com/xaionaro-go/homenet-server/iface"
 	"github.com/xaionaro-go/homenet-server/models"
 )
 
@@ -25,10 +24,24 @@ func New(negotiator Negotiator, logger Logger) *connector {
 	}
 }
 
-func (connector *connector) NewConnection(peerLocal, peerRemote iface.Peer) (conn net.Conn, err error) {
+func (connector *connector) NewConnection(peerLocal, peerRemote *models.PeerT) (conn net.Conn, err error) {
 	defer func() {
 		err = errors.Wrap(err)
 	}()
+
+	if peerRemote.LastSuccessfulNegotiationMessage.Local != nil && peerRemote.LastSuccessfulNegotiationMessage.Remote != nil {
+		connector.logger.Debugf("try old negotiation messages: local:%v; remote:%v", peerLocal.GetIntAlias(), peerRemote.GetIntAlias())
+		conn, err = connector.newConnection(
+			peerLocal,
+			peerRemote,
+			peerRemote.LastSuccessfulNegotiationMessage.Local,
+			peerRemote.LastSuccessfulNegotiationMessage.Remote,
+		)
+		if err == nil {
+			return
+		}
+	}
+
 	connector.logger.Debugf("negotiation starts: local:%v; remote:%v", peerLocal.GetIntAlias(), peerRemote.GetIntAlias())
 	negotiationMsgLocal, negotiationMsgRemote, err := connector.negotiator.NegotiateWith(peerRemote.GetID())
 	connector.logger.Debugf("negotiation ended: local:%v:%v; remote:%v:%v; err:%v", peerLocal.GetIntAlias(), negotiationMsgLocal, peerRemote.GetIntAlias(), negotiationMsgRemote, err)
@@ -43,7 +56,7 @@ func (connector *connector) NewConnection(peerLocal, peerRemote iface.Peer) (con
 }
 
 func (connector *connector) newConnection(
-	peerLocal, peerRemote iface.Peer,
+	peerLocal, peerRemote *models.PeerT,
 	negotiationMsgLocal, negotiationMsgRemote *models.NegotiationMessage,
 ) (net.Conn, error) {
 	// This's actually a wrong method to detect if the remote host is in the same network with you.
@@ -97,5 +110,6 @@ func (connector *connector) newConnection(
 		return nil, errors.Wrap(err)
 	}
 
+	peerRemote.SetLastNegotiationPair(negotiationMsgLocal, negotiationMsgRemote)
 	return conn, nil
 }

@@ -3,9 +3,9 @@ package network
 import (
 	"net"
 
-	"github.com/xaionaro-go/homenet-server/iface"
+	"github.com/xaionaro-go/homenet-server/models"
 )
 
 type Connector interface {
-	NewConnection(peerLocal, peerRemote iface.Peer) (net.Conn, error)
+	NewConnection(peerLocal, peerRemote *models.PeerT) (net.Conn, error)
 }

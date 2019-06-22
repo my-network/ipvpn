@@ -121,13 +121,17 @@ func main() {
 		fatalIf(homenet.UpdatePeers(peers))
 	}
 
+	homenet.AddHooker(&savePeersHandler{
+		homenet:       homenet,
+		peersFilePath: config.Get().PeersFile,
+	})
+
 	_, _, err = homenetServer.RegisterPeer(netInfo.GetID(), homenet.GetPeerID(), peerName, homenet.GetIdentity().Keys.Public)
 	fatalIf(err)
 
 	_, peers, err = homenetServer.GetPeers(netInfo.GetID())
 	errorIf(errors.Wrap(err))
 	if err == nil {
-		errorIf(errors.Wrap(network.SavePeersToFile(config.Get().PeersFile, peers)))
 		errorIf(errors.Wrap(homenet.UpdatePeers(peers)))
 	}
 
@@ -141,7 +145,6 @@ func main() {
 			logrus.Errorf("homenetServer.GetPeers(%s): %s", netInfo.GetID(), err.Error())
 			continue
 		}
-		errorIf(errors.Wrap(network.SavePeersToFile(config.Get().PeersFile, peers)))
 		errorIf(errors.Wrap(homenet.UpdatePeers(peers)))
 		if err != nil {
 			logrus.Errorf("homenet.UpdatePeers(): %s", err.Error())

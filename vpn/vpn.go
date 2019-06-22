@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"fmt"
+	"github.com/xaionaro-go/homenet-server/iface"
 	"io"
 	"net"
 	"sync"
@@ -79,12 +80,12 @@ func New(subnet net.IPNet, homenet *network.Network, opts ...Option) (r *vpn, er
 		return
 	}
 	r.ifDump(func(log Logger) {
-		log.Printf("UP-ing network link and setting the MTU")
+		log.Printf("setting the MTU and UP-ing network link")
 	})
-	if err = r.tapLink.SetLinkUp(); err != nil {
+	if err = r.tapLink.SetLinkMTU(800); err != nil {
 		return
 	}
-	if err = r.tapLink.SetLinkMTU(800); err != nil {
+	if err = r.tapLink.SetLinkUp(); err != nil {
 		return
 	}
 	r.ifDump(func(log Logger) {
@@ -108,6 +109,10 @@ func (vpn *vpn) OnHomenetClose() {
 
 func (vpn *vpn) OnHomenetUpdatePeers(peers models.Peers) error {
 	return vpn.updatePeers(peers)
+}
+
+func (vpn *vpn) OnHomenetConnectPeer(peer iface.Peer) error {
+	return nil
 }
 
 func (vpn *vpn) setNetwork(newNetwork *network.Network) {

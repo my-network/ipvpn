@@ -35,6 +35,7 @@ const (
 type Hooker interface {
 	OnHomenetClose()
 	OnHomenetUpdatePeers(models.Peers) error
+	OnHomenetConnectPeer(peer iface.Peer) error
 }
 
 type Handler interface {
@@ -47,27 +48,16 @@ type Network struct {
 	peer                 *models.PeerT
 	peers                atomic.Value
 	identity             *secureio.Identity
-	locker               sync.RWMutex
-	peerIntAliasMap      atomic.Value
+	peerIDMap            atomicmap.Map
+	peerIntAliasMap      atomicmap.Map
 	directConnectionsMap atomicmap.Map
 	routersMap           atomicmap.Map
 	pathMap              atomicmap.Map
 	logger               Logger
 	serviceHandler       map[ServiceID]Handler
+	updatePeersLocker    sync.RWMutex
 
 	hookers []Hooker
-}
-
-func (homenet *Network) RLockDo(fn func()) {
-	homenet.locker.RLock()
-	defer homenet.locker.RUnlock()
-	fn()
-}
-
-func (homenet *Network) LockDo(fn func()) {
-	homenet.locker.Lock()
-	defer homenet.locker.Unlock()
-	fn()
 }
 
 func New(connector Connector, logger Logger) (*Network, error) {
@@ -87,9 +77,11 @@ func New(connector Connector, logger Logger) (*Network, error) {
 		directConnectionsMap: atomicmap.New(),
 		routersMap:           atomicmap.New(),
 		pathMap:              atomicmap.New(),
+		peerIDMap:            atomicmap.New(),
+		peerIntAliasMap:      atomicmap.New(),
 		serviceHandler:       make(map[ServiceID]Handler),
 	}
-	r.peerIntAliasMap.Store(atomicmap.New())
+	r.peers.Store(models.Peers{})
 	r.peerID = helpers.ToHEX(r.identity.Keys.Public)
 
 	return r, nil
@@ -100,21 +92,17 @@ func (homenet *Network) GetIdentity() *secureio.Identity {
 }
 
 func (homenet *Network) SetConnector(connector Connector) {
-	homenet.LockDo(func() {
-		homenet.connector = connector
-	})
+	homenet.connector = connector
 }
 
 func (homenet *Network) Close() {
-	homenet.RLockDo(func() {
-		for _, hooker := range homenet.hookers {
-			hooker.OnHomenetClose()
-		}
-	})
+	for _, hooker := range homenet.hookers {
+		hooker.OnHomenetClose()
+	}
 }
 
 func (homenet *Network) GetPeerByIntAlias(peerIntAlias uint32) *models.PeerT {
-	r, _ := homenet.peerIntAliasMap.Load().(atomicmap.Map).Get(peerIntAlias)
+	r, _ := homenet.peerIntAliasMap.Get(peerIntAlias)
 	if r == nil {
 		return nil
 	}
@@ -126,22 +114,18 @@ func (homenet *Network) SetServiceHandler(serviceID ServiceID, handler Handler) 
 }
 
 func (homenet *Network) AddHooker(newHooker Hooker) {
-	homenet.LockDo(func() {
-		homenet.hookers = append(homenet.hookers, newHooker)
-	})
+	homenet.hookers = append(homenet.hookers, newHooker)
 }
 
 func (homenet *Network) RemoveHooker(removeHooker Hooker) {
-	homenet.LockDo(func() {
-		var leftHookers []Hooker
-		for _, hooker := range homenet.hookers {
-			if hooker == removeHooker {
-				continue
-			}
-			leftHookers = append(leftHookers, hooker)
+	var leftHookers []Hooker
+	for _, hooker := range homenet.hookers {
+		if hooker == removeHooker {
+			continue
 		}
-		homenet.hookers = leftHookers
-	})
+		leftHookers = append(leftHookers, hooker)
+	}
+	homenet.hookers = leftHookers
 }
 
 func (homenet *Network) GetPeers() models.Peers {
@@ -179,10 +163,20 @@ func (homenet *Network) GetDirectConnectionTo(peer iface.Peer) io.ReadWriteClose
 type sessionErrorHandler struct {
 	isClosed           uint32
 	homenet            *Network
-	peer               iface.Peer
+	peer               *models.PeerT
 	refusedTryNumber   uint
 	tryNumber          uint
 	signatureTryNumber uint
+}
+
+func (errHandler *sessionErrorHandler) OnConnect(sess *secureio.Session) {
+	errHandler.peer.SetLastSuccessfulNegotiationPair(errHandler.peer.GetLastNegotiationPair())
+
+	for _, hooker := range errHandler.homenet.hookers {
+		if err := hooker.OnHomenetConnectPeer(errHandler.peer); err != nil {
+			return
+		}
+	}
 }
 
 func (errHandler *sessionErrorHandler) considerFail(sess *secureio.Session) {
@@ -257,7 +251,7 @@ func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) {
 	}
 
 	homenet.logger.Debugf("establishing a connection to %v %v", peer.GetIntAlias(), peer.GetID())
-	realConn, err := homenet.connector.NewConnection(homenet.peer, peer)
+	realConn, err := homenet.connector.NewConnection(homenet.peer, peer.(*models.PeerT))
 	if realConn == nil || err != nil {
 		homenet.logger.Infof("we were unable to connect to %v: realConn is nil: %v;  err == %v", peer.GetID(), realConn == nil, err)
 		go func() {
@@ -274,7 +268,7 @@ func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) {
 	}
 	conn := homenet.identity.NewSession(secureio.NewRemoteIdentityFromPublicKey(peer.GetPublicKey()), realConn, &sessionErrorHandler{
 		homenet:   homenet,
-		peer:      peer,
+		peer:      peer.(*models.PeerT),
 		tryNumber: tryNumber,
 	})
 
@@ -355,43 +349,69 @@ func SavePeersToFile(filePath string, peers models.Peers) error {
 	return ioutil.WriteFile(filePath, b, 0640)
 }
 
+func (homenet *Network) onNewPeer(peer *models.PeerT) {
+	homenet.logger.Debugf("new peer: %v %v (is_me: %v)", peer.GetIntAlias(), peer.GetID(), peer.GetID() == homenet.GetPeerID())
+	if peer.GetID() == homenet.GetPeerID() {
+		homenet.peer = peer
+		return
+	}
+	go homenet.establishConnectionTo(peer, 0)
+}
+
 func (homenet *Network) UpdatePeers(peers models.Peers) (err error) {
-	homenet.RLockDo(func() {
-		newIntAliasMap := atomicmap.NewWithArgs(uint64(len(peers))*3/2 + 1)
-		foundMyself := false
-		for _, peer := range peers {
-			if peer.GetID() == homenet.GetPeerID() {
-				homenet.peer = peer
-				foundMyself = true
+	homenet.updatePeersLocker.Lock()
+	defer homenet.updatePeersLocker.Unlock()
+
+	dontRemoveMap := map[string]bool{}
+	var oldPeers models.Peers
+	var newPeers models.Peers
+	for _, peer := range peers {
+		oldPeerI, _ := homenet.peerIDMap.Get(peer.GetID())
+		if oldPeerI == nil {
+			newPeers = append(newPeers, peer)
+		} else {
+			oldPeer := oldPeerI.(*models.PeerT)
+			oldPeers = append(oldPeers, oldPeer)
+			dontRemoveMap[peer.GetID()] = true
+
+			if peer.GetIntAlias() != oldPeer.GetIntAlias() {
+				_ = homenet.peerIntAliasMap.Unset(oldPeer.GetIntAlias())
+				oldPeer.SetIntAlias(peer.GetIntAlias())
+				_ = homenet.peerIntAliasMap.Set(oldPeer.GetIntAlias(), oldPeer)
 			}
-			homenet.logError(errors.Wrap(newIntAliasMap.Set(peer.GetIntAlias(), peer)))
 		}
-		homenet.peerIntAliasMap.Store(newIntAliasMap)
-		if !foundMyself {
-			err = errors.Wrap(ErrMyselfNotFound)
+	}
+
+	for _, peer := range homenet.peers.Load().(models.Peers) {
+		peerID := peer.GetID()
+		if dontRemoveMap[peerID] {
+			continue
+		}
+		_ = homenet.peerIDMap.Unset(peerID)
+		_ = homenet.peerIntAliasMap.Unset(peer.GetIntAlias())
+	}
+
+	for _, peer := range newPeers {
+		_ = homenet.peerIDMap.Set(peer.GetID(), peer)
+		_ = homenet.peerIntAliasMap.Set(peer.GetIntAlias(), peer)
+	}
+
+	homenet.peers.Store(append(oldPeers, newPeers...))
+
+	for _, peer := range newPeers {
+		homenet.onNewPeer(peer)
+	}
+
+	for _, hooker := range homenet.hookers {
+		if err = hooker.OnHomenetUpdatePeers(peers); err != nil {
 			return
 		}
-		homenet.peers.Store(peers)
-		for _, peer := range peers {
-			if peer.GetID() == homenet.GetPeerID() {
-				continue
-			}
-			go homenet.establishConnectionTo(peer, 0)
-		}
-		for _, hooker := range homenet.hookers {
-			if err = hooker.OnHomenetUpdatePeers(peers); err != nil {
-				return
-			}
-		}
-	})
+	}
 	return
 }
 
 func (homenet *Network) GetPeerIntAlias() (r uint32) {
-	homenet.RLockDo(func() {
-		r = homenet.peer.GetIntAlias()
-	})
-	return
+	return homenet.peer.GetIntAlias()
 }
 
 func (homenet *Network) GetPeerID() string {
