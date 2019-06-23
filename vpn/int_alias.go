@@ -3,9 +3,12 @@ package vpn
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 type IntAlias struct {
+	PeerID         peer.ID
 	Value          uint64
 	MaxNetworkSize uint64
 	Timestamp      time.Time     `json:",omitempty"`

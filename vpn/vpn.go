@@ -77,6 +77,11 @@ func (vpn *VPN) GetNetworkMaximalSize() uint64 {
 
 func (vpn *VPN) SetID(newID peer.ID) {
 	vpn.myID = newID
+	vpn.intAlias.PeerID = vpn.myID
+	err := vpn.UpdateIntAliasMetadataAndSave()
+	if err != nil {
+		vpn.logger.Error(errors.Wrap(err))
+	}
 }
 
 func (vpn *VPN) sendIntAliases(stream Stream) (err error) {
@@ -96,14 +101,22 @@ func (vpn *VPN) sendIntAliases(stream Stream) (err error) {
 	if err != nil {
 		return
 	}
-	_, err = stream.Write(b)
-	return err
+
+	n, err := stream.Write(b)
+	vpn.logger.Debugf("sendIntAlias(): stream.Write(): %v %v %v", n, err, string(b))
+	if err != nil {
+		return
+	}
+
+	return
 }
 
 func (vpn *VPN) recvIntAliases(stream Stream) (remoteIntAliases IntAliases, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	n, err := stream.Read(vpn.buffer[:])
+	vpn.logger.Debugf("recvIntAlias(): stream.Read(): %v %v %v", n, err, string(vpn.buffer[:n]))
+
 	if n >= bufferSize {
 		return nil, errors.New("too big message")
 	}
@@ -111,9 +124,13 @@ func (vpn *VPN) recvIntAliases(stream Stream) (remoteIntAliases IntAliases, err 
 		return
 	}
 
-	err = remoteIntAliases.Unmarshal(vpn.buffer[:])
+	err = remoteIntAliases.Unmarshal(vpn.buffer[:n])
 	if err != nil {
 		return
+	}
+
+	if len(remoteIntAliases) == 0 {
+		return nil, errors.New("empty slice")
 	}
 
 	return
@@ -125,6 +142,8 @@ func (vpn *VPN) setupIfaceIPAddress() error {
 
 func (vpn *VPN) SetIntAlias(newValue uint64) (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	vpn.logger.Debugf("SetIntAlias: %v->%v", vpn.intAlias.Value, newValue)
 
 	vpn.intAlias.Value = newValue
 	vpn.intAlias.Timestamp = time.Now()
@@ -198,24 +217,45 @@ func (vpn *VPN) newStream(stream Stream) (err error) {
 		return true
 	})
 	for _, remoteIntAlias := range remoteIntAliases {
-		remoteIntAlias.Timestamp = time.Now().Add(remoteIntAlias.Since)
+		if remoteIntAlias.PeerID == vpn.intAlias.PeerID {
+			continue
+		}
+		remoteIntAlias.Timestamp = time.Now().Add(-remoteIntAlias.Since)
 		notMyIntAliases[remoteIntAlias.Value] = remoteIntAlias
 	}
-	if remoteIntAlias := notMyIntAliases[vpn.intAlias.Value]; remoteIntAliases != nil {
-		if vpn.intAlias.MaxNetworkSize > remoteIntAlias.MaxNetworkSize ||
-			vpn.intAlias.Timestamp.UnixNano() > remoteIntAlias.Timestamp.UnixNano() ||
-			vpn.myID < peerID {
-			vpn.logger.Debugf("int alias collision, remote side should change it's alias")
+	if remoteIntAliases[0].Value == vpn.intAlias.Value {
+		changeOnOurSide := false
+		if vpn.intAlias.MaxNetworkSize > remoteIntAliases[0].MaxNetworkSize {
+			changeOnOurSide = true
+		} else if vpn.intAlias.MaxNetworkSize == remoteIntAliases[0].MaxNetworkSize {
+			if vpn.intAlias.Timestamp.UnixNano() > remoteIntAliases[0].Timestamp.UnixNano() {
+				changeOnOurSide = true
+			} else if vpn.intAlias.Timestamp.UnixNano() == remoteIntAliases[0].Timestamp.UnixNano() {
+				if vpn.myID > peerID {
+					changeOnOurSide = true
+				}
+			}
+		}
+
+		if changeOnOurSide {
+			vpn.logger.Debugf("int alias collision, remote side should change it's alias %v <= %v && %v <= %v && %v < %v",
+				vpn.intAlias.Value, remoteIntAliases[0].Value,
+				vpn.intAlias.Timestamp, remoteIntAliases[0].Timestamp,
+				vpn.myID, peerID)
+
+			err = vpn.sendIntAliases(stream)
+			if err != nil {
+				return
+			}
 			remoteIntAliases, err = vpn.recvIntAliases(stream)
 			if err != nil {
 				return
 			}
-			for _, remoteIntAlias := range remoteIntAliases {
-				if remoteIntAlias.Value == vpn.intAlias.Value {
-					return errors.New("remote side decided not to change it's int alias, close connection")
-				}
+			if remoteIntAliases[0].Value == vpn.intAlias.Value {
+				return errors.New("remote side decided not to change it's int alias, close connection")
 			}
 		} else {
+			vpn.logger.Debugf("int alias collision, changing our int alias")
 			networkSize := vpn.GetNetworkMaximalSize()
 			for i := uint64(1); i < networkSize; i++ {
 				if notMyIntAliases[i] == nil {
@@ -227,6 +267,10 @@ func (vpn *VPN) newStream(stream Stream) (err error) {
 				}
 			}
 			err = vpn.sendIntAliases(stream)
+			if err != nil {
+				return
+			}
+			_, err = vpn.recvIntAliases(stream)
 			if err != nil {
 				return
 			}

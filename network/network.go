@@ -286,6 +286,10 @@ func (mesh *Network) start() (err error) {
 
 	mesh.logger.Debugf(`starting an IPFS node`)
 
+	for _, streamHandler := range mesh.streamHandlers {
+		streamHandler.SetID(mesh.ipfsNode.PeerHost.ID())
+	}
+
 	ipfsCid, err := cid.V1Builder{
 		Codec:  cid.Raw,
 		MhType: multihash.SHA2_256,
