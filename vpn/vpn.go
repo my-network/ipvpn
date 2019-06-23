@@ -224,21 +224,21 @@ func (vpn *VPN) newStream(stream Stream) (err error) {
 		notMyIntAliases[remoteIntAlias.Value] = remoteIntAlias
 	}
 	if remoteIntAliases[0].Value == vpn.intAlias.Value {
-		changeOnOurSide := false
+		changeOnRemoteSide := false
 		if vpn.intAlias.MaxNetworkSize > remoteIntAliases[0].MaxNetworkSize {
-			changeOnOurSide = true
+			changeOnRemoteSide = true
 		} else if vpn.intAlias.MaxNetworkSize == remoteIntAliases[0].MaxNetworkSize {
 			if vpn.intAlias.Timestamp.UnixNano() > remoteIntAliases[0].Timestamp.UnixNano() {
-				changeOnOurSide = true
+				changeOnRemoteSide = true
 			} else if vpn.intAlias.Timestamp.UnixNano() == remoteIntAliases[0].Timestamp.UnixNano() {
-				if vpn.myID > peerID {
-					changeOnOurSide = true
+				if vpn.myID < peerID {
+					changeOnRemoteSide = true
 				}
 			}
 		}
 
-		if changeOnOurSide {
-			vpn.logger.Debugf("int alias collision, remote side should change it's alias %v <= %v && %v <= %v && %v < %v",
+		if changeOnRemoteSide {
+			vpn.logger.Debugf("int alias collision, remote side should change it's alias %v <?= %v , %v <?= %v, %v >? %v",
 				vpn.intAlias.Value, remoteIntAliases[0].Value,
 				vpn.intAlias.Timestamp, remoteIntAliases[0].Timestamp,
 				vpn.myID, peerID)
