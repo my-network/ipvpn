@@ -1,419 +1,392 @@
 package network
 
-// TODO: consider https://github.com/perlin-network/noise
-
 import (
-	"encoding/json"
-	"io"
-	"io/ioutil"
-	"net"
+	"bytes"
+	"context"
+	"crypto/sha512"
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"syscall"
-	"time"
 
-	"github.com/mitchellh/go-homedir"
+	"golang.org/x/sys/unix"
 
-	"github.com/xaionaro-go/atomicmap"
+	"github.com/ipfs/go-cid"
+	ipfsConfig "github.com/ipfs/go-ipfs-config"
+	"github.com/ipfs/go-ipfs/core"
+	"github.com/ipfs/go-ipfs/plugin/loader"
+	"github.com/ipfs/go-ipfs/repo"
+	"github.com/ipfs/go-ipfs/repo/fsrepo"
+	p2pcore "github.com/libp2p/go-libp2p-core"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/peer"
+	p2pprotocol "github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/multiformats/go-multihash"
 	"github.com/xaionaro-go/errors"
-	"github.com/xaionaro-go/secureio"
-
-	"github.com/xaionaro-go/homenet-server/iface"
-	"github.com/xaionaro-go/homenet-server/models"
-
-	"github.com/xaionaro-go/homenet-peer/helpers"
 )
 
 const (
-	connectionRetryInitialDelay = time.Second
-	refusedTryLimit             = 30
-	signatureTryLimit           = 3
+	p2pProtocolID = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
 )
 
-type Hooker interface {
-	OnHomenetClose()
-	OnHomenetUpdatePeers(models.Peers) error
-	OnHomenetConnectPeer(peer iface.Peer) error
-}
-
-type Handler interface {
-	Handle(authorID uint32, payload []byte) error
-}
-
 type Network struct {
-	connector            Connector
-	peerID               string
-	peer                 *models.PeerT
-	peers                atomic.Value
-	identity             *secureio.Identity
-	peerIDMap            atomicmap.Map
-	peerIntAliasMap      atomicmap.Map
-	directConnectionsMap atomicmap.Map
-	routersMap           atomicmap.Map
-	pathMap              atomicmap.Map
-	logger               Logger
-	serviceHandler       map[ServiceID]Handler
-	updatePeersLocker    sync.RWMutex
-
-	hookers []Hooker
+	logger                Logger
+	sharedKeyword         []byte
+	ipfsNode              *core.IpfsNode
+	ipfsContext           context.Context
+	ipfsContextCancelFunc func()
+	streams               sync.Map
+	streamHandlers        []StreamHandler
 }
 
-func New(connector Connector, logger Logger) (*Network, error) {
-	homeDir, err := homedir.Dir()
+type Stream = p2pcore.Stream
+
+// generateSharedKeyword generates a keyword, shared through all nodes of the network "networkName"
+func generateSharedKeyword(networkName string, psk []byte) []byte {
+	hasher := sha512.New()
+	pskBasedSum := hasher.Sum(append(psk, []byte(networkName)...))
+
+	// We want to keyword be generated correctly only in case of correct networkName _AND_ psk.
+	// However we don't want to compromise psk and we don't trust any hashing algorithm, so
+	// we're using only a half of a hash of the "psk" to generate the keyword.
+	var buf bytes.Buffer
+	buf.Write(pskBasedSum[:len(pskBasedSum)/2])
+	buf.WriteString(networkName)
+	buf.WriteString("ipvpn")
+
+	return hasher.Sum(buf.Bytes())
+}
+
+func checkCacheDir(cacheDir string) (err error) {
+	var stat os.FileInfo
+	stat, err = os.Stat(cacheDir)
 	if err != nil {
-		return nil, err
-	}
-	identity, err := secureio.NewIdentity(filepath.Join(homeDir, ".homenet"))
-	if err != nil {
-		return nil, err
-	}
-
-	r := &Network{
-		connector:            connector,
-		logger:               logger,
-		identity:             identity,
-		directConnectionsMap: atomicmap.New(),
-		routersMap:           atomicmap.New(),
-		pathMap:              atomicmap.New(),
-		peerIDMap:            atomicmap.New(),
-		peerIntAliasMap:      atomicmap.New(),
-		serviceHandler:       make(map[ServiceID]Handler),
-	}
-	r.peers.Store(models.Peers{})
-	r.peerID = helpers.ToHEX(r.identity.Keys.Public)
-
-	return r, nil
-}
-
-func (homenet *Network) GetIdentity() *secureio.Identity {
-	return homenet.identity
-}
-
-func (homenet *Network) SetConnector(connector Connector) {
-	homenet.connector = connector
-}
-
-func (homenet *Network) Close() {
-	for _, hooker := range homenet.hookers {
-		hooker.OnHomenetClose()
-	}
-}
-
-func (homenet *Network) GetPeerByIntAlias(peerIntAlias uint32) *models.PeerT {
-	r, _ := homenet.peerIntAliasMap.Get(peerIntAlias)
-	if r == nil {
-		return nil
-	}
-	return r.(*models.PeerT)
-}
-
-func (homenet *Network) SetServiceHandler(serviceID ServiceID, handler Handler) {
-	homenet.serviceHandler[serviceID] = handler
-}
-
-func (homenet *Network) AddHooker(newHooker Hooker) {
-	homenet.hookers = append(homenet.hookers, newHooker)
-}
-
-func (homenet *Network) RemoveHooker(removeHooker Hooker) {
-	var leftHookers []Hooker
-	for _, hooker := range homenet.hookers {
-		if hooker == removeHooker {
-			continue
-		}
-		leftHookers = append(leftHookers, hooker)
-	}
-	homenet.hookers = leftHookers
-}
-
-func (homenet *Network) GetPeers() models.Peers {
-	peers := homenet.peers.Load()
-	if peers == nil {
-		return nil
-	}
-	return peers.(models.Peers)
-}
-
-func (homenet *Network) GetPathTo(peer iface.Peer) *Path {
-	path, _ := homenet.pathMap.Get(peer.GetID())
-	if path == nil {
-		return nil
-	}
-	return path.(*Path)
-}
-
-func (homenet *Network) GetPipeTo(peer iface.Peer, serviceID ServiceID) io.ReadWriter {
-	path := homenet.GetPathTo(peer)
-	if path == nil {
-		return nil
-	}
-	return path.GetReadWriter(serviceID)
-}
-
-func (homenet *Network) GetDirectConnectionTo(peer iface.Peer) io.ReadWriteCloser {
-	conn, _ := homenet.directConnectionsMap.Get(peer.GetID())
-	if conn == nil {
-		return nil
-	}
-	return conn.(io.ReadWriteCloser)
-}
-
-type sessionErrorHandler struct {
-	isClosed           uint32
-	homenet            *Network
-	peer               *models.PeerT
-	refusedTryNumber   uint
-	tryNumber          uint
-	signatureTryNumber uint
-}
-
-func (errHandler *sessionErrorHandler) OnConnect(sess *secureio.Session) {
-	errHandler.peer.SetLastSuccessfulNegotiationPair(errHandler.peer.GetLastNegotiationPair())
-
-	for _, hooker := range errHandler.homenet.hookers {
-		if err := hooker.OnHomenetConnectPeer(errHandler.peer); err != nil {
+		if !os.IsNotExist(err) {
 			return
 		}
+		return os.MkdirAll(cacheDir, 0750)
+	}
+
+	if !stat.IsDir() {
+		return errors.New(syscall.ENOTDIR, cacheDir)
+	}
+	if err := unix.Access(cacheDir, unix.W_OK); err != nil {
+		return errors.Wrap(err, "no permission to read/write within directory", cacheDir)
+	}
+	return
+}
+
+func addressesConfig() ipfsConfig.Addresses {
+	return ipfsConfig.Addresses{
+		Swarm: []string{
+			"/ip4/0.0.0.0/tcp/24001",
+			"/ip4/0.0.0.0/udp/24001",
+			"/ip6/::/tcp/24001",
+			"/ip6/::/udp/24001",
+			// Also we need ICMP :(
+		},
+		Announce:   []string{},
+		NoAnnounce: []string{},
+		API:        ipfsConfig.Strings{"/ip4/127.0.0.1/tcp/25001"},
+		Gateway:    ipfsConfig.Strings{"/ip4/127.0.0.1/tcp/28080"},
 	}
 }
 
-func (errHandler *sessionErrorHandler) considerFail(sess *secureio.Session) {
-	atomic.StoreUint32(&errHandler.isClosed, 1)
-	errHandler.homenet.logger.Debugf("sessionErrorHandler: considerFail")
-	_ = errHandler.homenet.directConnectionsMap.Unset(errHandler.peer.GetID())
-	_ = errHandler.homenet.routersMap.Unset(errHandler.peer.GetID())
-	_ = errHandler.homenet.pathMap.Unset(errHandler.peer.GetID())
-	_ = sess.Close()
-
-	go func() {
-		delayBeforeRetry := connectionRetryInitialDelay //* time.Duration(1<<errHandler.tryNumber)
-		errHandler.homenet.logger.Debugf("retry (try: %v) in %v...", errHandler.tryNumber, delayBeforeRetry)
-		time.Sleep(delayBeforeRetry)
-		errHandler.homenet.establishConnectionTo(errHandler.peer, errHandler.tryNumber+1)
+func initRepo(logger Logger, repoPath string) (err error) {
+	defer func() {
+		err = errors.Wrap(err)
 	}()
-}
 
-func (errHandler *sessionErrorHandler) IsClosed() bool {
-	return atomic.LoadUint32(&errHandler.isClosed) != 0
-}
+	logger.Debugf(`generating keys`)
 
-func (errHandler *sessionErrorHandler) Error(sess *secureio.Session, err error) {
-	if errHandler.IsClosed() {
-		return
-	}
-	err = err.(errors.SmartError).OriginalError()
-	errHandler.homenet.logger.Debugf("sessionErrorHandler: %T:%v", err, err)
-	if netErr, ok := err.(*net.OpError); ok {
-		errHandler.homenet.logger.Debugf("sessionErrorHandler: net error: %T:%v", netErr.Err, netErr.Err)
-		if osErr, ok := netErr.Err.(*os.SyscallError); ok {
-			errHandler.homenet.logger.Debugf("sessionErrorHandler: net os error: %T:%v", osErr.Err, osErr.Err)
-			if osErr.Err == syscall.ECONNREFUSED {
-				errHandler.refusedTryNumber++
-				if errHandler.refusedTryNumber < refusedTryLimit {
-					errHandler.homenet.logger.Debugf("connection refused by remote side, retry.")
-					return
-				}
-				errHandler.homenet.logger.Infof("connection refused by remote side")
-				errHandler.considerFail(sess)
-				return
-			}
-		}
-	}
-	if err == secureio.ErrInvalidSignature {
-		errHandler.signatureTryNumber++
-		if errHandler.signatureTryNumber < signatureTryLimit {
-			errHandler.homenet.logger.Infof("invalid signature, retry.")
-			return
-		}
-		errHandler.homenet.logger.Infof("invalid signature.")
-		errHandler.considerFail(sess)
+	privKey, pubKey, err := crypto.GenerateKeyPair(crypto.Ed25519, 521)
+	if err != nil {
 		return
 	}
 
-	errHandler.homenet.logger.Error(err)
-	errHandler.considerFail(sess)
-}
-
-func (errHandler *sessionErrorHandler) Infof(fm string, args ...interface{}) {
-	errHandler.homenet.logger.Infof(fm, args...)
-}
-
-func (errHandler *sessionErrorHandler) Debugf(fm string, args ...interface{}) {
-	errHandler.homenet.logger.Debugf(fm, args...)
-}
-
-func (homenet *Network) establishConnectionTo(peer iface.Peer, tryNumber uint) {
-	if conn := homenet.GetDirectConnectionTo(peer); conn != nil {
-		// We don't need to do anything if we already have a working connection
+	privKeyBytes, err := privKey.Bytes()
+	if err != nil {
 		return
 	}
 
-	homenet.logger.Debugf("establishing a connection to %v %v", peer.GetIntAlias(), peer.GetID())
-	realConn, err := homenet.connector.NewConnection(homenet.peer, peer.(*models.PeerT))
-	if realConn == nil || err != nil {
-		homenet.logger.Infof("we were unable to connect to %v: realConn is nil: %v;  err == %v", peer.GetID(), realConn == nil, err)
-		go func() {
-			time.Sleep(connectionRetryInitialDelay * time.Duration(1<<tryNumber))
-			homenet.establishConnectionTo(peer, tryNumber+1)
-		}()
+	peerID, err := peer.IDFromPublicKey(pubKey)
+	if err != nil {
 		return
 	}
 
-	homenet.logger.Debugf("securing the connection to %v %v", peer.GetIntAlias(), peer.GetID())
-	if len(peer.GetPublicKey()) == 0 {
-		homenet.logger.Error("peer's public key is empty")
+	identity := ipfsConfig.Identity{
+		PeerID:  peerID.Pretty(),
+		PrivKey: crypto.ConfigEncodeKey(privKeyBytes),
+	}
+
+	logger.Debugf(`initializing the repository`)
+
+	bootstrapPeers, err := ipfsConfig.DefaultBootstrapPeers()
+	if err != nil {
 		return
 	}
-	conn := homenet.identity.NewSession(secureio.NewRemoteIdentityFromPublicKey(peer.GetPublicKey()), realConn, &sessionErrorHandler{
-		homenet:   homenet,
-		peer:      peer.(*models.PeerT),
-		tryNumber: tryNumber,
+
+	err = fsrepo.Init(repoPath, &ipfsConfig.Config{
+		Identity:  identity,
+		Addresses: addressesConfig(),
+		Bootstrap: ipfsConfig.BootstrapPeerStrings(bootstrapPeers),
+		/*Mounts: ipfsConfig.Mounts{
+			IPFS: "/ipfs",
+			IPNS: "/ipns",
+		},*/
+		Datastore: ipfsConfig.DefaultDatastoreConfig(),
+		Discovery: ipfsConfig.Discovery{
+			MDNS: ipfsConfig.MDNS{
+				Enabled:  true,
+				Interval: 10,
+			},
+		},
+		Routing: ipfsConfig.Routing{
+			Type: "dht",
+		},
+		Ipns: ipfsConfig.Ipns{
+			ResolveCacheSize: 256,
+		},
+		Reprovider: ipfsConfig.Reprovider{
+			Interval: "12h", // just used the same value as in go-ipfs-config/init.go
+			Strategy: "all",
+		},
+		Swarm: ipfsConfig.SwarmConfig{
+			ConnMgr: ipfsConfig.ConnMgr{ // just used the same values as in go-ipfs-config/init.go
+				LowWater:    ipfsConfig.DefaultConnMgrLowWater,
+				HighWater:   ipfsConfig.DefaultConnMgrHighWater,
+				GracePeriod: ipfsConfig.DefaultConnMgrGracePeriod.String(),
+				Type:        "basic",
+			},
+		},
 	})
-
-	homenet.logger.Debugf("saving the connection to %v %v", peer.GetIntAlias(), peer.GetID())
-	homenet.saveDirectConnection(peer, conn)
+	if err != nil {
+		return
+	}
 
 	return
 }
 
-func (homenet *Network) logError(err error) {
-	if err == nil {
+type VPN interface {
+}
+
+func New(networkName string, psk []byte, cacheDir string, logger Logger, streamHandlers ...StreamHandler) (mesh *Network, err error) {
+	defer func() {
+		if err != nil {
+			mesh = nil
+			err = errors.Wrap(err)
+		}
+	}()
+
+	logger.Debugf(`loading IPFS plugins`)
+
+	loader, err := loader.NewPluginLoader(``)
+	if err != nil {
 		return
 	}
-	homenet.logger.Error("[homenet-network] got error: ", err)
-}
-
-func (homenet *Network) saveDirectConnection(peer iface.Peer, conn io.ReadWriteCloser) {
-	oldConn, err := homenet.directConnectionsMap.Swap(peer.GetID(), conn)
-	if oldConn != nil {
-		// If somebody already putted a connection for this peer (while another goroutine), then we need to close it :(
-		// It was somekind of a race condition. And here we are cleaning things up.
-		homenet.logger.Debugf("closing the previous connection to %v %v", peer.GetIntAlias(), peer.GetID())
-		_ = oldConn.(io.Closer).Close()
-	}
+	err = loader.Inject()
 	if err != nil {
-		homenet.logError(errors.Wrap(err))
+		return
 	}
 
-	homenet.setupRouter(peer, conn)
-	homenet.updatePaths()
-}
+	logger.Debugf(`checking the directory "%v"`, cacheDir)
 
-func (homenet *Network) setupRouter(peer iface.Peer, conn io.ReadWriteCloser) {
-	router := NewRouter(homenet, peer, conn)
-	oldRouter, _ := homenet.routersMap.Swap(peer.GetID(), router)
-	if oldRouter != nil {
-		_ = oldRouter.(*Router).Close()
+	if err := checkCacheDir(filepath.Join(cacheDir, "ipfs")); err != nil {
+		return nil, errors.Wrap(err, "invalid cache directory")
 	}
+
+	repoPath := filepath.Join(cacheDir, "ipfs")
+
+	if !fsrepo.IsInitialized(repoPath) {
+		logger.Debugf(`repository "%v" not initialized`, repoPath)
+
+		err = initRepo(logger, repoPath)
+		if err != nil {
+			return
+		}
+	}
+
+	logger.Debugf(`opening the repository "%v"`, repoPath)
+
+	var ipfsRepo repo.Repo
+	ipfsRepo, err = fsrepo.Open(repoPath)
+	if err != nil {
+		return
+	}
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	ipfsCfg := &core.BuildCfg{
+		Repo:      ipfsRepo,
+		Online:    true,
+		Permanent: true,
+		ExtraOpts: map[string]bool{
+			"pubsub": true,
+			"ipnsps": true,
+		},
+	}
+
+	logger.Debugf(`creating an IPFS node`)
+
+	var ipfsNode *core.IpfsNode
+	ipfsNode, err = core.NewNode(ctx, ipfsCfg)
+	if err != nil {
+		return
+	}
+
+	sharedKeyword := generateSharedKeyword(networkName, psk)
+
+	mesh = &Network{
+		logger:                logger,
+		sharedKeyword:         sharedKeyword,
+		ipfsNode:              ipfsNode,
+		ipfsContext:           ctx,
+		ipfsContextCancelFunc: cancelFunc,
+		streamHandlers:        streamHandlers,
+	}
+
+	err = mesh.start()
+	if err != nil {
+		_ = mesh.Close()
+		return
+	}
+
+	return
 }
 
-func (homenet *Network) updatePaths() {
-	for _, peer := range homenet.GetPeers() {
-		pathI, _ := homenet.pathMap.Get(peer.GetID())
-		if pathI != nil {
-			path := pathI.(*Path)
-			if path.IsValid() {
+func (mesh *Network) connector(ipfsCid cid.Cid) {
+	mesh.logger.Debugf("setting up the output streams initiator")
+
+	provChan := mesh.ipfsNode.DHT.FindProvidersAsync(mesh.ipfsContext, ipfsCid, 1<<16)
+	for {
+		select {
+		case <-mesh.ipfsContext.Done():
+			return
+		case peerAddr := <-provChan:
+			_, err := mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerAddr.ID)
+			if err != nil {
+				mesh.logger.Infof("unable to find a route to peer %v: %v", peerAddr.ID, err)
 				continue
 			}
-		}
-
-		var router *Router
-		routerI, _ := homenet.routersMap.Get(peer.GetID())
-		if routerI == nil {
-			continue
-		}
-		router = routerI.(*Router)
-		oldPath, _ := homenet.pathMap.Swap(peer.GetID(), NewPath(peer, router))
-		if oldPath != nil {
-			_ = oldPath.(*Path).Close()
+			stream, err := mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerAddr.ID, p2pProtocolID)
+			if err != nil {
+				mesh.logger.Infof("unable to connect to peer %v: %v", peerAddr.ID, err)
+				continue
+			}
+			mesh.addStream(stream)
 		}
 	}
+
 }
 
-func ParsePeersFromFile(filePath string) (result models.Peers, err error) {
-	b, err := ioutil.ReadFile(filePath)
+func (mesh *Network) start() (err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
+
+	mesh.logger.Debugf(`starting an IPFS node`)
+
+	ipfsCid, err := cid.V1Builder{
+		Codec:  cid.Raw,
+		MhType: multihash.SHA2_256,
+	}.Sum(mesh.sharedKeyword)
 	if err != nil {
-		return nil, errors.Wrap(err)
-	}
-	err = json.Unmarshal(b, &result)
-	return
-}
-
-func SavePeersToFile(filePath string, peers models.Peers) error {
-	b, err := json.Marshal(peers)
-	if err != nil {
-		return errors.Wrap(err)
-	}
-	return ioutil.WriteFile(filePath, b, 0640)
-}
-
-func (homenet *Network) onNewPeer(peer *models.PeerT) {
-	homenet.logger.Debugf("new peer: %v %v (is_me: %v)", peer.GetIntAlias(), peer.GetID(), peer.GetID() == homenet.GetPeerID())
-	if peer.GetID() == homenet.GetPeerID() {
-		homenet.peer = peer
 		return
 	}
-	go homenet.establishConnectionTo(peer, 0)
+
+	mesh.logger.Debugf("setting up the input streams handler")
+
+	mesh.ipfsNode.PeerHost.SetStreamHandler(p2pProtocolID, mesh.addStream)
+
+	go mesh.connector(ipfsCid)
+
+	mesh.logger.Infof(`My ID: %v        Calling IPFS "DHT.Provide()" on the shared key (that will be used for the node discovery), Cid: %v`, mesh.ipfsNode.PeerHost.ID(), ipfsCid)
+
+	err = mesh.ipfsNode.DHT.Provide(mesh.ipfsContext, ipfsCid, true)
+	if err != nil {
+		return
+	}
+
+	mesh.logger.Debugf(`started an IPFS node`)
+	return
 }
 
-func (homenet *Network) UpdatePeers(peers models.Peers) (err error) {
-	homenet.updatePeersLocker.Lock()
-	defer homenet.updatePeersLocker.Unlock()
+func (mesh *Network) Close() (err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
+	mesh.logger.Debugf(`closing an IPFS node`)
+	mesh.ipfsContextCancelFunc()
+	return mesh.ipfsNode.Close()
+}
 
-	dontRemoveMap := map[string]bool{}
-	var oldPeers models.Peers
-	var newPeers models.Peers
-	for _, peer := range peers {
-		oldPeerI, _ := homenet.peerIDMap.Get(peer.GetID())
-		if oldPeerI == nil {
-			newPeers = append(newPeers, peer)
-		} else {
-			oldPeer := oldPeerI.(*models.PeerT)
-			oldPeers = append(oldPeers, oldPeer)
-			dontRemoveMap[peer.GetID()] = true
+func (mesh *Network) sendAuthData(stream Stream) (err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
 
-			if peer.GetIntAlias() != oldPeer.GetIntAlias() {
-				_ = homenet.peerIntAliasMap.Unset(oldPeer.GetIntAlias())
-				oldPeer.SetIntAlias(peer.GetIntAlias())
-				_ = homenet.peerIntAliasMap.Set(oldPeer.GetIntAlias(), oldPeer)
-			}
-		}
-	}
-
-	for _, peer := range homenet.peers.Load().(models.Peers) {
-		peerID := peer.GetID()
-		if dontRemoveMap[peerID] {
-			continue
-		}
-		_ = homenet.peerIDMap.Unset(peerID)
-		_ = homenet.peerIntAliasMap.Unset(peer.GetIntAlias())
-	}
-
-	for _, peer := range newPeers {
-		_ = homenet.peerIDMap.Set(peer.GetID(), peer)
-		_ = homenet.peerIntAliasMap.Set(peer.GetIntAlias(), peer)
-	}
-
-	homenet.peers.Store(append(oldPeers, newPeers...))
-
-	for _, peer := range newPeers {
-		homenet.onNewPeer(peer)
-	}
-
-	for _, hooker := range homenet.hookers {
-		if err = hooker.OnHomenetUpdatePeers(peers); err != nil {
-			return
-		}
+	var buf bytes.Buffer
+	buf.WriteString(string(mesh.ipfsNode.Identity))
+	sum := sha512.Sum512(mesh.sharedKeyword)
+	buf.Write(sum[:])
+	sum = sha512.Sum512(buf.Bytes())
+	mesh.logger.Debugf(`sending auth data to %v: %v`, stream.Conn().RemotePeer(), sum[:])
+	_, err = stream.Write(sum[:])
+	if err != nil {
+		return
 	}
 	return
 }
 
-func (homenet *Network) GetPeerIntAlias() (r uint32) {
-	return homenet.peer.GetIntAlias()
+func (mesh *Network) recvAndCheckAuthData(stream Stream) (err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
+
+	var buf bytes.Buffer
+	buf.WriteString(string(stream.Conn().RemotePeer()))
+	sum := sha512.Sum512(mesh.sharedKeyword)
+	buf.Write(sum[:])
+	sum = sha512.Sum512(buf.Bytes())
+	expectedAuthData := sum[:]
+
+	receivedAuthData := make([]byte, len(expectedAuthData))
+	mesh.logger.Debugf(`waiting auth data from %v: %v`, stream.Conn().RemotePeer(), expectedAuthData)
+	_, err = stream.Read(receivedAuthData)
+	if err != nil {
+		return
+	}
+
+	if bytes.Compare(expectedAuthData, receivedAuthData) != 0 {
+		return errors.New("invalid signature")
+	}
+	return
 }
 
-func (homenet *Network) GetPeerID() string {
-	return homenet.peerID
+func (mesh *Network) addStream(stream Stream) {
+	mesh.logger.Debugf("addStream %v", stream.Conn().RemotePeer())
+	if stream.Conn().RemotePeer() == mesh.ipfsNode.PeerHost.ID() {
+		mesh.logger.Debugf("it's my ID, skip")
+	}
+
+	err := mesh.sendAuthData(stream)
+	if err != nil {
+		mesh.logger.Error(errors.Wrap(err))
+		_ = stream.Close()
+		return
+	}
+
+	err = mesh.recvAndCheckAuthData(stream)
+	if err != nil {
+		mesh.logger.Infof("invalid auth data: %v", err)
+		_ = stream.Close()
+		return
+	}
+
+	mesh.logger.Debugf(`a good stream, saving (remote peer: %v)`, stream.Conn().RemotePeer())
+	mesh.streams.Store(stream.Conn().RemotePeer(), stream)
+
+	for _, streamHandler := range mesh.streamHandlers {
+		streamHandler.NewStream(stream)
+	}
 }
