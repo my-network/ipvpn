@@ -1,23 +1,39 @@
 package vpn
 
 import (
+	e "errors"
 	"io/ioutil"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p-core/peer"
-
 	"github.com/xaionaro-go/errors"
+	"github.com/xaionaro-go/wgcreate"
+	"golang.org/x/crypto/ed25519"
+	"golang.zx2c4.com/wireguard/wgctrl"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
 	"github.com/xaionaro-go/ipvpn/network"
 )
 
 const (
-	bufferSize = 1 << 20
+	bufferSize              = 1 << 20
+	ipvpnIfaceName          = `ipvpn`
+	defaultMTU              = 1200
+	ipvpnPort               = 18291
+	directConnectionTimeout = 30 * time.Second
+)
+
+var (
+	ErrAlreadyClosed  = e.New("already closed")
+	ErrAlreadyStarted = e.New("already started")
 )
 
 type Stream = network.Stream
+type AddrInfo = network.AddrInfo
 
 type VPN struct {
 	logger           Logger
@@ -28,6 +44,12 @@ type VPN struct {
 	subnet           net.IPNet
 	newStreamLocker  sync.Mutex
 	buffer           [bufferSize]byte
+	wgctl            *wgctrl.Client
+	privKey          ed25519.PrivateKey
+	psk              []byte
+	ifaceName        string
+	state            uint32
+	currentIP        net.IP
 }
 
 func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) {
@@ -42,6 +64,12 @@ func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, er
 		logger:           logger,
 		subnet:           subnet,
 		intAliasFilePath: intAliasFilePath,
+		ifaceName:        ipvpnIfaceName,
+	}
+
+	vpn.wgctl, err = wgctrl.New()
+	if err != nil {
+		return
 	}
 
 	intAliasFileData, readErr := ioutil.ReadFile(intAliasFilePath)
@@ -82,6 +110,194 @@ func (vpn *VPN) SetID(newID peer.ID) {
 	if err != nil {
 		vpn.logger.Error(errors.Wrap(err))
 	}
+}
+
+func (vpn *VPN) setPrivateKey(privKey ed25519.PrivateKey) {
+	vpn.privKey = privKey
+}
+
+func (vpn *VPN) GetIP(intAlias uint64) (net.IP, error) {
+	maskOnes, maskBits := vpn.subnet.Mask.Size()
+	if vpn.intAlias.Value >= 1<<uint32(maskBits-maskOnes) {
+		return nil, errors.New("int alias value is too big or subnet is too small")
+	}
+
+	resultIP := make(net.IP, len(vpn.subnet.IP))
+	copy(resultIP, vpn.subnet.IP)
+	if resultIP.To4() == nil {
+		return nil, errors.New("IPv6 support is not implemented, yet")
+	}
+
+	if uint64(resultIP[len(resultIP)-1])+intAlias >= 255 {
+		return nil, errors.New("are not implemented, yet; we can only modify the last octet at the moment of an IP address")
+	}
+	resultIP[len(resultIP)-1] += uint8(intAlias)
+	return resultIP, nil
+}
+
+func (vpn *VPN) GetMyIP() (net.IP, error) {
+	return vpn.GetIP(vpn.intAlias.Value)
+}
+
+func (vpn *VPN) getPeers() (peers Peers) {
+	vpn.peers.Range(func(_, peerI interface{}) bool {
+		peer := peerI.(*Peer)
+		peers = append(peers, peer)
+		return true
+	})
+
+	return
+}
+
+func (vpn *VPN) IsStarted() bool {
+	return atomic.LoadUint32(&vpn.state) == 1
+}
+
+func (vpn *VPN) Start() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	if !atomic.CompareAndSwapUint32(&vpn.state, 0, 1) {
+		return ErrAlreadyStarted
+	}
+
+	vpn.ifaceName, err = wgcreate.Create(vpn.ifaceName, defaultMTU, true)
+	if err != nil {
+		return
+	}
+
+	err = vpn.updateWireGuardConfiguration()
+	if err != nil {
+		_ = vpn.deleteLink()
+		return
+	}
+
+	err = vpn.startFallbackConnector()
+	if err != nil {
+		_ = vpn.deleteLink()
+		return
+	}
+
+	return
+}
+
+func (vpn *VPN) switchToFallback(peer *Peer) {
+
+}
+
+func (vpn *VPN) fallbackConnectorLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	for vpn.IsStarted() {
+		select {
+		case <-ticker.C:
+		}
+
+		for _, vpnPeer := range vpn.getPeers() {
+			var err error
+			if time.Since(vpnPeer.WgDirect.LastHandshakeTime).Nanoseconds() < directConnectionTimeout.Nanoseconds() {
+				err = vpnPeer.switchChannel(channelTypeDirect)
+			} else {
+				err = vpnPeer.switchChannel(channelTypeIPFS)
+			}
+			if err != nil {
+				vpn.logger.Error(errors.Wrap(err))
+			}
+		}
+	}
+}
+
+func (vpn *VPN) startFallbackConnector() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	go vpn.fallbackConnectorLoop()
+
+	return
+}
+
+func (vpn *VPN) deleteLink() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	// TODO: implement it
+
+	return
+}
+
+func (vpn *VPN) Close() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	if !atomic.CompareAndSwapUint32(&vpn.state, 1, 0) {
+		return ErrAlreadyClosed
+	}
+
+	err = vpn.wgctl.Close()
+	if err != nil {
+		return
+	}
+
+	err = vpn.deleteLink()
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (vpn *VPN) updateWireGuardConfiguration() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	if !vpn.IsStarted() {
+		return
+	}
+
+	peersCfg, err := vpn.getPeers().toWireGuardConfigs()
+	if err != nil {
+		return
+	}
+
+	cfg := wgtypes.Config{
+		PrivateKey:   &wgtypes.Key{},
+		ListenPort:   &[]int{ipvpnPort}[0],
+		FirewallMark: &[]int{1}[0],
+		Peers:        peersCfg,
+		ReplacePeers: true,
+	}
+
+	copy(cfg.PrivateKey[:], vpn.privKey)
+
+	err = vpn.wgctl.ConfigureDevice(vpn.ifaceName, cfg)
+	if err != nil {
+		return
+	}
+
+	err = vpn.setupIfaceIPAddress()
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (vpn *VPN) SetPrivateKey(privKey ed25519.PrivateKey) {
+	vpn.setPrivateKey(privKey)
+	err := vpn.updateWireGuardConfiguration()
+	if err != nil {
+		vpn.logger.Error("unable to configure VPN", err)
+	}
+}
+
+func (vpn *VPN) setPSK(psk []byte) {
+	vpn.psk = psk
+}
+
+func (vpn *VPN) SetPSK(psk []byte) {
+	vpn.setPSK(psk)
+	err := vpn.updateWireGuardConfiguration()
+	if err != nil {
+		vpn.logger.Error("unable to configure VPN", err)
+	}
+}
+
+func (vpn *VPN) GetPSK() []byte {
+	return vpn.psk
 }
 
 func (vpn *VPN) sendIntAliases(stream Stream) (err error) {
@@ -136,7 +352,30 @@ func (vpn *VPN) recvIntAliases(stream Stream) (remoteIntAliases IntAliases, err 
 	return
 }
 
-func (vpn *VPN) setupIfaceIPAddress() error {
+func (vpn *VPN) setupIfaceIPAddress() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	myIP, err := vpn.GetMyIP()
+	if err != nil {
+		return
+	}
+
+	if vpn.currentIP.String() == myIP.String() {
+		return
+	}
+
+	vpn.currentIP = myIP
+
+	err = wgcreate.ResetIPs(vpn.ifaceName)
+	if err != nil {
+		return
+	}
+
+	err = wgcreate.AddIP(vpn.ifaceName, myIP, vpn.subnet)
+	if err != nil {
+		return
+	}
+
 	return nil
 }
 
@@ -192,7 +431,7 @@ func (vpn *VPN) UpdateIntAliasMetadataAndSave() (err error) {
 	return
 }
 
-func (vpn *VPN) newStream(stream Stream) (err error) {
+func (vpn *VPN) newStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	vpn.newStreamLocker.Lock()
@@ -200,7 +439,7 @@ func (vpn *VPN) newStream(stream Stream) (err error) {
 
 	peerID := stream.Conn().RemotePeer()
 	if peerID == vpn.myID {
-		panic("got a connection to myself, should not happened, ever")
+		return errors.New("got a connection to myself, should not happened, ever")
 	}
 	err = vpn.sendIntAliases(stream)
 	if err != nil {
@@ -286,6 +525,7 @@ func (vpn *VPN) newStream(stream Stream) (err error) {
 	newPeer := &Peer{
 		VPN:      vpn,
 		Stream:   stream,
+		AddrInfo: peerAddr,
 		IntAlias: *remoteIntAliases[0],
 	}
 
@@ -304,8 +544,8 @@ func (vpn *VPN) newStream(stream Stream) (err error) {
 	return
 }
 
-func (vpn *VPN) NewStream(stream Stream) {
-	if err := vpn.newStream(stream); err != nil {
+func (vpn *VPN) NewStream(stream Stream, peerAddr AddrInfo) {
+	if err := vpn.newStream(stream, peerAddr); err != nil {
 		vpn.logger.Error(errors.Wrap(err))
 		_ = stream.Close()
 	}

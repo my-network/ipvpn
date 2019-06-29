@@ -26,12 +26,15 @@ import (
 )
 
 const (
-	p2pProtocolID = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
+	p2pProtocolID               = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
+	ipvpnMagic = "\000\314\326This is an InterPlanetary Virtual Private Network node"
 )
 
 type Network struct {
 	logger                Logger
-	sharedKeyword         []byte
+	networkName           string
+	publicSharedKeyword   []byte
+	privateSharedKeyword  []byte
 	ipfsNode              *core.IpfsNode
 	ipfsContext           context.Context
 	ipfsContextCancelFunc func()
@@ -40,9 +43,10 @@ type Network struct {
 }
 
 type Stream = p2pcore.Stream
+type AddrInfo = peer.AddrInfo
 
-// generateSharedKeyword generates a keyword, shared through all nodes of the network "networkName"
-func generateSharedKeyword(networkName string, psk []byte) []byte {
+// generatePublicSharedKeyword generates a keyword, shared through all nodes of the network "networkName"
+func generatePublicSharedKeyword(networkName string, psk []byte) []byte {
 	hasher := sha512.New()
 	pskBasedSum := hasher.Sum(append(psk, []byte(networkName)...))
 
@@ -52,7 +56,18 @@ func generateSharedKeyword(networkName string, psk []byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(pskBasedSum[:len(pskBasedSum)/2])
 	buf.WriteString(networkName)
-	buf.WriteString("ipvpn")
+	buf.WriteString(ipvpnMagic)
+
+	return hasher.Sum(buf.Bytes())
+}
+
+func generatePrivateSharedKeyword(networkName string, psk []byte) []byte {
+	hasher := sha512.New()
+	pskBasedSum := hasher.Sum(append(psk, []byte(networkName)...))
+
+	var buf bytes.Buffer
+	buf.Write(pskBasedSum)
+	buf.WriteString(networkName)
 
 	return hasher.Sum(buf.Bytes())
 }
@@ -234,11 +249,11 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 		return
 	}
 
-	sharedKeyword := generateSharedKeyword(networkName, psk)
-
 	mesh = &Network{
 		logger:                logger,
-		sharedKeyword:         sharedKeyword,
+		networkName:           networkName,
+		publicSharedKeyword:   generatePublicSharedKeyword(networkName, psk),
+		privateSharedKeyword:  generatePrivateSharedKeyword(networkName, psk),
 		ipfsNode:              ipfsNode,
 		ipfsContext:           ctx,
 		ipfsContextCancelFunc: cancelFunc,
@@ -255,7 +270,7 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 }
 
 func (mesh *Network) connector(ipfsCid cid.Cid) {
-	mesh.logger.Debugf("setting up the output streams initiator")
+	mesh.logger.Debugf(`initializing output streams`)
 
 	provChan := mesh.ipfsNode.DHT.FindProvidersAsync(mesh.ipfsContext, ipfsCid, 1<<16)
 	for {
@@ -273,7 +288,7 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 				mesh.logger.Infof("unable to connect to peer %v: %v", peerAddr.ID, err)
 				continue
 			}
-			mesh.addStream(stream)
+			mesh.addStream(stream, peerAddr)
 		}
 	}
 
@@ -286,21 +301,38 @@ func (mesh *Network) start() (err error) {
 
 	mesh.logger.Debugf(`starting an IPFS node`)
 
-	for _, streamHandler := range mesh.streamHandlers {
-		streamHandler.SetID(mesh.ipfsNode.PeerHost.ID())
-	}
-
 	ipfsCid, err := cid.V1Builder{
 		Codec:  cid.Raw,
 		MhType: multihash.SHA2_256,
-	}.Sum(mesh.sharedKeyword)
+	}.Sum(mesh.publicSharedKeyword)
 	if err != nil {
 		return
 	}
 
-	mesh.logger.Debugf("setting up the input streams handler")
+	mesh.logger.Debugf(`sending configuration stream handlers`)
 
-	mesh.ipfsNode.PeerHost.SetStreamHandler(p2pProtocolID, mesh.addStream)
+	for _, streamHandler := range mesh.streamHandlers {
+		streamHandler.SetID(mesh.ipfsNode.PeerHost.ID())
+		streamHandler.SetPSK(mesh.privateSharedKeyword)
+		privKey, err := mesh.ipfsNode.PrivateKey.Raw()
+		if err != nil {
+			return err
+		}
+		streamHandler.SetPrivateKey(privKey)
+		err = streamHandler.Start()
+		if err != nil {
+			return err
+		}
+	}
+
+	mesh.logger.Debugf(`starting to listen for the input streams handler`)
+
+	mesh.ipfsNode.PeerHost.SetStreamHandler(p2pProtocolID, func(stream Stream) {
+		mesh.addStream(stream, AddrInfo{
+			ID:    stream.Conn().RemotePeer(),
+			Addrs: []p2pcore.Multiaddr{stream.Conn().RemoteMultiaddr()},
+		})
+	})
 
 	go mesh.connector(ipfsCid)
 
@@ -331,7 +363,7 @@ func (mesh *Network) sendAuthData(stream Stream) (err error) {
 
 	var buf bytes.Buffer
 	buf.WriteString(string(mesh.ipfsNode.Identity))
-	sum := sha512.Sum512(mesh.sharedKeyword)
+	sum := sha512.Sum512(mesh.privateSharedKeyword)
 	buf.Write(sum[:])
 	sum = sha512.Sum512(buf.Bytes())
 	mesh.logger.Debugf(`sending auth data to %v: %v`, stream.Conn().RemotePeer(), sum[:])
@@ -349,7 +381,7 @@ func (mesh *Network) recvAndCheckAuthData(stream Stream) (err error) {
 
 	var buf bytes.Buffer
 	buf.WriteString(string(stream.Conn().RemotePeer()))
-	sum := sha512.Sum512(mesh.sharedKeyword)
+	sum := sha512.Sum512(mesh.privateSharedKeyword)
 	buf.Write(sum[:])
 	sum = sha512.Sum512(buf.Bytes())
 	expectedAuthData := sum[:]
@@ -367,7 +399,7 @@ func (mesh *Network) recvAndCheckAuthData(stream Stream) (err error) {
 	return
 }
 
-func (mesh *Network) addStream(stream Stream) {
+func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) {
 	mesh.logger.Debugf("addStream %v", stream.Conn().RemotePeer())
 	if stream.Conn().RemotePeer() == mesh.ipfsNode.PeerHost.ID() {
 		mesh.logger.Debugf("it's my ID, skip")
@@ -391,6 +423,6 @@ func (mesh *Network) addStream(stream Stream) {
 	mesh.streams.Store(stream.Conn().RemotePeer(), stream)
 
 	for _, streamHandler := range mesh.streamHandlers {
-		streamHandler.NewStream(stream)
+		streamHandler.NewStream(stream, peerAddr)
 	}
 }

@@ -234,10 +234,14 @@ func main() {
 	vpnInstance, err := vpn.New(filepath.Join(dataDir, "int_alias.json"), *subnet, vpnLogger)
 	fatalIf(err)
 
+	defer func() {_ = vpnInstance.Close()}()
+
 	netLogger := &logger{config.Get().DumpNetworkCommunications}
 
-	_, err = network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), netLogger, vpnInstance)
+	networkInstance, err := network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), netLogger, vpnInstance)
 	fatalIf(err)
+
+	defer func() {_ = networkInstance.Close()}()
 
 	select {}
 }
