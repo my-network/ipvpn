@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -273,11 +274,23 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 	mesh.logger.Debugf(`initializing output streams`)
 
 	provChan := mesh.ipfsNode.DHT.FindProvidersAsync(mesh.ipfsContext, ipfsCid, 1<<16)
+	count := uint(0)
 	for {
 		select {
 		case <-mesh.ipfsContext.Done():
 			return
 		case peerAddr := <-provChan:
+			if peerAddr.ID == mesh.ipfsNode.PeerHost.ID() {
+				mesh.logger.Debugf("my ID, skip")
+				continue
+			}
+			if peerAddr.ID == "" {
+				mesh.logger.Debugf("empty peer ID, sleep %v hours and restart FindProvidersAsync", 1 << count)
+				time.Sleep(time.Hour * time.Duration(1 << count))
+				provChan = mesh.ipfsNode.DHT.FindProvidersAsync(mesh.ipfsContext, ipfsCid, 1<<16)
+				count++
+				continue
+			}
 			_, err := mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerAddr.ID)
 			if err != nil {
 				mesh.logger.Infof("unable to find a route to peer %v: %v", peerAddr.ID, err)

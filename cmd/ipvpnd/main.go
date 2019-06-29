@@ -6,7 +6,6 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
-	"github.com/xaionaro-go/ipvpn/vpn"
 	"hash/crc32"
 	"io/ioutil"
 	"net"
@@ -14,14 +13,15 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/denisbrodbeck/machineid"
+	"github.com/sirupsen/logrus"
 
 	"github.com/xaionaro-go/errors"
 
 	"github.com/xaionaro-go/ipvpn/config"
 	"github.com/xaionaro-go/ipvpn/helpers"
 	"github.com/xaionaro-go/ipvpn/network"
+	"github.com/xaionaro-go/ipvpn/vpn"
 )
 
 const (
@@ -229,14 +229,14 @@ func main() {
 	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
 	fatalIf(err)
 
-	vpnLogger := &logger{config.Get().DumpVPNCommunications}
+	vpnLogger := &logger{true, config.Get().DumpVPNCommunications}
 
 	vpnInstance, err := vpn.New(filepath.Join(dataDir, "int_alias.json"), *subnet, vpnLogger)
 	fatalIf(err)
 
 	defer func() {_ = vpnInstance.Close()}()
 
-	netLogger := &logger{config.Get().DumpNetworkCommunications}
+	netLogger := &logger{true, config.Get().DumpNetworkCommunications}
 
 	networkInstance, err := network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), netLogger, vpnInstance)
 	fatalIf(err)

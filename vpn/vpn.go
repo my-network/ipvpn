@@ -3,6 +3,7 @@ package vpn
 import (
 	e "errors"
 	"io/ioutil"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/xaionaro-go/errors"
 	"github.com/xaionaro-go/wgcreate"
 	"golang.org/x/crypto/ed25519"
+	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
@@ -160,7 +162,11 @@ func (vpn *VPN) Start() (err error) {
 		return ErrAlreadyStarted
 	}
 
-	vpn.ifaceName, err = wgcreate.Create(vpn.ifaceName, defaultMTU, true)
+	vpn.ifaceName, err = wgcreate.Create(vpn.ifaceName, defaultMTU, true, &device.Logger{
+		Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard] ", 0),
+		Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard] ", 0),
+		Error: log.New(vpn.logger.GetErrorWriter(), "[wireguard] ", 0),
+	})
 	if err != nil {
 		return
 	}
