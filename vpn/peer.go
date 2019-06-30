@@ -45,15 +45,16 @@ type TrustConfig struct {
 type Peer struct {
 	locker sync.Mutex
 
-	VPN        *VPN
-	Stream     Stream
-	AddrInfo   AddrInfo
-	IntAlias   IntAlias
-	DirectAddr *net.UDPAddr
-	TunnelAddr *net.UDPAddr
-	TunnelConn *net.UDPConn
-	IsTrusted  TrustConfig
-	WgPubKey   wgtypes.Key
+	VPN            *VPN
+	Stream         Stream
+	AddrInfo       AddrInfo
+	IntAlias       IntAlias
+	DirectAddr     *net.UDPAddr
+	TunnelAddr     *net.UDPAddr
+	TunnelConn     *net.UDPConn
+	IsTrusted      TrustConfig
+	WgPubKeyDirect wgtypes.Key
+	WgPubKeyTunnel wgtypes.Key
 }
 
 type Peers []*Peer
@@ -103,16 +104,28 @@ func (peer *Peer) Start() (err error) {
 		return
 	}
 
-	// Setup direct connection
+	// Setup tunneled connection
 
-	cfg := wgtypes.Config{
+	cfgTunnel := wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
-			peerDirectCfg,
 			peerIPFSCfg,
 		},
 	}
 
-	err = peer.VPN.wgctl.ConfigureDevice(peer.VPN.ifaceName, cfg)
+	err = peer.VPN.wgctl.ConfigureDevice(peer.VPN.ifaceNameTunnel, cfgTunnel)
+	if err != nil {
+		return
+	}
+
+	// Setup direct connection
+
+	cfgDirect := wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{
+			peerDirectCfg,
+		},
+	}
+
+	err = peer.VPN.wgctl.ConfigureDevice(peer.VPN.ifaceNameDirect, cfgDirect)
 	if err != nil {
 		return
 	}
@@ -172,7 +185,7 @@ func (peer *Peer) considerConfigBytes(payload []byte) (err error) {
 func (peer *Peer) considerPacket(b []byte) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	size, err := peer.TunnelConn.WriteToUDP(b, &peer.VPN.wgListenerAddr)
+	size, err := peer.TunnelConn.WriteToUDP(b, &peer.VPN.wgListenerTunnelAddr)
 	if err != nil {
 		if err == syscall.EDESTADDRREQ {
 			peer.VPN.logger.Debugf("WG is not connected to the tunnel, yet. Peer %v %v", peer.IntAlias.Value, peer.GetID())
@@ -255,10 +268,10 @@ func (peer *Peer) switchChannel(chType channelType) (err error) {
 	return
 }
 
-func (peer *Peer) toWireGuardXConfig() (peerCfg wgtypes.PeerConfig, err error) {
+func (peer *Peer) toWireGuardXConfig(isSecondary bool) (peerCfg wgtypes.PeerConfig, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	internalIP, err := peer.VPN.GetIP(peer.IntAlias.Value)
+	internalIP, err := peer.VPN.GetIP(peer.IntAlias.Value, isSecondary)
 	if err != nil {
 		return
 	}
@@ -276,7 +289,6 @@ func (peer *Peer) toWireGuardXConfig() (peerCfg wgtypes.PeerConfig, err error) {
 			},
 		},
 	}
-	copy(peerCfg.PublicKey[:], peer.WgPubKey[:])
 	copy(peerCfg.PresharedKey[:], peer.VPN.GetPSK())
 
 	peer.VPN.logger.Debugf("peerCfg: %v", peerCfg)
@@ -287,7 +299,7 @@ func (peer *Peer) toWireGuardXConfig() (peerCfg wgtypes.PeerConfig, err error) {
 func (peer *Peer) toWireGuardDirectConfig() (peerCfg wgtypes.PeerConfig, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	peerCfg, err = peer.toWireGuardXConfig()
+	peerCfg, err = peer.toWireGuardXConfig(true)
 	if err != nil {
 		return
 	}
@@ -295,9 +307,11 @@ func (peer *Peer) toWireGuardDirectConfig() (peerCfg wgtypes.PeerConfig, err err
 	if err != nil {
 		return
 	}
+
+	copy(peerCfg.PublicKey[:], peer.WgPubKeyDirect[:])
 	peerCfg.Endpoint = &net.UDPAddr{
 		IP:   net.ParseIP(peerIP),
-		Port: ipvpnPort,
+		Port: ipvpnPortDirect,
 	}
 
 	peer.VPN.logger.Debugf("peer %v, direct endpoint %v", peer.GetID(), peerCfg.Endpoint)
@@ -382,27 +396,35 @@ func (peer *Peer) toWireGuardIPFSConfig() (peerCfg wgtypes.PeerConfig, err error
 	peer.locker.Lock()
 	defer peer.locker.Unlock()
 
-	peerCfg, err = peer.toWireGuardXConfig()
+	peerCfg, err = peer.toWireGuardXConfig(false)
 	if err != nil {
 		return
 	}
 
+	copy(peerCfg.PublicKey[:], peer.WgPubKeyTunnel[:])
 	peerCfg.Endpoint = peer.TunnelAddr
 
 	peer.VPN.logger.Debugf("peer %v, IPFS endpoint %v", peer.GetID(), peerCfg.Endpoint)
 	return
 }
 
-func (peers Peers) toWireGuardConfigs() (result []wgtypes.PeerConfig, err error) {
+func (peers Peers) toWireGuardDirectConfigs() (result []wgtypes.PeerConfig, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	for _, peer := range peers {
-		/*peerDirectCfg, err := peer.toWireGuardDirectConfig()
+		peerDirectCfg, err := peer.toWireGuardDirectConfig()
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, peerDirectCfg)*/
+		result = append(result, peerDirectCfg)
+	}
+	return
+}
 
+func (peers Peers) toWireGuardTunnelConfigs() (result []wgtypes.PeerConfig, err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	for _, peer := range peers {
 		peerIPFSCfg, err := peer.toWireGuardIPFSConfig()
 		if err != nil {
 			return nil, err

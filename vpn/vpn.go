@@ -3,6 +3,7 @@ package vpn
 import (
 	e "errors"
 	"github.com/agl/ed25519/extra25519"
+	"golang.org/x/crypto/curve25519"
 	"io/ioutil"
 	"log"
 	"net"
@@ -24,10 +25,16 @@ import (
 
 const (
 	bufferSize              = 1 << 20
-	ipvpnIfaceName          = `ipvpn`
+	ipvpnIfaceNameTunnel    = `ipvpn_tunnel`
+	ipvpnIfaceNameDirect    = `ipvpn_direct`
 	defaultMTU              = 1200
-	ipvpnPort               = 18291
+	ipvpnPortTunnel         = 18291
+	ipvpnPortDirect         = 18292
 	directConnectionTimeout = 30 * time.Second
+)
+
+var (
+	secondaryKeyBase = [32]byte{'i', 'p', 'v', 'p', 'n'}
 )
 
 var (
@@ -39,21 +46,23 @@ type Stream = network.Stream
 type AddrInfo = network.AddrInfo
 
 type VPN struct {
-	logger           Logger
-	myID             peer.ID
-	intAlias         IntAlias
-	intAliasFilePath string
-	peers            sync.Map
-	subnet           net.IPNet
-	newStreamLocker  sync.Mutex
-	buffer           [bufferSize]byte
-	wgctl            *wgctrl.Client
-	privKey          ed25519.PrivateKey
-	psk              []byte
-	ifaceName        string
-	state            uint32
-	currentIP        net.IP
-	wgListenerAddr   net.UDPAddr
+	logger               Logger
+	myID                 peer.ID
+	intAlias             IntAlias
+	intAliasFilePath     string
+	peers                sync.Map
+	subnet               net.IPNet
+	newStreamLocker      sync.Mutex
+	buffer               [bufferSize]byte
+	wgctl                *wgctrl.Client
+	privKey              ed25519.PrivateKey
+	psk                  []byte
+	ifaceNameTunnel      string
+	ifaceNameDirect      string
+	state                uint32
+	currentPrimaryIP     net.IP
+	wgListenerTunnelAddr net.UDPAddr
+	wgListenerDirectAddr net.UDPAddr
 }
 
 func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) {
@@ -68,7 +77,8 @@ func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, er
 		logger:           logger,
 		subnet:           subnet,
 		intAliasFilePath: intAliasFilePath,
-		ifaceName:        ipvpnIfaceName,
+		ifaceNameTunnel:  ipvpnIfaceNameTunnel,
+		ifaceNameDirect:  ipvpnIfaceNameDirect,
 	}
 
 	vpn.wgctl, err = wgctrl.New()
@@ -120,27 +130,42 @@ func (vpn *VPN) setPrivateKey(privKey ed25519.PrivateKey) {
 	vpn.privKey = privKey
 }
 
-func (vpn *VPN) GetIP(intAlias uint64) (net.IP, error) {
+func (vpn *VPN) GetIP(intAlias uint64, isSecondary bool) (resultIP net.IP, err error) {
+	defer func() { err = errors.Wrap(err) }()
+	defer func() { vpn.logger.Debugf("GetIP(%v, %v) -> %v, %v", intAlias, isSecondary, resultIP, err) }()
+
 	maskOnes, maskBits := vpn.subnet.Mask.Size()
-	if vpn.intAlias.Value >= 1<<uint32(maskBits-maskOnes) {
+	if vpn.intAlias.Value >= 1<<uint32(maskBits-maskOnes-1) {
 		return nil, errors.New("int alias value is too big or subnet is too small")
 	}
 
-	resultIP := make(net.IP, len(vpn.subnet.IP))
+	resultIP = make(net.IP, len(vpn.subnet.IP))
 	copy(resultIP, vpn.subnet.IP)
 	if resultIP.To4() == nil {
 		return nil, errors.New("IPv6 support is not implemented, yet")
 	}
 
-	if uint64(resultIP[len(resultIP)-1])+intAlias >= 255 {
-		return nil, errors.New("are not implemented, yet; we can only modify the last octet at the moment of an IP address")
+	octet := len(resultIP) - 1
+
+	offset := intAlias
+	if isSecondary {
+		offset += 1 << uint32(maskBits-maskOnes-1)
 	}
-	resultIP[len(resultIP)-1] += uint8(intAlias)
+	for offset > 0 && octet >= 0 {
+		localOffset := uint8(offset % 256)
+		offset /= 256
+		if uint16(resultIP[octet])+uint16(localOffset) >= 256 {
+			offset++
+		}
+		resultIP[octet] += localOffset
+		octet--
+	}
+
 	return resultIP, nil
 }
 
-func (vpn *VPN) GetMyIP() (net.IP, error) {
-	return vpn.GetIP(vpn.intAlias.Value)
+func (vpn *VPN) GetMyIP(isSecondary bool) (net.IP, error) {
+	return vpn.GetIP(vpn.intAlias.Value, isSecondary)
 }
 
 func (vpn *VPN) getPeers() (peers Peers) {
@@ -164,10 +189,19 @@ func (vpn *VPN) Start() (err error) {
 		return ErrAlreadyStarted
 	}
 
-	vpn.ifaceName, err = wgcreate.Create(vpn.ifaceName, defaultMTU, true, &device.Logger{
-		Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard] ", 0),
-		Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard] ", 0),
-		Error: log.New(vpn.logger.GetErrorWriter(), "[wireguard] ", 0),
+	vpn.ifaceNameTunnel, err = wgcreate.Create(vpn.ifaceNameTunnel, defaultMTU, true, &device.Logger{
+		Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard-tunnel] ", 0),
+		Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard-tunnel] ", 0),
+		Error: log.New(vpn.logger.GetErrorWriter(), "[wireguard-tunnel] ", 0),
+	})
+	if err != nil {
+		return
+	}
+
+	vpn.ifaceNameDirect, err = wgcreate.Create(vpn.ifaceNameDirect, defaultMTU, true, &device.Logger{
+		Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard-direct] ", 0),
+		Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard-direct] ", 0),
+		Error: log.New(vpn.logger.GetErrorWriter(), "[wireguard-direct] ", 0),
 	})
 	if err != nil {
 		return
@@ -197,13 +231,26 @@ func (vpn *VPN) fallbackConnectorLoop() {
 
 		m := map[string]*wgtypes.Peer{}
 
-		dev, err := vpn.wgctl.Device(vpn.ifaceName)
-		if err != nil {
-			return
+		{ // scanning tunneled peers
+			dev, err := vpn.wgctl.Device(vpn.ifaceNameTunnel)
+			if err != nil {
+				return
+			}
+
+			for idx, wgPeer := range dev.Peers {
+				m[wgPeer.Endpoint.String()] = &dev.Peers[idx]
+			}
 		}
 
-		for idx, wgPeer := range dev.Peers {
-			m[wgPeer.Endpoint.String()] = &dev.Peers[idx]
+		{ // scanning direct peers
+			dev, err := vpn.wgctl.Device(vpn.ifaceNameDirect)
+			if err != nil {
+				return
+			}
+
+			for idx, wgPeer := range dev.Peers {
+				m[wgPeer.Endpoint.String()] = &dev.Peers[idx]
+			}
 		}
 
 		for _, vpnPeer := range vpn.getPeers() {
@@ -277,33 +324,66 @@ func (vpn *VPN) updateWireGuardConfiguration() (err error) {
 		return
 	}
 
-	peersCfg, err := vpn.getPeers().toWireGuardConfigs()
+	peersCfgTunnel, err := vpn.getPeers().toWireGuardTunnelConfigs()
 	if err != nil {
 		return
 	}
 
-	cfg := wgtypes.Config{
+	cfgTunnel := wgtypes.Config{
 		PrivateKey:   &wgtypes.Key{},
-		ListenPort:   &[]int{ipvpnPort}[0],
+		ListenPort:   &[]int{ipvpnPortTunnel}[0],
 		FirewallMark: &[]int{1}[0],
-		Peers:        peersCfg,
+		Peers:        peersCfgTunnel,
 		ReplacePeers: true,
 	}
 
-	vpn.wgListenerAddr.IP = net.ParseIP(`127.0.0.1`)
-	vpn.wgListenerAddr.Port = ipvpnPort
+	vpn.wgListenerTunnelAddr.IP = net.ParseIP(`127.0.0.1`)
+	vpn.wgListenerTunnelAddr.Port = ipvpnPortTunnel
 
 	// WireGuard uses Curve25519, while IPFS uses ED25519. So we need to convert it:
 	{
 		var privKey [64]byte
 		copy(privKey[:], vpn.privKey)
-		extra25519.PrivateKeyToCurve25519((*[32]byte)(cfg.PrivateKey), &privKey)
+		extra25519.PrivateKeyToCurve25519((*[32]byte)(cfgTunnel.PrivateKey), &privKey)
 	}
 
-	vpn.logger.Debugf("wgConfig: %v", cfg)
-	vpn.logger.Debugf("wgConfig public key: %v", cfg.PrivateKey.PublicKey())
+	vpn.logger.Debugf("wgConfigTunnel: %v", cfgTunnel)
+	vpn.logger.Debugf("wgConfigTunnel public key: %v", cfgTunnel.PrivateKey.PublicKey())
 
-	err = vpn.wgctl.ConfigureDevice(vpn.ifaceName, cfg)
+	err = vpn.wgctl.ConfigureDevice(vpn.ifaceNameTunnel, cfgTunnel)
+	if err != nil {
+		return
+	}
+
+	peersCfgDirect, err := vpn.getPeers().toWireGuardDirectConfigs()
+	if err != nil {
+		return
+	}
+
+	cfgDirect := wgtypes.Config{
+		PrivateKey:   &wgtypes.Key{},
+		ListenPort:   &[]int{ipvpnPortDirect}[0],
+		FirewallMark: &[]int{1}[0],
+		Peers:        peersCfgDirect,
+		ReplacePeers: true,
+	}
+
+	vpn.wgListenerDirectAddr.IP = net.ParseIP(`0.0.0.0`)
+	vpn.wgListenerDirectAddr.Port = ipvpnPortDirect
+
+	/*
+		// WireGuard doesn't support multiple endpoints for one peer, so we do a separate WireGuard
+		// listener for the direct endpoints with another key (shifted on a constant value)
+		wgPrivateKeyDirect := shiftWgKey(cfgTunnel.PrivateKey)
+		copy(cfgDirect.PrivateKey[:], wgPrivateKeyDirect[:])*/
+
+	// We separated WG interfaces, so there's no need to separate keys anymore
+	copy(cfgDirect.PrivateKey[:], cfgTunnel.PrivateKey[:])
+
+	vpn.logger.Debugf("wgConfigDirect: %v", cfgDirect)
+	vpn.logger.Debugf("wgConfigDirect public key: %v", cfgDirect.PrivateKey.PublicKey())
+
+	err = vpn.wgctl.ConfigureDevice(vpn.ifaceNameDirect, cfgDirect)
 	if err != nil {
 		return
 	}
@@ -396,23 +476,48 @@ func (vpn *VPN) recvIntAliases(stream Stream) (remoteIntAliases IntAliases, err 
 func (vpn *VPN) setupIfaceIPAddress() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	myIP, err := vpn.GetMyIP()
+	myPrimaryIP, err := vpn.GetMyIP(false)
 	if err != nil {
 		return
 	}
 
-	if vpn.currentIP.String() == myIP.String() {
+	if vpn.currentPrimaryIP.String() == myPrimaryIP.String() {
 		return
 	}
 
-	vpn.currentIP = myIP
-
-	err = wgcreate.ResetIPs(vpn.ifaceName)
+	mySecondaryIP, err := vpn.GetMyIP(true)
 	if err != nil {
 		return
 	}
 
-	err = wgcreate.AddIP(vpn.ifaceName, myIP, vpn.subnet)
+	vpn.currentPrimaryIP = myPrimaryIP
+
+	err = wgcreate.ResetIPs(vpn.ifaceNameTunnel)
+	if err != nil {
+		return
+	}
+
+	err = wgcreate.ResetIPs(vpn.ifaceNameDirect)
+	if err != nil {
+		return
+	}
+
+	maskOnes, maskBits := vpn.subnet.Mask.Size()
+
+	tunnelSubnet := vpn.subnet
+	tunnelSubnet.Mask = net.CIDRMask(maskOnes+1, maskBits)
+	err = wgcreate.AddIP(vpn.ifaceNameTunnel, myPrimaryIP, tunnelSubnet)
+	if err != nil {
+		return
+	}
+
+	directSubnet := vpn.subnet
+	directSubnet.Mask = net.CIDRMask(maskOnes+1, maskBits)
+	directSubnet.IP, err = vpn.GetIP(0, true)
+	if err != nil {
+		return
+	}
+	err = wgcreate.AddIP(vpn.ifaceNameDirect, mySecondaryIP, directSubnet)
 	if err != nil {
 		return
 	}
@@ -472,21 +577,41 @@ func (vpn *VPN) UpdateIntAliasMetadataAndSave() (err error) {
 	return
 }
 
+// WireGuard uses Curve25519, while IPFS uses ED25519. So we need to convert it:
+func streamToWgPubKey(stream Stream) (result wgtypes.Key, err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	var pubKey [32]byte
+	pubKeyBytes, err := stream.Conn().RemotePublicKey().Raw()
+	if err != nil {
+		return
+	}
+	copy(pubKey[:], pubKeyBytes)
+	extra25519.PublicKeyToCurve25519((*[32]byte)(&result), &pubKey)
+	return
+}
+
+func shiftWgKey(in *wgtypes.Key) (out wgtypes.Key) {
+	curve25519.ScalarMult((*[32]byte)(&out), (*[32]byte)(in), &secondaryKeyBase)
+	return
+}
+
 func (vpn *VPN) newStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	// WireGuard uses Curve25519, while IPFS uses ED25519. So we need to convert it:
-	var wgPubKey wgtypes.Key
-	{
-		var pubKey [32]byte
-		pubKeyBytes, err := stream.Conn().RemotePublicKey().Raw()
-		if err != nil {
-			return err
-		}
-		copy(pubKey[:], pubKeyBytes)
-		extra25519.PublicKeyToCurve25519((*[32]byte)(&wgPubKey), &pubKey)
-		vpn.logger.Debugf("new stream %v, pubkey %v", peerAddr.ID, wgPubKey)
+	wgPubKeyTunnel, err := streamToWgPubKey(stream)
+	if err != nil {
+		return
 	}
+	vpn.logger.Debugf("new stream %v, pubkey %v", peerAddr.ID, wgPubKeyTunnel)
+
+	/*
+		// WireGuard doesn't support multiple endpoints for one peer, so we do a separate WireGuard
+		// peer for the direct endpoint
+		wgPubKeyDirect := shiftWgKey(&wgPubKeyTunnel)
+	*/
+	// We've separated WG interfaces, so there's no need to separate keys anymore
+	wgPubKeyDirect := wgPubKeyTunnel
 
 	vpn.newStreamLocker.Lock()
 	defer vpn.newStreamLocker.Unlock()
@@ -577,11 +702,12 @@ func (vpn *VPN) newStream(stream Stream, peerAddr AddrInfo) (err error) {
 
 	remoteIntAliases[0].Timestamp = time.Now().Add(-remoteIntAliases[0].Since)
 	newPeer := &Peer{
-		VPN:      vpn,
-		Stream:   stream,
-		AddrInfo: peerAddr,
-		IntAlias: *remoteIntAliases[0],
-		WgPubKey: wgPubKey,
+		VPN:            vpn,
+		Stream:         stream,
+		AddrInfo:       peerAddr,
+		IntAlias:       *remoteIntAliases[0],
+		WgPubKeyTunnel: wgPubKeyTunnel,
+		WgPubKeyDirect: wgPubKeyDirect,
 	}
 
 	err = newPeer.Start()
@@ -602,6 +728,10 @@ func (vpn *VPN) newStream(stream Stream, peerAddr AddrInfo) (err error) {
 func (vpn *VPN) NewStream(stream Stream, peerAddr AddrInfo) {
 	if err := vpn.newStream(stream, peerAddr); err != nil {
 		vpn.logger.Error(errors.Wrap(err))
-		_ = stream.Close()
+		err := stream.Close()
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err))
+			return
+		}
 	}
 }

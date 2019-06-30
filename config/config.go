@@ -2,23 +2,20 @@ package config
 
 import (
 	"encoding/json"
+	"github.com/caarlos0/env"
 	"os"
 	"strings"
 	"sync/atomic"
-	"time"
-
-	"github.com/caarlos0/env"
 )
 
 var configInstance atomic.Value
 
 type config struct {
-	DataDirectory             string        `env:"IPVPN_DATADIR" envDefault:"${HOME}/.ipvpn"`
-	NetworkSubnet             string        `env:"IPVPN_NETWORK_SUBNET" envDefault:"10.68.0.0/16"`
-	NetworkUpdateInterval     time.Duration `env:"IPVPN_NETWORK_UPDATE_INTERVAL" envDefault:"3600s"`
-	DumpVPNCommunications     bool          `env:"IPVPN_NETWORK_DUMP_VPN"`
-	DumpNetworkCommunications bool          `env:"IPVPN_NETWORK_DUMP_MESH"`
-	DumpConfiguration         bool          `env:"IPVPN_DUMP_CONFIG"`
+	DataDirectory             string `env:"IPVPN_DATADIR" envDefault:"${HOME}/.ipvpn"`
+	NetworkSubnet             string `env:"IPVPN_NETWORK_SUBNET" envDefault:"10.197.202.0/23"`
+	DumpVPNCommunications     bool   `env:"IPVPN_NETWORK_DUMP_VPN"`
+	DumpNetworkCommunications bool   `env:"IPVPN_NETWORK_DUMP_MESH"`
+	DumpConfiguration         bool   `env:"IPVPN_DUMP_CONFIG"`
 }
 
 func (cfg config) String() string {
