@@ -36,15 +36,16 @@ const (
 )
 
 type Network struct {
-	logger                Logger
-	networkName           string
-	publicSharedKeyword   []byte
-	privateSharedKeyword  []byte
-	ipfsNode              *core.IpfsNode
-	ipfsContext           context.Context
-	ipfsContextCancelFunc func()
-	streams               sync.Map
-	streamHandlers        []StreamHandler
+	logger                 Logger
+	networkName            string
+	publicSharedKeyword    []byte
+	privateSharedKeyword   []byte
+	ipfsNode               *core.IpfsNode
+	ipfsContext            context.Context
+	ipfsContextCancelFunc  func()
+	streams                sync.Map
+	streamHandlers         []StreamHandler
+	callPathOptimizerCount sync.Map
 }
 
 type Stream = p2pcore.Stream
@@ -408,10 +409,32 @@ func (mesh *Network) start() (err error) {
 	mesh.logger.Debugf(`starting to listen for the input streams handler`)
 
 	mesh.ipfsNode.PeerHost.SetStreamHandler(p2pProtocolID, func(stream Stream) {
-		mesh.addStream(stream, AddrInfo{
-			ID:    stream.Conn().RemotePeer(),
-			Addrs: []p2pcore.Multiaddr{stream.Conn().RemoteMultiaddr()},
-		})
+		peerID := stream.Conn().RemotePeer()
+		addrInfo, err := mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerID)
+		if err != nil {
+			mesh.logger.Error(errors.Wrap(err, peerID))
+			err := stream.Conn().Close()
+			if err != nil {
+				mesh.logger.Error(errors.Wrap(err))
+			}
+			return
+		}
+
+		var callPathOptimizerCount uint64
+		if v, ok := mesh.callPathOptimizerCount.Load(peerID); ok {
+			callPathOptimizerCount = v.(uint64)
+		}
+		if callPathOptimizerCount == 0 {
+			go func() {
+				time.Sleep(time.Hour)
+				mesh.callPathOptimizerCount.Store(peerID, uint64(0))
+			}()
+		}
+		if callPathOptimizerCount < 10 {
+			mesh.tryConnectByOptimalPath(&addrInfo)
+			mesh.callPathOptimizerCount.Store(peerID, callPathOptimizerCount+1)
+		}
+		mesh.addStream(stream, addrInfo)
 	})
 
 	go mesh.connector(ipfsCid)
