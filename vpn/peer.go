@@ -4,11 +4,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	e "errors"
+	"github.com/libp2p/go-libp2p-core/mux"
+	"github.com/libp2p/go-libp2p/p2p/net/mock"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
@@ -46,11 +49,11 @@ type Peer struct {
 	Stream     Stream
 	AddrInfo   AddrInfo
 	IntAlias   IntAlias
-	WgDirect   *wgtypes.Peer
-	WgIPFS     *wgtypes.Peer
+	DirectAddr *net.UDPAddr
 	TunnelAddr *net.UDPAddr
 	TunnelConn *net.UDPConn
 	IsTrusted  TrustConfig
+	WgPubKey   wgtypes.Key
 }
 
 type Peers []*Peer
@@ -63,16 +66,19 @@ func (peer *Peer) Close() (err error) {
 
 	err = peer.Stream.Close()
 	if err != nil {
-		return
+		peer.VPN.logger.Error(errors.Wrap(err))
 	}
 
 	if peer.TunnelConn != nil {
 		err = peer.TunnelConn.Close()
 		if err != nil {
-			return
+			peer.VPN.logger.Error(errors.Wrap(err))
 		}
 		peer.TunnelConn = nil
 	}
+
+	peer.VPN.peers.Delete(peer.GetID())
+	peer.VPN.logger.Debugf("peer closed %v %v", peer.IntAlias.Value, peer.GetID())
 
 	return
 }
@@ -81,6 +87,13 @@ func (peer *Peer) Start() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	peerDirectCfg, err := peer.toWireGuardDirectConfig()
+	if err != nil {
+		return
+	}
+
+	peer.DirectAddr = peerDirectCfg.Endpoint
+
+	err = peer.startTunnel()
 	if err != nil {
 		return
 	}
@@ -106,11 +119,6 @@ func (peer *Peer) Start() (err error) {
 	copy(cfg.PrivateKey[:], peer.VPN.privKey)
 
 	err = peer.VPN.wgctl.ConfigureDevice(peer.VPN.ifaceName, cfg)
-	if err != nil {
-		return
-	}
-
-	err = peer.startTunnel()
 	if err != nil {
 		return
 	}
@@ -170,8 +178,12 @@ func (peer *Peer) considerConfigBytes(payload []byte) (err error) {
 func (peer *Peer) considerPacket(b []byte) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	size, err := peer.TunnelConn.Write(b)
+	size, err := peer.TunnelConn.WriteToUDP(b, &peer.VPN.wgListenerAddr)
 	if err != nil {
+		if err == syscall.EDESTADDRREQ {
+			peer.VPN.logger.Debugf("WG is not connected to the tunnel, yet. Peer %v %v", peer.IntAlias.Value, peer.GetID())
+			return nil
+		}
 		return
 	}
 
@@ -188,20 +200,24 @@ func (peer *Peer) streamReaderLoop() {
 	for {
 		size, err := peer.Stream.Read(buffer[:])
 		if err != nil {
-			if netErr, ok := err.(*net.OpError); ok {
-				if netErr.Err == io.EOF {
-					peer.VPN.logger.Infof("IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
-					return
-				}
+			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset {
+				peer.VPN.logger.Infof("IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
+			} else {
+				peer.VPN.logger.Error(errors.Wrap(err))
 			}
-			peer.VPN.logger.Error(errors.Wrap(err))
-			_ = peer.Close()
+			err := peer.Close()
+			if err != nil {
+				peer.VPN.logger.Error(errors.Wrap(err))
+			}
 			return
 		}
 
 		if size < 2 {
 			peer.VPN.logger.Error(errors.Wrap(ErrMessageTooShort))
-			_ = peer.Close()
+			err := peer.Close()
+			if err != nil {
+				peer.VPN.logger.Error(errors.Wrap(err))
+			}
 			return
 		}
 
@@ -220,7 +236,10 @@ func (peer *Peer) streamReaderLoop() {
 
 		if err != nil {
 			peer.VPN.logger.Error(errors.Wrap(err))
-			_ = peer.Close()
+			err := peer.Close()
+			if err != nil {
+				peer.VPN.logger.Error(errors.Wrap(err))
+			}
 			return
 		}
 	}
@@ -245,10 +264,6 @@ func (peer *Peer) switchChannel(chType channelType) (err error) {
 func (peer *Peer) toWireGuardXConfig() (peerCfg wgtypes.PeerConfig, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	pubKey, err := peer.Stream.Conn().RemotePublicKey().Raw()
-	if err != nil {
-		return
-	}
 	internalIP, err := peer.VPN.GetIP(peer.IntAlias.Value)
 	if err != nil {
 		return
@@ -267,8 +282,10 @@ func (peer *Peer) toWireGuardXConfig() (peerCfg wgtypes.PeerConfig, err error) {
 			},
 		},
 	}
-	copy(peerCfg.PublicKey[:], pubKey)
+	copy(peerCfg.PublicKey[:], peer.WgPubKey[:])
 	copy(peerCfg.PresharedKey[:], peer.VPN.GetPSK())
+
+	peer.VPN.logger.Debugf("peerCfg: %v", peerCfg)
 
 	return
 }
@@ -289,6 +306,8 @@ func (peer *Peer) toWireGuardDirectConfig() (peerCfg wgtypes.PeerConfig, err err
 		Port: ipvpnPort,
 	}
 
+	peer.VPN.logger.Debugf("peer %v, direct endpoint %v", peer.GetID(), peerCfg.Endpoint)
+
 	return
 }
 
@@ -300,20 +319,30 @@ func (peer *Peer) tunnelLoop() {
 		size, err := peer.TunnelConn.Read(buffer[2:])
 		if err != nil {
 			if netErr, ok := err.(*net.OpError); ok {
-				if netErr.Err == io.EOF {
+				if netErr.Err == io.EOF || netErr.Err.Error() == "use of closed network connection" {
 					peer.VPN.logger.Infof("tunnel connection closed (peer ID %v:%v), port %v", peer.IntAlias.Value, peer.GetID(), peer.TunnelAddr.Port)
+					err := peer.Close()
+					if err != nil {
+						peer.VPN.logger.Error(errors.Wrap(err))
+					}
 					return
 				}
 			}
 			peer.VPN.logger.Error(errors.Wrap(err))
-			_ = peer.Close()
+			err := peer.Close()
+			if err != nil {
+				peer.VPN.logger.Error(errors.Wrap(err))
+			}
 			return
 		}
 
-		wSize, err := peer.Stream.Write(buffer[:])
+		wSize, err := peer.Stream.Write(buffer[:size])
 		if size != wSize {
 			peer.VPN.logger.Error(errors.Wrap(ErrInvalidSize, size, wSize))
-			_ = peer.Close()
+			err = peer.Close()
+			if err != nil {
+				peer.VPN.logger.Error(errors.Wrap(err))
+			}
 			return
 		}
 	}
@@ -365,6 +394,8 @@ func (peer *Peer) toWireGuardIPFSConfig() (peerCfg wgtypes.PeerConfig, err error
 	}
 
 	peerCfg.Endpoint = peer.TunnelAddr
+
+	peer.VPN.logger.Debugf("peer %v, IPFS endpoint %v", peer.GetID(), peerCfg.Endpoint)
 	return
 }
 
@@ -372,11 +403,11 @@ func (peers Peers) toWireGuardConfigs() (result []wgtypes.PeerConfig, err error)
 	defer func() { err = errors.Wrap(err) }()
 
 	for _, peer := range peers {
-		peerDirectCfg, err := peer.toWireGuardDirectConfig()
+		/*peerDirectCfg, err := peer.toWireGuardDirectConfig()
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, peerDirectCfg)
+		result = append(result, peerDirectCfg)*/
 
 		peerIPFSCfg, err := peer.toWireGuardIPFSConfig()
 		if err != nil {

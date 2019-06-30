@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	p2pProtocolID               = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
-	ipvpnMagic = "\000\314\326This is an InterPlanetary Virtual Private Network node"
+	p2pProtocolID = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
+	ipvpnMagic    = "\000\314\326This is an InterPlanetary Virtual Private Network node"
 )
 
 type Network struct {
@@ -285,8 +285,9 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 				continue
 			}
 			if peerAddr.ID == "" {
-				mesh.logger.Debugf("empty peer ID, sleep %v hours and restart FindProvidersAsync", 1 << count)
-				time.Sleep(time.Hour * time.Duration(1 << count))
+				hours := (1 << count) - 1
+				mesh.logger.Debugf("empty peer ID, sleep %v hours and restart FindProvidersAsync", hours)
+				time.Sleep(time.Hour * time.Duration(hours))
 				provChan = mesh.ipfsNode.DHT.FindProvidersAsync(mesh.ipfsContext, ipfsCid, 1<<16)
 				count++
 				continue

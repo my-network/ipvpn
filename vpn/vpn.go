@@ -2,6 +2,7 @@ package vpn
 
 import (
 	e "errors"
+	"github.com/agl/ed25519/extra25519"
 	"io/ioutil"
 	"log"
 	"net"
@@ -52,6 +53,7 @@ type VPN struct {
 	ifaceName        string
 	state            uint32
 	currentIP        net.IP
+	wgListenerAddr   net.UDPAddr
 }
 
 func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) {
@@ -186,20 +188,41 @@ func (vpn *VPN) Start() (err error) {
 	return
 }
 
-func (vpn *VPN) switchToFallback(peer *Peer) {
-
-}
-
 func (vpn *VPN) fallbackConnectorLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	for vpn.IsStarted() {
 		select {
 		case <-ticker.C:
 		}
 
+		m := map[string]*wgtypes.Peer{}
+
+		dev, err := vpn.wgctl.Device(vpn.ifaceName)
+		if err != nil {
+			return
+		}
+
+		for idx, wgPeer := range dev.Peers {
+			m[wgPeer.Endpoint.String()] = &dev.Peers[idx]
+		}
+
 		for _, vpnPeer := range vpn.getPeers() {
+			wgPeerTunnel := m[vpnPeer.TunnelAddr.String()]
+			if wgPeerTunnel == nil {
+				vpn.logger.Debugf("WG peer (via IPFS) is closed %v %v. Closing VPN peer.", vpnPeer.IntAlias.Value, vpnPeer.GetID())
+				err := vpnPeer.Close()
+				if err != nil {
+					vpn.logger.Error(errors.Wrap(err))
+				}
+				continue
+			}
+			wgPeerDirect := m[vpnPeer.DirectAddr.String()]
+			if wgPeerDirect == nil {
+				vpn.logger.Debugf("WG peer (direct) is not opened. %v %v", vpnPeer.IntAlias.Value, vpnPeer.GetID())
+				continue
+			}
 			var err error
-			if time.Since(vpnPeer.WgDirect.LastHandshakeTime).Nanoseconds() < directConnectionTimeout.Nanoseconds() {
+			if time.Since(wgPeerDirect.LastHandshakeTime).Nanoseconds() < directConnectionTimeout.Nanoseconds() {
 				err = vpnPeer.switchChannel(channelTypeDirect)
 			} else {
 				err = vpnPeer.switchChannel(channelTypeIPFS)
@@ -267,7 +290,18 @@ func (vpn *VPN) updateWireGuardConfiguration() (err error) {
 		ReplacePeers: true,
 	}
 
-	copy(cfg.PrivateKey[:], vpn.privKey)
+	vpn.wgListenerAddr.IP = net.ParseIP(`127.0.0.1`)
+	vpn.wgListenerAddr.Port = ipvpnPort
+
+	// WireGuard uses Curve25519, while IPFS uses ED25519. So we need to convert it:
+	{
+		var privKey [64]byte
+		copy(privKey[:], vpn.privKey)
+		extra25519.PrivateKeyToCurve25519((*[32]byte)(cfg.PrivateKey), &privKey)
+	}
+
+	vpn.logger.Debugf("wgConfig: %v", cfg)
+	vpn.logger.Debugf("wgConfig public key: %v", cfg.PrivateKey.PublicKey())
 
 	err = vpn.wgctl.ConfigureDevice(vpn.ifaceName, cfg)
 	if err != nil {
@@ -336,6 +370,7 @@ func (vpn *VPN) sendIntAliases(stream Stream) (err error) {
 func (vpn *VPN) recvIntAliases(stream Stream) (remoteIntAliases IntAliases, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	vpn.logger.Debugf("recvIntAlias(): stream.Read()...")
 	n, err := stream.Read(vpn.buffer[:])
 	vpn.logger.Debugf("recvIntAlias(): stream.Read(): %v %v %v", n, err, string(vpn.buffer[:n]))
 
@@ -440,6 +475,19 @@ func (vpn *VPN) UpdateIntAliasMetadataAndSave() (err error) {
 func (vpn *VPN) newStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	// WireGuard uses Curve25519, while IPFS uses ED25519. So we need to convert it:
+	var wgPubKey wgtypes.Key
+	{
+		var pubKey [32]byte
+		pubKeyBytes, err := stream.Conn().RemotePublicKey().Raw()
+		if err != nil {
+			return err
+		}
+		copy(pubKey[:], pubKeyBytes)
+		extra25519.PublicKeyToCurve25519((*[32]byte)(&wgPubKey), &pubKey)
+		vpn.logger.Debugf("new stream %v, pubkey %v", peerAddr.ID, wgPubKey)
+	}
+
 	vpn.newStreamLocker.Lock()
 	defer vpn.newStreamLocker.Unlock()
 
@@ -533,6 +581,7 @@ func (vpn *VPN) newStream(stream Stream, peerAddr AddrInfo) (err error) {
 		Stream:   stream,
 		AddrInfo: peerAddr,
 		IntAlias: *remoteIntAliases[0],
+		WgPubKey: wgPubKey,
 	}
 
 	err = newPeer.Start()

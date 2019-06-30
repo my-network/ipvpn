@@ -6,26 +6,27 @@ import (
 )
 
 type logger struct {
-	enableInfo bool
+	prefix      string
+	enableInfo  bool
 	enableDebug bool
 }
 
 func (l *logger) Error(args ...interface{}) {
-	logrus.Error(args...)
+	logrus.Error(append([]interface{}{l.prefix}, args...)...)
 }
 
 func (l *logger) Infof(fm string, args ...interface{}) {
 	if !l.enableInfo {
 		return
 	}
-	logrus.Infof(fm, args...)
+	logrus.Infof(l.prefix+" "+fm, args...)
 }
 
 func (l *logger) Debugf(fm string, args ...interface{}) {
 	if !l.enableDebug {
 		return
 	}
-	logrus.Debugf(fm, args...)
+	logrus.Debugf(l.prefix+" "+fm, args...)
 }
 
 type loggerDebugWriter struct {

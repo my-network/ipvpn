@@ -229,19 +229,19 @@ func main() {
 	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
 	fatalIf(err)
 
-	vpnLogger := &logger{true, config.Get().DumpVPNCommunications}
+	vpnLogger := &logger{"[vpn]", true, config.Get().DumpVPNCommunications}
 
 	vpnInstance, err := vpn.New(filepath.Join(dataDir, "int_alias.json"), *subnet, vpnLogger)
 	fatalIf(err)
 
-	defer func() {_ = vpnInstance.Close()}()
+	defer func() { _ = vpnInstance.Close() }()
 
-	netLogger := &logger{true, config.Get().DumpNetworkCommunications}
+	netLogger := &logger{"[net]", true, config.Get().DumpNetworkCommunications}
 
 	networkInstance, err := network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), netLogger, vpnInstance)
 	fatalIf(err)
 
-	defer func() {_ = networkInstance.Close()}()
+	defer func() { _ = networkInstance.Close() }()
 
 	select {}
 }
