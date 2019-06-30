@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	p2pProtocolID = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
-	ipvpnMagic    = "\000\314\326This is an InterPlanetary Virtual Private Network node"
+	p2pProtocolID  = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
+	ipvpnMagic     = "\000\314\326This is an InterPlanetary Virtual Private Network node"
 	ipfsPortString = "24001"
 )
 
@@ -99,10 +99,10 @@ func checkCacheDir(cacheDir string) (err error) {
 func addressesConfig() ipfsConfig.Addresses {
 	return ipfsConfig.Addresses{
 		Swarm: []string{
-			"/ip4/0.0.0.0/tcp/"+ipfsPortString,
-			"/ip4/0.0.0.0/udp/"+ipfsPortString,
-			"/ip6/::/tcp/"+ipfsPortString,
-			"/ip6/::/udp/"+ipfsPortString,
+			"/ip4/0.0.0.0/tcp/" + ipfsPortString,
+			"/ip4/0.0.0.0/udp/" + ipfsPortString,
+			"/ip6/::/tcp/" + ipfsPortString,
+			"/ip6/::/udp/" + ipfsPortString,
 			// Also we need ICMP :(
 		},
 		Announce:   []string{},
