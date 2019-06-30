@@ -32,6 +32,7 @@ import (
 const (
 	p2pProtocolID = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
 	ipvpnMagic    = "\000\314\326This is an InterPlanetary Virtual Private Network node"
+	ipfsPortString = "24001"
 )
 
 type Network struct {
@@ -98,10 +99,10 @@ func checkCacheDir(cacheDir string) (err error) {
 func addressesConfig() ipfsConfig.Addresses {
 	return ipfsConfig.Addresses{
 		Swarm: []string{
-			"/ip4/0.0.0.0/tcp/24001",
-			"/ip4/0.0.0.0/udp/24001",
-			"/ip6/::/tcp/24001",
-			"/ip6/::/udp/24001",
+			"/ip4/0.0.0.0/tcp/"+ipfsPortString,
+			"/ip4/0.0.0.0/udp/"+ipfsPortString,
+			"/ip6/::/tcp/"+ipfsPortString,
+			"/ip6/::/udp/"+ipfsPortString,
 			// Also we need ICMP :(
 		},
 		Announce:   []string{},
@@ -559,7 +560,7 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) {
 		if err != nil {
 			mesh.logger.Debugf("unable to get TCP/UDP port of multiaddr %v: %v", maddr, err)
 		} else {
-			if portStr == "24001" {
+			if portStr == ipfsPortString {
 				err := mesh.addToBootstrapPeers(maddr, peerAddr.ID)
 				if err != nil {
 					mesh.logger.Error("Unable to add %v to the list of bootstrap nodes: %v", maddr, errors.Wrap(err))
