@@ -106,17 +106,11 @@ func (peer *Peer) Start() (err error) {
 	// Setup direct connection
 
 	cfg := wgtypes.Config{
-		PrivateKey:   &wgtypes.Key{},
-		ListenPort:   &[]int{ipvpnPort}[0],
-		FirewallMark: &[]int{1}[0],
 		Peers: []wgtypes.PeerConfig{
 			peerDirectCfg,
 			peerIPFSCfg,
 		},
-		ReplacePeers: false,
 	}
-
-	copy(cfg.PrivateKey[:], peer.VPN.privKey)
 
 	err = peer.VPN.wgctl.ConfigureDevice(peer.VPN.ifaceName, cfg)
 	if err != nil {
@@ -336,8 +330,8 @@ func (peer *Peer) tunnelLoop() {
 			return
 		}
 
-		wSize, err := peer.Stream.Write(buffer[:size])
-		if size != wSize {
+		wSize, err := peer.Stream.Write(buffer[:size+2])
+		if size+2 != wSize {
 			peer.VPN.logger.Error(errors.Wrap(ErrInvalidSize, size, wSize))
 			err = peer.Close()
 			if err != nil {
