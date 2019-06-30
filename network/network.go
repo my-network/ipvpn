@@ -319,7 +319,12 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 		data.Latencies[idx] = math.MaxInt64
 
 		go func(idx int, addr p2pcore.Multiaddr) {
-			data.Latencies[idx] = mesh.measureLatencyToMultiaddr(measureLatencyContext, addr)
+			latency := mesh.measureLatencyToMultiaddr(measureLatencyContext, addr)
+			select {
+			case <-measureLatencyContext.Done():
+			default:
+				data.Latencies[idx] = latency
+			}
 		}(idx, addr)
 		go func(idx int, addr p2pcore.Multiaddr) {
 			addr4, err := addr.ValueForProtocol(multiaddr.P_IP4)
@@ -333,7 +338,11 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 			data.BadConnectionCount[idx]++
 			conn, err := net.DialTimeout("tcp", addr4+":"+port, time.Second)
 			if err == nil {
-				data.BadConnectionCount[idx]--
+				select {
+				case <-measureLatencyContext.Done():
+				default:
+					data.BadConnectionCount[idx]--
+				}
 				_ = conn.Close()
 			}
 		}(idx, addr)
@@ -348,9 +357,9 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	mesh.ipfsNode.PeerHost.Network().Peerstore().SetAddrs(addrInfo.ID, data.AddrInfo.Addrs, time.Minute*5)
 
 	if data.AddrInfo.Addrs[0].String() != stream.Conn().RemoteMultiaddr().String() {
-		mesh.logger.Infof("sending status data")
 		var msg [9]byte
 		msg[0] = byte(MessageTypeStopConnectionOnYourSide)
+		mesh.logger.Infof("sending status data: %v %v", msg[0], uint64(data.Latencies[0]))
 		binary.LittleEndian.PutUint64(msg[1:], uint64(data.Latencies[0]))
 		_, err := stream.Write(msg[:])
 		if err != nil {
@@ -366,7 +375,8 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 		latency := time.Duration(binary.LittleEndian.Uint64(msg[1:]))
 		mesh.logger.Infof("received status data: %v %v", msgType, latency)
 
-		if latency < data.Latencies[0]*3/2 {
+		if latency <= data.Latencies[0] {
+			mesh.logger.Infof("my latency is higher, I was wrong: %v %v", latency, data.Latencies[0])
 			return stream
 		}
 
@@ -383,9 +393,9 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 		}
 	}
 
-	mesh.logger.Infof("sending status data")
 	var msg [9]byte
 	msg[0] = byte(MessageTypeOK)
+	mesh.logger.Infof("sending status data %v %v", msg[0], uint64(data.Latencies[0]))
 	binary.LittleEndian.PutUint64(msg[1:], uint64(data.Latencies[0]))
 	_, err := stream.Write(msg[:])
 	if err != nil {
@@ -405,6 +415,10 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	case MessageTypeOK:
 	case MessageTypeStopConnectionOnYourSide:
 		mesh.logger.Infof("remote side wishes to initiate connection from it's side")
+		if latency >= data.Latencies[0] {
+			mesh.logger.Infof("their latency is higher, not complying", latency, data.Latencies[0])
+			return stream
+		}
 		_ = stream.Close()
 		return nil
 	}
