@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha512"
+	"github.com/multiformats/go-multiaddr"
 	"math"
 	"os"
 	"path/filepath"
@@ -477,6 +478,51 @@ func (mesh *Network) recvAndCheckAuthData(stream Stream) (err error) {
 	return
 }
 
+func (mesh *Network) saveIPFSRepositoryConfig(cfg *ipfsConfig.Config) (err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
+
+	err = mesh.ipfsNode.Repo.SetConfig(cfg)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (mesh *Network) addToBootstrapPeers(maddr p2pcore.Multiaddr, peerID peer.ID) (err error) {
+	defer func() {
+		err = errors.Wrap(err)
+	}()
+
+	cfg, err := mesh.ipfsNode.Repo.Config()
+	if err != nil {
+		return
+	}
+
+	peerString := maddr.String() + `/ipfs/` + peerID.String()
+
+	found := false
+	for _, bootstrapPeer := range cfg.Bootstrap {
+		if bootstrapPeer == peerString {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		cfg.Bootstrap = append(cfg.Bootstrap, peerString)
+	}
+
+	err = mesh.saveIPFSRepositoryConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	return
+}
+
 func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) {
 	mesh.logger.Debugf("addStream %v", stream.Conn().RemotePeer())
 	if stream.Conn().RemotePeer() == mesh.ipfsNode.PeerHost.ID() {
@@ -502,5 +548,23 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) {
 
 	for _, streamHandler := range mesh.streamHandlers {
 		streamHandler.NewStream(stream, peerAddr)
+	}
+
+	{ // Add the node to bootstrap nodes
+		maddr := stream.Conn().RemoteMultiaddr()
+		portStr, err := maddr.ValueForProtocol(multiaddr.P_TCP)
+		if err != nil {
+			portStr, err = maddr.ValueForProtocol(multiaddr.P_UDP)
+		}
+		if err != nil {
+			mesh.logger.Debugf("unable to get TCP/UDP port of multiaddr %v: %v", maddr, err)
+		} else {
+			if portStr == "24001" {
+				err := mesh.addToBootstrapPeers(maddr, peerAddr.ID)
+				if err != nil {
+					mesh.logger.Error("Unable to add %v to the list of bootstrap nodes: %v", maddr, errors.Wrap(err))
+				}
+			}
+		}
 	}
 }
