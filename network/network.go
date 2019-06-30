@@ -375,17 +375,22 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 		latency := time.Duration(binary.LittleEndian.Uint64(msg[1:]))
 		mesh.logger.Infof("received status data: %v %v", msgType, latency)
 
-		if latency <= data.Latencies[0] {
+		if latency == data.Latencies[0] {
+			mesh.logger.Infof("equal latencies, I was wrong: %v %v", latency, data.Latencies[0])
+			return stream
+		}
+
+		if latency < data.Latencies[0] {
 			mesh.logger.Infof("my latency is higher, I was wrong: %v %v", latency, data.Latencies[0])
+			if msgType == MessageTypeStopConnectionOnYourSide {
+				mesh.logger.Debugf("ignoring connection %v by remote request", stream.Conn().RemoteMultiaddr().String())
+				return nil
+			}
 			return stream
 		}
 
 		mesh.logger.Debugf("closing connection %v (!= %v)", stream.Conn().RemoteMultiaddr().String(), data.AddrInfo.Addrs[0].String())
 		_ = stream.Conn().Close()
-
-		if msgType == MessageTypeStopConnectionOnYourSide && isIncoming {
-			return nil
-		}
 
 		stream, err = mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, addrInfo.ID, p2pProtocolID)
 		if err != nil {
