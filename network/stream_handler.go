@@ -2,6 +2,7 @@ package network
 
 import (
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/multiformats/go-multiaddr"
 	"golang.org/x/crypto/ed25519"
 )
 
@@ -11,6 +12,8 @@ type StreamHandler interface {
 	SetID(id peer.ID)
 	SetPrivateKey(privKey ed25519.PrivateKey)
 	SetPSK(psk []byte)
+
+	IsBadAddress(maddr multiaddr.Multiaddr) bool
 
 	Start() error
 	Close() error

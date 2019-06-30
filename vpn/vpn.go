@@ -3,6 +3,7 @@ package vpn
 import (
 	e "errors"
 	"github.com/agl/ed25519/extra25519"
+	"github.com/multiformats/go-multiaddr"
 	"golang.org/x/crypto/curve25519"
 	"io/ioutil"
 	"log"
@@ -162,6 +163,14 @@ func (vpn *VPN) GetIP(intAlias uint64, isSecondary bool) (resultIP net.IP, err e
 	}
 
 	return resultIP, nil
+}
+
+func (vpn *VPN) IsBadAddress(maddr multiaddr.Multiaddr) bool {
+	addr4, err := maddr.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil {
+		return false
+	}
+	return vpn.subnet.Contains(net.ParseIP(addr4))
 }
 
 func (vpn *VPN) GetMyIP(isSecondary bool) (net.IP, error) {

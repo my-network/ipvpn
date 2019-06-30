@@ -22,8 +22,14 @@ func (mesh *Network) measureLatencyToMultiaddr(ctx context.Context, addr p2pcore
 		return math.MaxInt64
 	}
 	if portStr != ipfsPortString {
-		mesh.logger.Debugf("NAT-ed port, seems to be unreachable", addr.String(), err)
+		mesh.logger.Debugf("NAT-ed port, seems to be unreachable: %v", addr.String())
 		return math.MaxInt64 / 4
+	}
+	for _, streamHandler := range mesh.streamHandlers {
+		if streamHandler.IsBadAddress(addr) {
+			mesh.logger.Debugf("a streamHandler said it's a bad address: %v", addr.String())
+			return math.MaxInt64
+		}
 	}
 
 	addr4, err := addr.ValueForProtocol(multiaddr.P_IP4)
@@ -96,14 +102,20 @@ func (mesh *Network) measureLatency(ctx context.Context, ip net.IP) (result time
 		close(chICMP)
 	}()
 
+	var t time.Duration
 	select {
 	case <-ctx.Done():
-		return math.MaxInt64 / 2
+		t = math.MaxInt64 / 2
+		mesh.logger.Debugf("got timeout: %v", ip.String())
 	case <-chTCP1:
-		return time.Since(start)
+		t = time.Since(start)
+		mesh.logger.Debugf("got signal chTCP1: %v", ip.String())
 	case <-chTCP80:
-		return time.Since(start)
+		t = time.Since(start)
+		mesh.logger.Debugf("got signal chTCP80: %v", ip.String())
 	case <-chICMP:
-		return time.Since(start)
+		t = time.Since(start)
+		mesh.logger.Debugf("got signal chICMP: %v", ip.String())
 	}
+	return t
 }
