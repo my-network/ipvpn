@@ -207,7 +207,7 @@ func (peer *Peer) streamReaderLoop() {
 	for {
 		size, err := peer.Stream.Read(buffer[:])
 		if err != nil {
-			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset {
+			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "stream reset" {
 				peer.VPN.logger.Infof("IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
 				peer.VPN.logger.Error(errors.Wrap(err))

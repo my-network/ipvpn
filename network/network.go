@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha512"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -270,6 +272,67 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 	return
 }
 
+type addrInfoWithLatencies struct {
+	Latencies []time.Duration
+	AddrInfo  *AddrInfo
+}
+
+func (data *addrInfoWithLatencies) Len() int           { return len(data.AddrInfo.Addrs) }
+func (data *addrInfoWithLatencies) Less(i, j int) bool { return data.Latencies[i] < data.Latencies[j] }
+func (data *addrInfoWithLatencies) Swap(i, j int) {
+	data.Latencies[i], data.Latencies[j] = data.Latencies[j], data.Latencies[i]
+	data.AddrInfo.Addrs[i], data.AddrInfo.Addrs[j] = data.AddrInfo.Addrs[j], data.AddrInfo.Addrs[i]
+}
+
+func (mesh *Network) tryConnectByOptimalPath(addrInfo *AddrInfo) {
+	data := addrInfoWithLatencies{
+		Latencies: make([]time.Duration, len(addrInfo.Addrs)),
+		AddrInfo:  addrInfo,
+	}
+
+	// Measure latencies
+	measureLatencyContext, _ := context.WithTimeout(context.Background(), time.Second)
+	for idx, addr := range addrInfo.Addrs {
+		data.Latencies[idx] = math.MaxInt64
+
+		go func(idx int, addr p2pcore.Multiaddr) {
+			data.Latencies[idx] = mesh.measureLatencyToMultiaddr(measureLatencyContext, addr)
+		}(idx, addr)
+	}
+	<-measureLatencyContext.Done()
+
+	// Prioritize paths
+	sort.Sort(&data)
+	mesh.logger.Debugf("prioritized paths %v %v", data.Latencies, data.AddrInfo.Addrs)
+
+	// Closing existing connections
+	for _, conn := range mesh.ipfsNode.PeerHost.Network().ConnsToPeer(addrInfo.ID) {
+		if conn.RemoteMultiaddr().String() == addrInfo.Addrs[0].String() {
+			mesh.logger.Debugf("we already have a connection via the optimal path")
+			return
+		}
+		mesh.logger.Debugf("closing connection to %v via %v", addrInfo.ID, conn.RemoteMultiaddr())
+		err := conn.Close()
+		if err != nil {
+			mesh.logger.Debugf("unable to close connection to %v: %v", addrInfo.ID, err)
+		}
+	}
+
+	// Do the connection (start tries with the path with the lowest latency)
+	for _, addr := range addrInfo.Addrs {
+		err := mesh.ipfsNode.PeerHost.Connect(mesh.ipfsContext, AddrInfo{
+			ID: addrInfo.ID,
+			Addrs: []p2pcore.Multiaddr{
+				addr,
+			},
+		})
+		mesh.logger.Debugf("try connect: %v -> %v", addr, err)
+		if err == nil {
+			return
+		}
+	}
+}
+
 func (mesh *Network) connector(ipfsCid cid.Cid) {
 	mesh.logger.Debugf(`initializing output streams`)
 
@@ -292,11 +355,12 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 				count++
 				continue
 			}
-			_, err := mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerAddr.ID)
+			addrInfo, err := mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerAddr.ID)
 			if err != nil {
 				mesh.logger.Infof("unable to find a route to peer %v: %v", peerAddr.ID, err)
 				continue
 			}
+			mesh.tryConnectByOptimalPath(&addrInfo)
 			stream, err := mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerAddr.ID, p2pProtocolID)
 			if err != nil {
 				mesh.logger.Infof("unable to connect to peer %v: %v", peerAddr.ID, err)

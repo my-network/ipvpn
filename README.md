@@ -15,8 +15,10 @@ echo "my_password_here" > "$HOME/.ipvpn/password_new.txt""
 `go env GOPATH`/bin/ipvpnd
 
 # in other terminal, check:
-ip a show dev ipvpn
-ping 10.68.0.1
+ip a show dev ipvpn_direct
+ip a show dev ipvpn_tunnel
+ping -c 5 10.197.202.1
+ping -c 5 10.197.203.1
 ```
 
 * `my_unique_network_here` should be replaced by a name of you virtual private network
