@@ -18,10 +18,10 @@ import (
 
 	"github.com/xaionaro-go/errors"
 
-	"github.com/xaionaro-go/ipvpn/config"
-	"github.com/xaionaro-go/ipvpn/helpers"
-	"github.com/xaionaro-go/ipvpn/network"
-	"github.com/xaionaro-go/ipvpn/vpn"
+	"github.com/my-network/ipvpn/config"
+	"github.com/my-network/ipvpn/helpers"
+	"github.com/my-network/ipvpn/network"
+	"github.com/my-network/ipvpn/vpn"
 )
 
 const (

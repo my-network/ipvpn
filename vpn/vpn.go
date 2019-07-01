@@ -14,14 +14,14 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/my-network/wgcreate"
 	"github.com/xaionaro-go/errors"
-	"github.com/xaionaro-go/wgcreate"
 	"golang.org/x/crypto/ed25519"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
-	"github.com/xaionaro-go/ipvpn/network"
+	"github.com/my-network/ipvpn/network"
 )
 
 const (

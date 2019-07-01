@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	p2pProtocolID  = p2pprotocol.ID(`/p2p/github.com/xaionaro-go/ipvpn`)
+	p2pProtocolID  = p2pprotocol.ID(`/p2p/github.com/my-network/ipvpn`)
 	ipvpnMagic     = "\000\314\326This is an InterPlanetary Virtual Private Network node"
 	ipfsPortString = "24001"
 )
