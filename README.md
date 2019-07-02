@@ -9,7 +9,7 @@ sudo setcap cap_net_raw,cap_net_admin+ep `go env GOPATH`/bin/ipvpnd
 # configure
 mkdir -p "$HOME/.ipvpn"
 echo "my_unique_network_name_here" > "$HOME/ipvpn/network_id.txt"
-echo "my_password_here" > "$HOME/.ipvpn/password_new.txt""
+echo "my_password_here" > "$HOME/.ipvpn/password_new.txt"
 
 # run
 `go env GOPATH`/bin/ipvpnd
