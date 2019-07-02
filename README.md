@@ -1,7 +1,7 @@
 On all your nodes:
 ```sh
 # install
-go get github.com/xaionaro-go/ipvpn/cmd/ipvpnd
+go get github.com/my-network/ipvpn/cmd/ipvpnd
 sudo mkdir /var/run/wireguard
 sudo chown $UID /var/run/wireguard
 sudo setcap cap_net_raw,cap_net_admin+ep `go env GOPATH`/bin/ipvpnd
