@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -105,9 +106,9 @@ func addressesConfig() ipfsConfig.Addresses {
 	return ipfsConfig.Addresses{
 		Swarm: []string{
 			"/ip4/0.0.0.0/tcp/" + ipfsPortString,
-			"/ip4/0.0.0.0/udp/" + ipfsPortString,
+			"/ip4/0.0.0.0/udp/" + ipfsPortString + "/quic",
 			"/ip6/::/tcp/" + ipfsPortString,
-			"/ip6/::/udp/" + ipfsPortString,
+			"/ip6/::/udp/" + ipfsPortString + "/quic",
 			// Also we need ICMP :(
 		},
 		Announce:   []string{},
@@ -155,10 +156,10 @@ func initRepo(logger Logger, repoPath string) (err error) {
 		Identity:  identity,
 		Addresses: addressesConfig(),
 		Bootstrap: ipfsConfig.BootstrapPeerStrings(bootstrapPeers),
-		/*Mounts: ipfsConfig.Mounts{
+		Mounts: ipfsConfig.Mounts{
 			IPFS: "/ipfs",
 			IPNS: "/ipns",
-		},*/
+		},
 		Datastore: ipfsConfig.DefaultDatastoreConfig(),
 		Discovery: ipfsConfig.Discovery{
 			MDNS: ipfsConfig.MDNS{
@@ -183,6 +184,13 @@ func initRepo(logger Logger, repoPath string) (err error) {
 				GracePeriod: ipfsConfig.DefaultConnMgrGracePeriod.String(),
 				Type:        "basic",
 			},
+			//EnableAutoRelay: true,
+		},
+		Experimental: ipfsConfig.Experiments{
+			// https://github.com/ipfs/go-ipfs/blob/master/docs/experimental-features.md
+
+			FilestoreEnabled: true,
+			QUIC: true,
 		},
 	})
 	if err != nil {
@@ -356,7 +364,7 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	// Set new addrs
 	mesh.ipfsNode.PeerHost.Network().Peerstore().SetAddrs(addrInfo.ID, data.AddrInfo.Addrs, time.Minute*5)
 
-	if data.AddrInfo.Addrs[0].String() != stream.Conn().RemoteMultiaddr().String() {
+	if data.AddrInfo.Addrs[0].String() != stream.Conn().RemoteMultiaddr().String() && (isIncoming && strings.HasSuffix(stream.Conn().RemoteMultiaddr().String(), `/quic`)) {
 		var msg [9]byte
 		msg[0] = byte(MessageTypeStopConnectionOnYourSide)
 		mesh.logger.Infof("sending status data: %v %v", msg[0], uint64(data.Latencies[0]))
@@ -442,7 +450,7 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 			return
 		case peerAddr := <-provChan:
 			peerID := peerAddr.ID
-			mesh.logger.Debugf("found peer: %v", peerID)
+			mesh.logger.Debugf("found peer: %v: %v", peerID, peerAddr.Addrs)
 
 			if peerID == mesh.ipfsNode.PeerHost.ID() {
 				mesh.logger.Debugf("my ID, skip")
@@ -466,19 +474,27 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 				count++
 				continue
 			}
-			addrInfo, err := mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerID)
-			if err != nil {
-				mesh.logger.Infof("unable to find a route to peer %v: %v", peerID, err)
-				continue
+
+			if len(peerAddr.Addrs) == 0 {
+				mesh.logger.Debugf("mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerID)...")
+				var err error
+				peerAddr, err = mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerID)
+				if err != nil {
+					mesh.logger.Infof("unable to find a route to peer %v: %v", peerID, err)
+					continue
+				}
+				mesh.logger.Debugf("peer's addresses: %v", peerAddr.Addrs)
 			}
 
+			mesh.logger.Debugf("mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)...")
 			stream, err := mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)
 			if err != nil {
 				mesh.logger.Infof("unable to connect to peer %v: %v", peerID, err)
 				continue
 			}
+			mesh.logger.Debugf("new stream: %v", stream.Conn().RemoteMultiaddr())
 
-			stream = mesh.tryConnectByOptimalPath(stream, &addrInfo, false)
+			stream = mesh.tryConnectByOptimalPath(stream, &peerAddr, false)
 			if stream == nil {
 				mesh.logger.Debugf("no opened stream, skip")
 				continue
@@ -497,7 +513,7 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 					continue
 				}
 			}*/
-			err = mesh.addStream(stream, addrInfo)
+			err = mesh.addStream(stream, peerAddr)
 			if err != nil {
 				mesh.logger.Debugf("got error from addStream(): %v", err)
 				continue

@@ -432,6 +432,8 @@ func (vpn *VPN) GetPSK() []byte {
 func (vpn *VPN) sendIntAliases(stream Stream) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	vpn.logger.Debugf("sendIntAlias()")
+
 	knownAliases := IntAliases{vpn.intAlias.Copy()}
 	vpn.peers.Range(func(_, peerI interface{}) bool {
 		peer := peerI.(*Peer)
