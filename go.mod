@@ -11,11 +11,13 @@ require (
 	github.com/ipfs/go-ipfs-config v0.0.6
 	github.com/libp2p/go-libp2p v0.2.0
 	github.com/libp2p/go-libp2p-core v0.0.6
+	github.com/libp2p/go-libp2p-peer v0.2.0
 	github.com/multiformats/go-multiaddr v0.0.4
 	github.com/multiformats/go-multihash v0.0.6
 	github.com/my-network/wgcreate v0.0.0-20190707165004-31e33f68f780
 	github.com/sirupsen/logrus v1.4.2
 	github.com/sparrc/go-ping v0.0.0-20190613174326-4e5b6552494c
+	github.com/stretchr/testify v1.3.0
 	github.com/xaionaro-go/atomicmap v0.0.0-20190707161005-2e6f4aeaa450
 	github.com/xaionaro-go/errors v0.0.0-20190618051035-77224f41226e
 	github.com/xaionaro-go/spinlock v0.0.0-20190309154744-55278e21e817 // indirect
