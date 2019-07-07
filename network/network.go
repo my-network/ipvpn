@@ -797,6 +797,10 @@ func (mesh *Network) addToKnownPeers(peerAddr AddrInfo) (err error) {
 	mesh.knownPeersLocker.Lock()
 	defer mesh.knownPeersLocker.Unlock()
 
+	if mesh.knownPeers == nil {
+		mesh.knownPeers = KnownPeers{}
+	}
+
 	knownPeer := mesh.knownPeers[peerAddr.ID]
 	if knownPeer == nil {
 		knownPeer = &KnownPeer{ID: peerAddr.ID}

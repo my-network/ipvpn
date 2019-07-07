@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	e "errors"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/agl/ed25519/extra25519"
@@ -336,7 +338,7 @@ func (vpn *VPN) directConnectorLoop() {
 }
 
 func (vpn *VPN) GetPublicKey() ed25519.PublicKey {
-	return (ed25519.PublicKey)(vpn.privKey.Public().([]byte))
+	return vpn.privKey.Public().(ed25519.PublicKey)
 }
 
 func (vpn *VPN) startDirectConnector() (err error) {
@@ -795,7 +797,13 @@ func (vpn *VPN) newTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) 
 	case Stream:
 		chType = channelTypeIPFS
 		_ = peer.SetIPFSStream(connTyped)
+	case *udpWriter:
+		chType = channelTypeTunnel
+		_ = peer.SetSimpleTunnelConn(connTyped)
 	case *net.UDPConn:
+		chType = channelTypeTunnel
+		_ = peer.SetSimpleTunnelConn(connTyped)
+	case *udpClientSocket:
 		chType = channelTypeTunnel
 		_ = peer.SetSimpleTunnelConn(connTyped)
 	}
@@ -818,7 +826,7 @@ func (vpn *VPN) newTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) 
 
 }
 
-func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
+func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []net.Conn) {
 	remotePubKeyI, err := peerAddr.ID.ExtractPublicKey()
 	if err != nil {
 		vpn.logger.Error(`unable to extract public key from ID %v: %v`, peerAddr.ID, err)
@@ -831,7 +839,7 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 	}
 	remotePubKey := ed25519.PublicKey(remotePubKeyRaw)
 
-	myPubKey := ed25519.PublicKey(vpn.privKey.Public().([]byte))
+	myPubKey := vpn.GetPublicKey()
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	if prevCancelFunc, _ := vpn.waitingForResponseContextCancelFunc.Swap(peerAddr.ID, &cancelFunc); prevCancelFunc != nil {
@@ -857,23 +865,28 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 	}()
 
 	for _, conn := range conns {
-		go func(conn *net.UDPConn) {
+		go func(conn net.Conn) {
 			pingSize := uint(binary.Size(&MessagePing{}))
 			pongSize := uint(binary.Size(&MessagePong{}))
 			readBuf := make([]byte, binary.Size(MessageType(0))+int(max(pingSize, pongSize))+1)
 			for {
 				n, err := conn.Read(readBuf[:])
-				vpn.logger.Debugf("conn.Read(readBuf[:]) -> %v", err)
+				vpn.logger.Debugf("conn.Read(readBuf[:]) -> %v (%v)", err, conn.RemoteAddr())
 				if err != nil {
 					select {
 					case <-ctx.Done():
 					default:
-						vpn.logger.Error("unable to read message")
+						if err == syscall.ECONNREFUSED {
+							vpn.logger.Debugf("ECONNREFUSED (%v), try again soon", conn.RemoteAddr())
+							time.Sleep(time.Millisecond * 100) // TODO: remove this too often reading (make it event driven)
+							continue
+						}
+						vpn.logger.Debugf("unable to read message: %v (%v)", err, conn.RemoteAddr().String())
 						_ = conn.Close()
 					}
 				}
 				if n < 2 {
-					vpn.logger.Error("message is too short: %v < 2", n)
+					vpn.logger.Error("message is too short: %v < 2 (%v)", n, conn.RemoteAddr().String())
 					_ = conn.Close()
 					return
 				}
@@ -885,17 +898,17 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 				msgType := MessageType(binary.LittleEndian.Uint16(readBuf[:]))
 				switch msgType {
 				case MessageTypePing:
-					if err := messagePong.MessagePing.Read(readBuf[2:]); err != nil {
-						vpn.logger.Error(errors.Wrap(err, "incorrect message"))
+					if err := messagePong.MessagePing.Read(readBuf[2:n]); err != nil {
+						vpn.logger.Debugf("incorrect message: %v (%v)", err, conn.RemoteAddr())
 						continue
 					}
 					if err := messagePong.MessagePing.VerifySender(remotePubKey); err != nil {
-						vpn.logger.Debugf("remote signature is invalid in ping from peer %v: %v", peerAddr.ID, err)
+						vpn.logger.Debugf("remote signature is invalid in ping from peer %v: %v (%v)", peerAddr.ID, err, conn.RemoteAddr())
 						continue
 					}
 
-					messagePong.ReceiveTS = recvTS
-					messagePong.SendTS = time.Now()
+					messagePong.ReceiveTS = recvTS.UnixNano()
+					messagePong.SendTS = time.Now().UnixNano()
 					if err := messagePong.SignRecipient(vpn.privKey); err != nil {
 						vpn.logger.Error(errors.Wrap(err, `unable to sign a message`))
 						cancelFunc()
@@ -903,23 +916,23 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 					}
 					_, err := conn.Write(messagePong.Bytes())
 					if err != nil {
-						vpn.logger.Error(errors.Wrap(err, `unable to send a message`))
+						vpn.logger.Debugf(`unable to send a message: %v (%v)`, err, conn.RemoteAddr().String())
 						_ = conn.Close()
 						return
 					}
 					continue
 				case MessageTypePong:
-					if err := messagePong.Read(readBuf[2:]); err != nil {
-						vpn.logger.Error(errors.Wrap(err, "incorrect message"))
+					if err := messagePong.Read(readBuf[2:n]); err != nil {
+						vpn.logger.Error(errors.Wrap(err, "incorrect message (%v)", conn.RemoteAddr()))
 						continue
 					}
 
 					if err := messagePong.VerifyRecipient(remotePubKey); err != nil {
-						vpn.logger.Debugf("remove signature is invalid in pong from peer %v: %v", peerAddr.ID, err)
+						vpn.logger.Debugf("remove signature is invalid in pong from peer %v: %v (%v)", peerAddr.ID, err, conn.RemoteAddr())
 						continue
 					}
 					if err := messagePong.VerifySender(myPubKey); err != nil {
-						vpn.logger.Debugf("my signature is invalid in pong from peer %v: %v", peerAddr.ID, err)
+						vpn.logger.Debugf("my signature is invalid in pong from peer %v: %v (%v)", peerAddr.ID, err, conn.RemoteAddr())
 						continue
 					}
 
@@ -934,7 +947,7 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 						}
 						_, err := conn.Write(messagePing.Bytes())
 						if err != nil {
-							vpn.logger.Error(errors.Wrap(err, `unable to send a message`))
+							vpn.logger.Debugf(`unable to send a message: %v (%v)`, err, conn.RemoteAddr())
 							_ = conn.Close()
 							return
 						}
@@ -944,15 +957,15 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 						cancelFunc()
 						go func() {
 							if err := vpn.newTunnelConnection(conn, peerAddr); err != nil {
-								vpn.logger.Error(errors.Wrap(err, `unable to open a tunnel connection`))
+								vpn.logger.Error(errors.Wrap(err, `unable to open a tunnel connection (%v)`, conn.RemoteAddr()))
 							}
 						}()
 					default:
-						vpn.logger.Debugf(`unexpected sequence ID: %v`, messagePong.SequenceID)
+						vpn.logger.Debugf(`unexpected sequence ID: %v (%v)`, messagePong.SequenceID, conn.RemoteAddr())
 						continue
 					}
 				default:
-					vpn.logger.Debugf("unknown message type: %v", msgType)
+					vpn.logger.Debugf("unknown message type: %v (%v)", msgType, conn.RemoteAddr())
 					continue
 				}
 			}
@@ -969,22 +982,23 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 	}()
 
 	for {
-		newConns := make([]*net.UDPConn, 0, len(conns))
-		conns = newConns
-
 		messagePing := MessagePing{}
-		messagePing.SendTS = time.Now()
+		messagePing.SendTS = time.Now().UnixNano()
 		err := messagePing.SignSender(vpn.privKey)
 		if err != nil {
-			vpn.logger.Error("unable to sign a message", errors.Wrap(err))
+			vpn.logger.Error(errors.Wrap(err, "unable to sign a message"))
 			return
 		}
-		messagePingBytes := messagePing.Bytes()
-		newConns = make([]*net.UDPConn, 0, len(conns))
+		var buf bytes.Buffer
+		if err = binary.Write(&buf, binary.LittleEndian, MessageTypePing); err != nil {
+			return
+		}
+		buf.Write(messagePing.Bytes())
+		newConns := make([]net.Conn, 0, len(conns))
 		for _, conn := range conns {
-			_, err := conn.Write(messagePingBytes)
+			_, err := conn.Write(buf.Bytes())
 			if err != nil {
-				vpn.logger.Error(`unable to send message: %v`, err)
+				vpn.logger.Debugf(`unable to send message: %v (%v)`, err, conn.RemoteAddr().String())
 				_ = conn.Close()
 				continue
 			}
@@ -1008,7 +1022,7 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []*net.UDPConn) {
 	}
 }
 
-func (vpn *VPN) startTryingConnect(peerAddr AddrInfo, conns []*net.UDPConn) {
+func (vpn *VPN) startTryingConnect(peerAddr AddrInfo, conns []net.Conn) {
 	go vpn.tryingConnectLoop(peerAddr, conns)
 }
 
@@ -1045,21 +1059,25 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 		}
 	}
 
-	var conns []*net.UDPConn
+	var conns []net.Conn
 	for _, addr := range addrs {
-		conn, err := net.DialUDP("udp", &net.UDPAddr{
+		if addr.IsLoopback() {
+			continue
+		}
+		vpn.logger.Debugf(`creating a connection to %v`, addr.String())
+		conn, err := dialUDPReuse("udp", &net.UDPAddr{
 			Port: ipvpnTunnelPortSimpleTunnel,
 		}, &net.UDPAddr{
 			IP:   addr,
 			Port: ipvpnTunnelPortSimpleTunnel,
 		})
 		if err != nil {
-			vpn.logger.Error("unable to open connection to %v: %v", addr.String(), err)
+			vpn.logger.Error(errors.Wrap(err, "unable to open connection", addr.String()))
 			continue
 		}
-		err = udpSetNoFragment(conn)
+		err = udpSetNoFragmentSyscall(conn)
 		if err != nil {
-			vpn.logger.Error("unable to set noFragment on connection to %v: %v", addr.String(), err)
+			vpn.logger.Error(errors.Wrap(err, "unable to set noFragment on connection", addr.String()))
 			continue
 		}
 		conns = append(conns, conn)

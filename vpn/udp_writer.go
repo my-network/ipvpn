@@ -7,19 +7,19 @@ import (
 )
 
 type udpWriter struct {
-	conn *net.UDPConn
+	*net.UDPConn
 	addr *net.UDPAddr
 }
 
 func newUDPWriter(conn *net.UDPConn, addr *net.UDPAddr) *udpWriter {
 	return &udpWriter{
-		conn: conn,
-		addr: addr,
+		UDPConn: conn,
+		addr:    addr,
 	}
 }
 
 func (w *udpWriter) Write(b []byte) (size int, err error) {
-	size, err = w.conn.WriteToUDP(b, w.addr)
+	size, err = w.UDPConn.WriteToUDP(b, w.addr)
 	if err != nil {
 		err = errors.Wrap(err)
 	}

@@ -2,18 +2,17 @@ package vpn
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rand"
 	"encoding/binary"
-	"time"
-
 	"github.com/xaionaro-go/errors"
 	"golang.org/x/crypto/ed25519"
 )
 
 type MessagePongData struct {
 	MessagePing
-	ReceiveTS time.Time
-	SendTS    time.Time
+	ReceiveTS int64
+	SendTS    int64
 }
 
 type MessagePong struct {
@@ -33,7 +32,7 @@ func (pongData *MessagePongData) Bytes() []byte {
 func (pong *MessagePong) SignRecipient(privKey ed25519.PrivateKey) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	signature, err := privKey.Sign(rand.Reader, pong.MessagePongData.Bytes(), nil)
+	signature, err := privKey.Sign(rand.Reader, pong.MessagePongData.Bytes(), crypto.Hash(0))
 	if err != nil {
 		return
 	}

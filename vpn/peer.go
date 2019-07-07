@@ -229,8 +229,8 @@ func (peer *Peer) replyWithPong(pingBytes []byte, writer io.Writer) (err error) 
 		return
 	}
 
-	pong.ReceiveTS = recvTS
-	pong.SendTS = time.Now()
+	pong.ReceiveTS = recvTS.UnixNano()
+	pong.SendTS = time.Now().UnixNano()
 	if err = pong.SignRecipient(peer.VPN.privKey); err != nil {
 		return
 	}
@@ -292,7 +292,7 @@ func (peer *Peer) considerPong(chType channelType, pong *MessagePong) (err error
 		return
 	}
 
-	if err = peer.considerRTT(chType, recvTS.Sub(pong.MessagePing.SendTS)); err != nil {
+	if err = peer.considerRTT(chType, recvTS.Sub(time.Unix(0, pong.MessagePing.SendTS))); err != nil {
 		return
 	}
 
@@ -445,7 +445,7 @@ func (peer *Peer) SendPing(chType channelType) (err error) {
 
 		var ping MessagePing
 		ping.SequenceID = 0
-		ping.SendTS = time.Now()
+		ping.SendTS = time.Now().UnixNano()
 		if err = ping.SignSender(peer.VPN.privKey); err != nil {
 			return
 		}
@@ -669,7 +669,7 @@ func (peer *Peer) stopSimpleTunnelConn() (err error) {
 	return nil
 }
 
-func (peer *Peer) SetSimpleTunnelConn(conn *net.UDPConn) (err error) {
+func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	peer.locker.Lock()

@@ -1,4 +1,4 @@
-// +build !linux,!darwin,!freebsd,!openbsd,!netbsd
+// +build darwin freebsd openbsd netbsd
 
 package vpn
 
@@ -11,9 +11,5 @@ func udpSetNoFragment(conn *net.UDPConn) (err error) {
 }
 
 func udpSetNoFragmentSyscall(conn *udpClientSocket) (err error) {
-	return
-}
-
-func udpSetReuseFD(fd int) error {
 	return
 }
