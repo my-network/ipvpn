@@ -325,6 +325,8 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 		}
 	}
 
+	logger.Debugf(`bootstrap nodes: %v`, ipfsRepoConfig.Bootstrap)
+
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
 	ipfsCfg := &core.BuildCfg{
@@ -877,6 +879,7 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 
 	for _, streamHandler := range mesh.streamHandlers {
 		streamHandler.NewStream(stream, peerAddr)
+		streamHandler.ConsiderKnownPeer(peerAddr)
 	}
 
 	go func() {
