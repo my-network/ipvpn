@@ -799,7 +799,6 @@ func (vpn *VPN) newTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) 
 		chType = channelTypeTunnel
 		_ = peer.SetSimpleTunnelConn(connTyped)
 	}
-	peer.locker.Unlock()
 
 	err = peer.Start(chType)
 	if err != nil {

@@ -695,7 +695,7 @@ func (mesh *Network) start() (err error) {
 	go mesh.connector(ipfsCid)
 
 	go func() {
-		mesh.logger.Infof(`Notifying streamHandlers (such as VPN handler) about previously known peers (count == %v)`, len(mesh.knownPeers))
+		mesh.logger.Debugf(`Notifying streamHandlers (such as VPN handler) about previously known peers (count == %v)`, len(mesh.knownPeers))
 		mesh.knownPeersLocker.RLock()
 		defer mesh.knownPeersLocker.RUnlock()
 
