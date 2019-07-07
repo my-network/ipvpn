@@ -238,7 +238,9 @@ func main() {
 
 	netLogger := &logger{"[net]", true, config.Get().DumpNetworkCommunications}
 
-	networkInstance, err := network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), netLogger, vpnInstance)
+	agreeToBeRelay := false
+
+	networkInstance, err := network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), agreeToBeRelay, netLogger, vpnInstance)
 	fatalIf(err)
 
 	defer func() { _ = networkInstance.Close() }()

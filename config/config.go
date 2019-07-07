@@ -2,26 +2,27 @@ package config
 
 import (
 	"encoding/json"
-	"github.com/caarlos0/env"
 	"os"
 	"strings"
 	"sync/atomic"
+
+	"github.com/caarlos0/env"
 )
 
 var configInstance atomic.Value
 
 type config struct {
 	DataDirectory             string `env:"IPVPN_DATADIR" envDefault:"${HOME}/.ipvpn"`
-	NetworkSubnet             string `env:"IPVPN_NETWORK_SUBNET" envDefault:"10.197.202.0/23"`
+	NetworkSubnet             string `env:"IPVPN_NETWORK_SUBNET" envDefault:"10.197.204.0/22"`
 	DumpVPNCommunications     bool   `env:"IPVPN_NETWORK_DUMP_VPN"`
 	DumpNetworkCommunications bool   `env:"IPVPN_NETWORK_DUMP_MESH"`
 	DumpConfiguration         bool   `env:"IPVPN_DUMP_CONFIG"`
 }
 
 func (cfg config) String() string {
-	json, err := json.MarshalIndent(cfg, "", "\t")
+	jsonBytes, err := json.MarshalIndent(cfg, "", "\t")
 	panicIf(err)
-	return string(json)
+	return string(jsonBytes)
 }
 
 func panicIf(err error) {

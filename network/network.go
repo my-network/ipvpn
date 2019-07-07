@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/json"
+	"io/ioutil"
 	"math"
 	"net"
 	"os"
@@ -38,7 +40,16 @@ const (
 	ipfsPortString = "24001"
 )
 
+const (
+	sitSpotsPerPeerLimit = 16
+)
+
+var (
+	sitSpotExpireInterval = time.Hour * 24 * 30
+)
+
 type Network struct {
+	cacheDir                   string
 	logger                     Logger
 	networkName                string
 	publicSharedKeyword        []byte
@@ -51,6 +62,8 @@ type Network struct {
 	callPathOptimizerCount     sync.Map
 	badConnectionCount         sync.Map
 	forbidOutcomingConnections sync.Map
+	knownPeers                 KnownPeers
+	knownPeersLocker           sync.RWMutex
 }
 
 type Stream = p2pcore.Stream
@@ -118,7 +131,7 @@ func addressesConfig() ipfsConfig.Addresses {
 	}
 }
 
-func initRepo(logger Logger, repoPath string) (err error) {
+func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 	defer func() {
 		err = errors.Wrap(err)
 	}()
@@ -184,13 +197,15 @@ func initRepo(logger Logger, repoPath string) (err error) {
 				GracePeriod: ipfsConfig.DefaultConnMgrGracePeriod.String(),
 				Type:        "basic",
 			},
-			//EnableAutoRelay: true,
+			EnableAutoNATService: true,
+			EnableAutoRelay:      true, // see https://github.com/ipfs/go-ipfs/blob/master/docs/config.md
+			EnableRelayHop:       agreeToBeRelay,
 		},
 		Experimental: ipfsConfig.Experiments{
 			// https://github.com/ipfs/go-ipfs/blob/master/docs/experimental-features.md
 
 			FilestoreEnabled: true,
-			QUIC: true,
+			QUIC:             true,
 		},
 	})
 	if err != nil {
@@ -203,7 +218,7 @@ func initRepo(logger Logger, repoPath string) (err error) {
 type VPN interface {
 }
 
-func New(networkName string, psk []byte, cacheDir string, logger Logger, streamHandlers ...StreamHandler) (mesh *Network, err error) {
+func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, logger Logger, streamHandlers ...StreamHandler) (mesh *Network, err error) {
 	defer func() {
 		if err != nil {
 			mesh = nil
@@ -213,11 +228,11 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 
 	logger.Debugf(`loading IPFS plugins`)
 
-	loader, err := loader.NewPluginLoader(``)
+	pluginLoader, err := loader.NewPluginLoader(``)
 	if err != nil {
 		return
 	}
-	err = loader.Inject()
+	err = pluginLoader.Inject()
 	if err != nil {
 		return
 	}
@@ -233,9 +248,23 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 	if !fsrepo.IsInitialized(repoPath) {
 		logger.Debugf(`repository "%v" not initialized`, repoPath)
 
-		err = initRepo(logger, repoPath)
+		err = initRepo(logger, repoPath, agreeToBeRelay)
 		if err != nil {
 			return
+		}
+	}
+
+	logger.Debugf(`loading "known_peers.json"`)
+
+	var knownPeers KnownPeers
+	{
+		knownPeersJSON, knownPeersReadError := ioutil.ReadFile(filepath.Join(cacheDir, `known_peers.json`))
+		logger.Debugf(`loading "known_peers.json" err == %v`, knownPeersReadError)
+		if knownPeersReadError == nil {
+			knownPeersParseError := json.Unmarshal(knownPeersJSON, &knownPeers)
+			if knownPeersParseError != nil {
+				logger.Error(errors.Wrap(knownPeersParseError, `unable to parse "known_peers.json"`))
+			}
 		}
 	}
 
@@ -245,6 +274,55 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 	ipfsRepo, err = fsrepo.Open(repoPath)
 	if err != nil {
 		return
+	}
+
+	ipfsRepoConfig, err := ipfsRepo.Config()
+	if err != nil {
+		return
+	}
+
+	if ipfsRepoConfig.Swarm.EnableRelayHop != agreeToBeRelay {
+		logger.Debugf(`fixing and saving the repository's config: agreeToBeRelay`)
+
+		ipfsRepoConfig.Swarm.EnableRelayHop = agreeToBeRelay
+		err = ipfsRepo.SetConfig(ipfsRepoConfig)
+		if err != nil {
+			logger.Error("unable to save new repo config: %v", err)
+		}
+	}
+
+	if len(knownPeers) > 0 {
+		logger.Debugf(`fixing the repository's config: adding known peers' (count: %v) addresses to bootstrap nodes`, len(knownPeers))
+
+		for _, knownPeer := range knownPeers {
+			sitSpots := knownPeer.SitSpots
+			if len(sitSpots) > sitSpotsPerPeerLimit {
+				sitSpots = sitSpots[:sitSpotsPerPeerLimit]
+			}
+			for _, sitSpot := range sitSpots {
+				if time.Since(sitSpot.LastSuccessfulHandshakeTS) > sitSpotExpireInterval {
+					// We actually could put "break" here instead of "continue", because sitSpots are already
+					// sorted by LastSuccessfulHandshakeTS. But performance is not important here, so we
+					// leave a "continue" here just in case.
+					continue
+				}
+				for _, maddr := range sitSpot.Addresses {
+					peerString := maddr.String() + `/ipfs/` + knownPeer.ID.String()
+
+					found := false
+					for _, bootstrapPeer := range ipfsRepoConfig.Bootstrap {
+						if bootstrapPeer == peerString {
+							found = true
+							break
+						}
+					}
+
+					if !found {
+						ipfsRepoConfig.Bootstrap = append(ipfsRepoConfig.Bootstrap, peerString)
+					}
+				}
+			}
+		}
 	}
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -268,6 +346,7 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 	}
 
 	mesh = &Network{
+		cacheDir:              cacheDir,
 		logger:                logger,
 		networkName:           networkName,
 		publicSharedKeyword:   generatePublicSharedKeyword(networkName, psk),
@@ -276,6 +355,7 @@ func New(networkName string, psk []byte, cacheDir string, logger Logger, streamH
 		ipfsContext:           ctx,
 		ipfsContextCancelFunc: cancelFunc,
 		streamHandlers:        streamHandlers,
+		knownPeers:            knownPeers,
 	}
 
 	err = mesh.start()
@@ -612,6 +692,25 @@ func (mesh *Network) start() (err error) {
 
 	go mesh.connector(ipfsCid)
 
+	go func() {
+		mesh.logger.Infof(`Notifying streamHandlers (such as VPN handler) about previously known peers`)
+		mesh.knownPeersLocker.RLock()
+		defer mesh.knownPeersLocker.RUnlock()
+
+		for _, knownPeer := range mesh.knownPeers {
+			var addresses []multiaddr.Multiaddr
+			for _, sitSpot := range knownPeer.SitSpots {
+				if time.Since(sitSpot.LastSuccessfulHandshakeTS) > sitSpotExpireInterval {
+					continue
+				}
+				addresses = append(addresses, sitSpot.Addresses...)
+			}
+			for _, streamHandler := range mesh.streamHandlers {
+				streamHandler.ConsiderKnownPeer(AddrInfo{ID: knownPeer.ID, Addrs: addresses})
+			}
+		}
+	}()
+
 	mesh.logger.Infof(`My ID: %v        Calling IPFS "DHT.Provide()" on the shared key (that will be used for the node discovery), Cid: %v`, mesh.ipfsNode.PeerHost.ID(), ipfsCid)
 
 	err = mesh.ipfsNode.DHT.Provide(mesh.ipfsContext, ipfsCid, true)
@@ -688,33 +787,49 @@ func (mesh *Network) saveIPFSRepositoryConfig(cfg *ipfsConfig.Config) (err error
 	return
 }
 
-func (mesh *Network) addToBootstrapPeers(maddr p2pcore.Multiaddr, peerID peer.ID) (err error) {
+func (mesh *Network) addToKnownPeers(peerAddr AddrInfo) (err error) {
 	defer func() {
 		err = errors.Wrap(err)
 	}()
 
-	cfg, err := mesh.ipfsNode.Repo.Config()
+	mesh.knownPeersLocker.Lock()
+	defer mesh.knownPeersLocker.Unlock()
+
+	knownPeer := mesh.knownPeers[peerAddr.ID]
+	if knownPeer == nil {
+		knownPeer = &KnownPeer{ID: peerAddr.ID}
+		mesh.knownPeers[peerAddr.ID] = knownPeer
+	}
+
+	var sitSpot *KnownPeerSitSpot
+findSitSpot:
+	for _, oneSitSpot := range knownPeer.SitSpots {
+		for _, maddrOld := range oneSitSpot.Addresses {
+			for _, maddrNew := range peerAddr.Addrs {
+				if maddrOld.String() == maddrNew.String() {
+					sitSpot = oneSitSpot
+					break findSitSpot
+				}
+			}
+		}
+	}
+
+	if sitSpot == nil {
+		sitSpot = &KnownPeerSitSpot{}
+		knownPeer.SitSpots = append(knownPeer.SitSpots, sitSpot)
+	}
+
+	sitSpot.Addresses = peerAddr.Addrs
+	sitSpot.LastSuccessfulHandshakeTS = time.Now()
+
+	knownPeersJSON, err := json.Marshal(mesh.knownPeers)
 	if err != nil {
 		return
 	}
 
-	peerString := maddr.String() + `/ipfs/` + peerID.String()
-
-	found := false
-	for _, bootstrapPeer := range cfg.Bootstrap {
-		if bootstrapPeer == peerString {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		cfg.Bootstrap = append(cfg.Bootstrap, peerString)
-	}
-
-	err = mesh.saveIPFSRepositoryConfig(cfg)
+	err = ioutil.WriteFile(filepath.Join(mesh.cacheDir, `known_peers.json`), knownPeersJSON, 0640)
 	if err != nil {
-		return err
+		return
 	}
 
 	return
@@ -764,23 +879,11 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 		streamHandler.NewStream(stream, peerAddr)
 	}
 
-	{ // Add the node to bootstrap nodes
-		maddr := stream.Conn().RemoteMultiaddr()
-		portStr, err := maddr.ValueForProtocol(multiaddr.P_TCP)
+	go func() {
+		err = mesh.addToKnownPeers(peerAddr)
 		if err != nil {
-			portStr, err = maddr.ValueForProtocol(multiaddr.P_UDP)
+			mesh.logger.Error(`unable to add the peer to the list of known peers: %v`, err)
 		}
-		if err != nil {
-			mesh.logger.Debugf("unable to get TCP/UDP port of multiaddr %v: %v", maddr, err)
-		} else {
-			if portStr == ipfsPortString {
-				err := mesh.addToBootstrapPeers(maddr, peerAddr.ID)
-				if err != nil {
-					mesh.logger.Error("Unable to add %v to the list of bootstrap nodes: %v", maddr, errors.Wrap(err))
-				}
-			}
-		}
-	}
-
+	}()
 	return
 }

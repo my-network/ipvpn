@@ -8,6 +8,7 @@ import (
 
 type StreamHandler interface {
 	NewStream(stream Stream, peerAddr AddrInfo)
+	ConsiderKnownPeer(peerAddr AddrInfo)
 
 	SetID(id peer.ID)
 	SetPrivateKey(privKey ed25519.PrivateKey)
