@@ -1204,9 +1204,11 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 			addrs = append(addrs, &net.UDPAddr{IP: ip, Port: int(port)})
 		}
 	}
-	for _, addr := range addrs {
-		if uint16(addr.Port) != remoteUsualPort {
-			addr.Port++
+	if remoteUsualPort > 0 {
+		for _, addr := range addrs {
+			if uint16(addr.Port) != remoteUsualPort {
+				addr.Port++
+			}
 		}
 	}
 
