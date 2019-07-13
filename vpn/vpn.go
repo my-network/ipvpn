@@ -1179,8 +1179,11 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 		ip := net.ParseIP(addrString)
 		portString, err := maddr.ValueForProtocol(multiaddr.P_TCP)
 		if err != nil {
-			vpn.logger.Debugf(`skipping multiaddr %v: not an TCP address`, maddr.String())
-			continue
+			portString, err = maddr.ValueForProtocol(multiaddr.P_UDP)
+			if err != nil {
+				vpn.logger.Debugf(`skipping multiaddr %v: not an TCP/UDP address`, maddr.String())
+				continue
+			}
 		}
 		port, err := strconv.ParseInt(portString, 10, 64)
 		if err != nil {
