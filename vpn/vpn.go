@@ -297,17 +297,25 @@ func (vpn *VPN) considerMyExternalPort(port uint16) (err error) {
 	}
 
 	if !vpn.IsStarted() {
+		vpn.myExternalPort = port
 		return
 	}
 
-	return vpn.restartSimpleTunnelExternalListener(vpn.myExternalPort)
+	return vpn.restartSimpleTunnelExternalListener(port)
 }
 
 func (vpn *VPN) restartSimpleTunnelExternalListener(port uint16) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	vpn.logger.Debugf("restartSimpleTunnelExternalListener(%v)", port)
+
 	if vpn.simpleTunnelExternalListener != nil {
 		_ = vpn.simpleTunnelExternalListener.Close()
+	}
+
+	if port == 0 {
+		vpn.myExternalPort = 0
+		return nil
 	}
 
 	var simpleTunnelExternalListener *net.UDPConn
@@ -331,7 +339,7 @@ func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
 	for _, addr := range addrs {
 		ipStr, err := addr.ValueForProtocol(multiaddr.P_IP4)
 		if err != nil {
-			vpn.logger.Error(errors.Wrap(err, `unable to extract IP from address`, addr))
+			//vpn.logger.Error(errors.Wrap(err, `unable to extract IP from address`, addr))
 			continue
 		}
 		ip := net.ParseIP(ipStr)
@@ -341,7 +349,7 @@ func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
 
 		portStr, err := addr.ValueForProtocol(multiaddr.P_TCP)
 		if err != nil {
-			vpn.logger.Error(errors.Wrap(err, `unable to extract port from address`, addr))
+			vpn.logger.Error(errors.Wrap(err, `unable to extract TCP port from address`, addr))
 			break
 		}
 		port, err := strconv.ParseInt(portStr, 10, 64)
@@ -361,7 +369,7 @@ func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
 	for _, addr := range addrs {
 		portStr, err := addr.ValueForProtocol(multiaddr.P_TCP)
 		if err != nil {
-			vpn.logger.Error(errors.Wrap(err, `unable to extract port from address`, addr))
+			//vpn.logger.Debugf(`unable to extract TCP port from address %v: %v`, addr, err)
 			continue
 		}
 		port, err := strconv.ParseInt(portStr, 10, 64)
@@ -373,7 +381,7 @@ func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
 			continue
 		}
 
-		err = vpn.considerMyExternalPort(uint16(port))
+		err = vpn.considerMyExternalPort(uint16(port) + 1)
 		if err != nil {
 			vpn.logger.Error(errors.Wrap(err))
 			continue
@@ -395,6 +403,11 @@ func (vpn *VPN) simpleTunnelListenerReader(conn *net.UDPConn) {
 	for vpn.IsStarted() {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if netErr, ok := err.(*net.OpError); ok {
+				vpn.logger.Error(errors.Wrap(err, fmt.Sprintf("%T", err), fmt.Sprintf("%T", netErr.Err)))
+				return
+			}
+
 			vpn.logger.Error(errors.Wrap(err, fmt.Sprintf("%T", err)))
 			return
 		}
@@ -1186,6 +1199,11 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 		}
 		if !found {
 			addrs = append(addrs, &net.UDPAddr{IP: ip, Port: int(port)})
+		}
+	}
+	for _, addr := range addrs {
+		if uint16(addr.Port) != remoteUsualPort {
+			addr.Port++
 		}
 	}
 

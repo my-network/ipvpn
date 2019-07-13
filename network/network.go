@@ -29,6 +29,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
 	p2pprotocol "github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/discovery"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 	"github.com/xaionaro-go/errors"
@@ -263,6 +264,20 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 		}
 	}
 
+	logger.Debugf(`loading "swarm_peers.json"`)
+
+	var swarmAddrInfos []AddrInfo
+	{
+		swarmAddrInfosJSON, swarmAddrInfosReadError := ioutil.ReadFile(filepath.Join(cacheDir, `swarm_peers.json`))
+		logger.Debugf(`loading "known_peers.json" err == %v`, swarmAddrInfosReadError)
+		if swarmAddrInfosReadError == nil {
+			swarmAddrInfosParseError := json.Unmarshal(swarmAddrInfosJSON, &swarmAddrInfos)
+			if swarmAddrInfosParseError != nil {
+				logger.Error(errors.Wrap(swarmAddrInfosParseError, `unable to parse "known_peers.json"`))
+			}
+		}
+	}
+
 	logger.Debugf(`opening the repository "%v"`, repoPath)
 
 	var ipfsRepo repo.Repo
@@ -315,6 +330,27 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 					if !found {
 						ipfsRepoConfig.Bootstrap = append(ipfsRepoConfig.Bootstrap, peerString)
 					}
+				}
+			}
+		}
+	}
+
+	if len(swarmAddrInfos) > 0 {
+		logger.Debugf(`fixing the repository's config: previous swam peers' (count: %v) addresses to bootstrap nodes`, len(swarmAddrInfos))
+
+		for _, addrInfo := range swarmAddrInfos {
+			for _, maddr := range addrInfo.Addrs {
+				found := false
+				peerAddr := maddr.String() + `/ipfs/` + addrInfo.ID.String()
+				for _, bootstrapPeer := range ipfsRepoConfig.Bootstrap {
+					if bootstrapPeer == peerAddr {
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					ipfsRepoConfig.Bootstrap = append(ipfsRepoConfig.Bootstrap, peerAddr)
 				}
 			}
 		}
@@ -524,7 +560,78 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	return stream
 }
 
-func (mesh *Network) connector(ipfsCid cid.Cid) {
+func (mesh *Network) considerPeerAddr(peerAddr AddrInfo) {
+	peerID := peerAddr.ID
+
+	if peerID == mesh.ipfsNode.PeerHost.ID() {
+		if len(peerAddr.Addrs) == 0 {
+			mesh.logger.Debugf(`len(peerAddr.Addrs) == 0`)
+			return
+		}
+		//mesh.logger.Debugf("my ID, notifing stream handlers about my addrInfo: %v", peerAddr.Addrs)
+		for _, streamHandler := range mesh.streamHandlers {
+			streamHandler.SetMyAddrs(peerAddr.Addrs)
+		}
+		return
+	}
+
+	mesh.logger.Debugf("found peer: %v: %v", peerID, peerAddr.Addrs)
+
+	if len(peerAddr.Addrs) == 0 {
+		mesh.logger.Debugf(`mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, "%v")...`, peerID)
+		var err error
+		peerAddr, err = mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerID)
+		if err != nil {
+			mesh.logger.Infof("unable to find a route to peer %v: %v", peerID, err)
+			return
+		}
+		mesh.logger.Debugf("peer's addresses: %v", peerAddr.Addrs)
+	}
+
+	/*if t, ok := mesh.forbidOutcomingConnections.Load(peerID); ok {
+		until := t.(time.Time)
+		if until.After(time.Now()) {
+			mesh.logger.Debugf("we promised not to try to connect to this node: %v", peerID)
+			return
+		}
+		mesh.forbidOutcomingConnections.Delete(peerID)
+	}*/
+
+	mesh.logger.Debugf("mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)...")
+	stream, err := mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)
+	if err != nil {
+		mesh.logger.Infof("unable to connect to peer %v: %v", peerID, err)
+		return
+	}
+	mesh.logger.Debugf("new stream: %v", stream.Conn().RemoteMultiaddr())
+
+	stream = mesh.tryConnectByOptimalPath(stream, &peerAddr, false)
+	if stream == nil {
+		mesh.logger.Debugf("no opened stream, skip")
+		return
+	}
+
+	/*shouldContinue, alreadyOptimal := mesh.tryConnectByOptimalPath(stream, &addrInfo, false)
+	if !shouldContinue {
+		mesh.logger.Debugf("no more tries to connect to %v", peerID)
+		mesh.forbidOutcomingConnections.Store(peerID, time.Now().Add(5 * time.Minute))
+		continue
+	}
+	if !alreadyOptimal {
+		stream, err = mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)
+		if err != nil {
+			mesh.logger.Infof("unable to connect to peer %v: %v", peerID, err)
+			continue
+		}
+	}*/
+	err = mesh.addStream(stream, peerAddr)
+	if err != nil {
+		mesh.logger.Debugf("got error from addStream(): %v", err)
+		return
+	}
+}
+
+func (mesh *Network) dhtBasedConnector(ipfsCid cid.Cid) {
 	mesh.logger.Debugf(`initializing output streams`)
 
 	provChan := mesh.ipfsNode.DHT.FindProvidersAsync(mesh.ipfsContext, ipfsCid, 1<<16)
@@ -534,26 +641,6 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 		case <-mesh.ipfsContext.Done():
 			return
 		case peerAddr := <-provChan:
-			peerID := peerAddr.ID
-			mesh.logger.Debugf("found peer: %v: %v", peerID, peerAddr.Addrs)
-
-			if peerID == mesh.ipfsNode.PeerHost.ID() {
-				mesh.logger.Debugf("my ID, notifing stream handlers about my addrInfo")
-				for _, streamHandler := range mesh.streamHandlers {
-					streamHandler.SetMyAddrs(peerAddr.Addrs)
-				}
-				continue
-			}
-
-			/*if t, ok := mesh.forbidOutcomingConnections.Load(peerID); ok {
-				until := t.(time.Time)
-				if until.After(time.Now()) {
-					mesh.logger.Debugf("we promised not to try to connect to this node: %v", peerID)
-					continue
-				}
-				mesh.forbidOutcomingConnections.Delete(peerID)
-			}*/
-
 			if peerAddr.ID == "" {
 				hours := (1 << count) - 1
 				mesh.logger.Debugf("empty peer ID, sleep %v hours and restart FindProvidersAsync", hours)
@@ -563,49 +650,7 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 				continue
 			}
 
-			if len(peerAddr.Addrs) == 0 {
-				mesh.logger.Debugf("mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerID)...")
-				var err error
-				peerAddr, err = mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, peerID)
-				if err != nil {
-					mesh.logger.Infof("unable to find a route to peer %v: %v", peerID, err)
-					continue
-				}
-				mesh.logger.Debugf("peer's addresses: %v", peerAddr.Addrs)
-			}
-
-			mesh.logger.Debugf("mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)...")
-			stream, err := mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)
-			if err != nil {
-				mesh.logger.Infof("unable to connect to peer %v: %v", peerID, err)
-				continue
-			}
-			mesh.logger.Debugf("new stream: %v", stream.Conn().RemoteMultiaddr())
-
-			stream = mesh.tryConnectByOptimalPath(stream, &peerAddr, false)
-			if stream == nil {
-				mesh.logger.Debugf("no opened stream, skip")
-				continue
-			}
-
-			/*shouldContinue, alreadyOptimal := mesh.tryConnectByOptimalPath(stream, &addrInfo, false)
-			if !shouldContinue {
-				mesh.logger.Debugf("no more tries to connect to %v", peerID)
-				mesh.forbidOutcomingConnections.Store(peerID, time.Now().Add(5 * time.Minute))
-				continue
-			}
-			if !alreadyOptimal {
-				stream, err = mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)
-				if err != nil {
-					mesh.logger.Infof("unable to connect to peer %v: %v", peerID, err)
-					continue
-				}
-			}*/
-			err = mesh.addStream(stream, peerAddr)
-			if err != nil {
-				mesh.logger.Debugf("got error from addStream(): %v", err)
-				continue
-			}
+			go mesh.considerPeerAddr(peerAddr)
 		}
 	}
 }
@@ -641,6 +686,13 @@ func (mesh *Network) start() (err error) {
 
 	mesh.logger.Debugf(`registering local discovery handler`)
 
+	if mesh.ipfsNode.Discovery != nil {
+		panic("mesh.ipfsNode.Discovery != nil")
+	}
+	mesh.ipfsNode.Discovery, err = discovery.NewMdnsService(mesh.ipfsContext, mesh.ipfsNode.PeerHost, time.Second*10, "_ipfs-ipvpn-discovery._udp")
+	if err != nil {
+		mesh.logger.Error(errors.Wrap(err))
+	}
 	mesh.ipfsNode.Discovery.RegisterNotifee(mesh)
 
 	mesh.logger.Debugf(`starting to listen for the input streams handler`)
@@ -700,8 +752,6 @@ func (mesh *Network) start() (err error) {
 		mesh.logger.Debugf("success %v", peerID)
 	})
 
-	go mesh.connector(ipfsCid)
-
 	go func() {
 		mesh.logger.Debugf(`Notifying streamHandlers (such as VPN handler) about previously known peers (count == %v)`, len(mesh.knownPeers))
 		mesh.knownPeersLocker.RLock()
@@ -721,6 +771,17 @@ func (mesh *Network) start() (err error) {
 		}
 	}()
 
+	go mesh.updateMyAddrInfo()
+
+	go func() {
+		for i := 0; i < 120; i++ {
+			time.Sleep(time.Second)
+			mesh.updateMyAddrInfo()
+		}
+	}()
+
+	go mesh.dhtBasedConnector(ipfsCid)
+
 	mesh.logger.Infof(`My ID: %v        Calling IPFS "DHT.Provide()" on the shared key (that will be used for the node discovery), Cid: %v`, mesh.ipfsNode.PeerHost.ID(), ipfsCid)
 
 	err = mesh.ipfsNode.DHT.Provide(mesh.ipfsContext, ipfsCid, true)
@@ -729,6 +790,25 @@ func (mesh *Network) start() (err error) {
 	}
 
 	mesh.logger.Debugf(`started an IPFS node`)
+
+	go func() {
+		time.Sleep(time.Minute * 5)
+		mesh.updateMyAddrInfo()
+	}()
+
+	go func() {
+		go mesh.updateMyAddrInfo()
+		mesh.saveSwarmPeersAsBootstrapPeers()
+		ticker := time.NewTicker(time.Hour)
+		for {
+			select {
+			case <-ticker.C:
+			}
+			go mesh.updateMyAddrInfo()
+			mesh.saveSwarmPeersAsBootstrapPeers()
+		}
+	}()
+
 	return
 }
 
@@ -760,6 +840,68 @@ func (mesh *Network) HandlePeerFound(addrInfo peer.AddrInfo) {
 	if err := mesh.handlePeerFound(addrInfo); err != nil {
 		mesh.logger.Error(errors.Wrap(err))
 	}
+}
+
+func (mesh *Network) saveSwarmPeersAsBootstrapPeers() {
+	err := mesh.doSaveSwarmPeersAsBootstrapPeers()
+	if err != nil {
+		mesh.logger.Error(errors.Wrap(err))
+	}
+}
+
+func (mesh *Network) doSaveSwarmPeersAsBootstrapPeers() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	mesh.logger.Debugf(`doSaveSwarmPeersAsBootstrapPeers()`)
+
+	var addrInfos []*AddrInfo
+	for _, conn := range mesh.ipfsNode.PeerHost.Network().Conns() {
+		peerID := conn.RemotePeer()
+		addr := conn.RemoteMultiaddr()
+		var addrInfo *AddrInfo
+		for _, cmpAddrInfo := range addrInfos {
+			if cmpAddrInfo.ID == peerID {
+				addrInfo = cmpAddrInfo
+				break
+			}
+		}
+
+		if addrInfo == nil {
+			addrInfo = &AddrInfo{ID: peerID}
+			addrInfos = append(addrInfos, addrInfo)
+		}
+
+		found := false
+		for _, cmpAddr := range addrInfo.Addrs {
+			if cmpAddr.Equal(addr) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			addrInfo.Addrs = append(addrInfo.Addrs, addr)
+		}
+	}
+
+	addrInfosJSON, err := json.Marshal(addrInfos)
+	if err != nil {
+		return
+	}
+
+	err = ioutil.WriteFile(filepath.Join(mesh.cacheDir, `swarm_peers.json`), addrInfosJSON, 0640)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (mesh *Network) updateMyAddrInfo() {
+	//mesh.logger.Debugf(`updating my AddrInfo...`)
+	mesh.considerPeerAddr(AddrInfo{
+		ID:    mesh.ipfsNode.PeerHost.ID(),
+		Addrs: mesh.ipfsNode.PeerHost.Addrs(),
+	})
 }
 
 func (mesh *Network) sendAuthData(stream Stream) (err error) {

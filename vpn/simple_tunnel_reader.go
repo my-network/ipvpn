@@ -237,8 +237,18 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 }
 
 func (r *simpleTunnelReader) Read(b []byte) (size int, err error) {
+	size, _, err = r.ReadFromUDP(b)
+	return
+}
+
+func (r *simpleTunnelReader) ReadFromUDP(b []byte) (size int, addr *net.UDPAddr, err error) {
 	item := <-r.queue
+	addr = item.addrRemote
 	copy(b, item.msg)
+	size = len(b)
+	if size > len(item.msg) {
+		size = len(item.msg)
+	}
 	item.Release()
-	return len(b), nil
+	return
 }

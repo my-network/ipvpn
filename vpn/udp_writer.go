@@ -29,10 +29,37 @@ func (w *udpWriter) Write(b []byte) (size int, err error) {
 	return
 }
 
-func (w *udpWriter) Read(b []byte) (size int, err error) {
-	return w.readCloser.Read(b)
+func (w *udpWriter) WriteToUDP(b []byte, addr *net.UDPAddr) (size int, err error) {
+	size, err = w.UDPConn.WriteToUDP(b, addr)
+	if err != nil {
+		err = errors.Wrap(err)
+	}
+	return
 }
 
-func (w *udpWriter) Close() error {
-	return w.readCloser.Close()
+func (w *udpWriter) Read(b []byte) (size int, err error) {
+	size, err = w.readCloser.Read(b)
+	if err != nil {
+		err = errors.Wrap(err)
+	}
+	return
+}
+
+func (w *udpWriter) ReadFromUDP(b []byte) (size int, addr *net.UDPAddr, err error) {
+	readFromUDPer := w.readCloser.(interface {
+		ReadFromUDP([]byte) (int, *net.UDPAddr, error)
+	})
+	size, addr, err = readFromUDPer.ReadFromUDP(b)
+	if err != nil {
+		err = errors.Wrap(err)
+	}
+	return
+}
+
+func (w *udpWriter) Close() (err error) {
+	err = w.readCloser.Close()
+	if err != nil {
+		err = errors.Wrap(err)
+	}
+	return err
 }

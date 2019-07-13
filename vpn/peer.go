@@ -336,21 +336,18 @@ func (peer *Peer) forwardPacketToWG(b []byte, writer io.Writer) (err error) {
 func (peer *Peer) tunnelToWgForwarderLoop(chType channelType) {
 	buffer := [peerBufferSize]byte{}
 
-	var reader io.Reader
-	var writer io.Writer
+	var conn io.ReadWriter
 	switch chType {
 	case channelTypeIPFS:
-		reader = peer.IPFSStream
-		writer = newUDPWriter(peer.IPFSTunnelConnToWG, nil, &peer.VPN.wgnets[chType].WGListenerAddr)
+		conn = newUDPWriter(peer.IPFSTunnelConnToWG, peer.IPFSStream, &peer.VPN.wgnets[chType].WGListenerAddr)
 	case channelTypeTunnel:
-		reader = peer.SimpleTunnelConn
-		writer = newUDPWriter(peer.SimpleTunnelConnToWG, nil, &peer.VPN.wgnets[chType].WGListenerAddr)
+		conn = newUDPWriter(peer.SimpleTunnelConnToWG, peer.SimpleTunnelConn, &peer.VPN.wgnets[chType].WGListenerAddr)
 	default:
 		panic(fmt.Errorf("invalid channel type: %v", chType))
 	}
 
 	for {
-		size, err := reader.Read(buffer[:])
+		size, err := conn.Read(buffer[:])
 		if err != nil {
 			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
 				peer.VPN.logger.Infof("IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
@@ -379,13 +376,13 @@ func (peer *Peer) tunnelToWgForwarderLoop(chType channelType) {
 
 		switch msgType {
 		case MessageTypePing:
-			err = peer.replyWithPong(payload, writer)
+			err = peer.replyWithPong(payload, conn)
 		case MessageTypePong:
 			err = peer.considerPongBytes(chType, payload)
 		case MessageTypeConfig:
 			err = peer.considerConfigBytes(payload)
 		case MessageTypePacket:
-			err = peer.forwardPacketToWG(payload, writer)
+			err = peer.forwardPacketToWG(payload, conn)
 		default:
 			err = errors.Wrap(ErrUnknownMessageType, msgType)
 		}
