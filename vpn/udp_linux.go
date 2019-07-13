@@ -9,6 +9,8 @@ import (
 	"github.com/xaionaro-go/errors"
 )
 
+// TODO: consider IPV6_DONTFRAG
+
 func udpSetNoFragment(conn *net.UDPConn) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 	var syscallConn syscall.RawConn

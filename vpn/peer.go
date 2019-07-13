@@ -341,10 +341,10 @@ func (peer *Peer) tunnelToWgForwarderLoop(chType channelType) {
 	switch chType {
 	case channelTypeIPFS:
 		reader = peer.IPFSStream
-		writer = newUDPWriter(peer.IPFSTunnelConnToWG, &peer.VPN.wgnets[chType].WGListenerAddr)
+		writer = newUDPWriter(peer.IPFSTunnelConnToWG, nil, &peer.VPN.wgnets[chType].WGListenerAddr)
 	case channelTypeTunnel:
 		reader = peer.SimpleTunnelConn
-		writer = newUDPWriter(peer.SimpleTunnelConnToWG, &peer.VPN.wgnets[chType].WGListenerAddr)
+		writer = newUDPWriter(peer.SimpleTunnelConnToWG, nil, &peer.VPN.wgnets[chType].WGListenerAddr)
 	default:
 		panic(fmt.Errorf("invalid channel type: %v", chType))
 	}

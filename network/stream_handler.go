@@ -13,6 +13,7 @@ type StreamHandler interface {
 	SetID(id peer.ID)
 	SetPrivateKey(privKey ed25519.PrivateKey)
 	SetPSK(psk []byte)
+	SetMyAddrs(addrs []multiaddr.Multiaddr)
 
 	IsBadAddress(maddr multiaddr.Multiaddr) bool
 

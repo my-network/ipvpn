@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/agl/ed25519/extra25519"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/my-network/ipvpn/network"
 	"github.com/my-network/wgcreate"
 	"github.com/xaionaro-go/atomicmap"
 	"github.com/xaionaro-go/errors"
@@ -28,14 +30,12 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"github.com/my-network/ipvpn/network"
 )
 
 const (
 	bufferSize                  = 1 << 20
 	ipvpnIfaceNamePrefix        = `ipvpn_`
-	defaultMTU                  = 1200
+	defaultMTU                  = 1280
 	ipvpnWGPortDirect           = 18291
 	ipvpnWGPortIPFS             = 18292
 	ipvpnWGPortSimpleTunnel     = 18293
@@ -56,22 +56,27 @@ type Stream = network.Stream
 type AddrInfo = network.AddrInfo
 
 type VPN struct {
-	logger                 Logger
-	myID                   peer.ID
-	ifaceNamePrefix        string
-	intAlias               IntAlias
-	intAliasFilePath       string
-	peers                  sync.Map
-	newStreamLocker        sync.Mutex
-	buffer                 [bufferSize]byte
-	privKey                ed25519.PrivateKey
-	psk                    []byte
-	state                  uint32
-	wgctl                  *wgctrl.Client
-	wgnets                 [channelType_max]WGNet
-	directConnectorTrigger chan struct{}
+	logger                             Logger
+	myID                               peer.ID
+	ifaceNamePrefix                    string
+	intAlias                           IntAlias
+	intAliasFilePath                   string
+	peers                              sync.Map
+	newStreamLocker                    sync.Mutex
+	buffer                             [bufferSize]byte
+	privKey                            ed25519.PrivateKey
+	psk                                []byte
+	state                              uint32
+	wgctl                              *wgctrl.Client
+	wgnets                             [channelType_max]WGNet
+	directConnectorTrigger             chan struct{}
+	simpleTunnelListener               *net.UDPConn
+	simpleTunnelExternalListener       *net.UDPConn
+	simpleTunnelExternalListenerLocker sync.RWMutex
+	simpleTunnelReaderMap              atomicmap.Map
+	myExternalPort                     uint16
 
-	waitingForResponseContextCancelFunc atomicmap.Map
+	pingSenderLoopCancelFunc atomicmap.Map
 }
 
 func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) {
@@ -88,7 +93,8 @@ func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, er
 		ifaceNamePrefix:        ipvpnIfaceNamePrefix,
 		directConnectorTrigger: make(chan struct{}, 256),
 
-		waitingForResponseContextCancelFunc: atomicmap.New(),
+		simpleTunnelReaderMap:    atomicmap.New(),
+		pingSenderLoopCancelFunc: atomicmap.New(),
 	}
 
 	// Splitting "subnet" to 4 subnets: direct, ipfs, simpleTunnel, autoRouted
@@ -255,7 +261,195 @@ func (vpn *VPN) Start() (err error) {
 		return
 	}
 
+	var simpleTunnelListener *net.UDPConn
+	simpleTunnelListener, err = net.ListenUDP("udp", &net.UDPAddr{
+		Port: ipvpnTunnelPortSimpleTunnel,
+	})
+	if err != nil {
+		return
+	}
+	vpn.simpleTunnelListener = simpleTunnelListener
+	go vpn.simpleTunnelListenerReader(simpleTunnelListener)
+
+	vpn.simpleTunnelExternalListenerLocker.Lock()
+	defer vpn.simpleTunnelExternalListenerLocker.Unlock()
+
+	if vpn.myExternalPort > 0 {
+		err = vpn.restartSimpleTunnelExternalListener(vpn.myExternalPort)
+		if err != nil {
+			return
+		}
+	}
+
 	return
+}
+
+func (vpn *VPN) considerMyExternalPort(port uint16) (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	vpn.logger.Debugf("considerMyExternalPort(%v)", port)
+
+	vpn.simpleTunnelExternalListenerLocker.Lock()
+	defer vpn.simpleTunnelExternalListenerLocker.Unlock()
+
+	if port == vpn.myExternalPort {
+		return
+	}
+
+	if !vpn.IsStarted() {
+		return
+	}
+
+	return vpn.restartSimpleTunnelExternalListener(vpn.myExternalPort)
+}
+
+func (vpn *VPN) restartSimpleTunnelExternalListener(port uint16) (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	if vpn.simpleTunnelExternalListener != nil {
+		_ = vpn.simpleTunnelExternalListener.Close()
+	}
+
+	var simpleTunnelExternalListener *net.UDPConn
+	simpleTunnelExternalListener, err = net.ListenUDP("udp", &net.UDPAddr{
+		Port: int(port),
+	})
+	if err != nil {
+		return
+	}
+	vpn.simpleTunnelExternalListener = simpleTunnelExternalListener
+	go vpn.simpleTunnelListenerReader(simpleTunnelExternalListener)
+
+	vpn.myExternalPort = port
+
+	return
+}
+
+func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
+	// Find usual IPFS TCP port
+	var ipfsPort uint16
+	for _, addr := range addrs {
+		ipStr, err := addr.ValueForProtocol(multiaddr.P_IP4)
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, `unable to extract IP from address`, addr))
+			continue
+		}
+		ip := net.ParseIP(ipStr)
+		if !ip.IsLoopback() {
+			continue
+		}
+
+		portStr, err := addr.ValueForProtocol(multiaddr.P_TCP)
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, `unable to extract port from address`, addr))
+			break
+		}
+		port, err := strconv.ParseInt(portStr, 10, 64)
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, `unable to parse port from address`, addr))
+			break
+		}
+		ipfsPort = uint16(port)
+		break
+	}
+
+	if ipfsPort == 0 {
+		vpn.logger.Error("I did not find a loopback interface in the addresses list, so I don't know my usual port for IPFS :(")
+		return
+	}
+
+	for _, addr := range addrs {
+		portStr, err := addr.ValueForProtocol(multiaddr.P_TCP)
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, `unable to extract port from address`, addr))
+			continue
+		}
+		port, err := strconv.ParseInt(portStr, 10, 64)
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, `unable to parse port from address`, addr))
+			continue
+		}
+		if uint16(port) == ipfsPort {
+			continue
+		}
+
+		err = vpn.considerMyExternalPort(uint16(port))
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err))
+			continue
+		}
+		break
+	}
+}
+
+const simpleTunnelListenerReaderCacheSize = 0
+
+func (vpn *VPN) simpleTunnelListenerReader(conn *net.UDPConn) {
+	vpn.logger.Debugf("started simpleTunnelListenerReader(%v)", conn.LocalAddr())
+	defer vpn.logger.Debugf("finished simpleTunnelListenerReader(%v)", conn.LocalAddr())
+
+	cache := make([]*simpleTunnelReader, 0, simpleTunnelListenerReaderCacheSize)
+
+	addrBuf := make([]byte, 2+net.IPv6len)
+	buf := make([]byte, bufferSize)
+	for vpn.IsStarted() {
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, fmt.Sprintf("%T", err)))
+			return
+		}
+
+		vpn.logger.Debugf("conn<%v>.ReadFromUDP(buf) -> %v (%v)", conn.LocalAddr(), err, addr)
+		if err != nil {
+			if err == syscall.ECONNREFUSED { // TODO: consider IP_RECVERR
+				vpn.logger.Debugf("%v> ECONNREFUSED (%v), try again (to connect using for a hole punching)", conn.LocalAddr().String(), addr)
+				continue
+			}
+			vpn.logger.Debugf("%v> unable to read message: %v (%v)", conn.LocalAddr(), err, addr)
+			_ = conn.Close()
+			return
+		}
+		if n < 2 {
+			vpn.logger.Error("%v> message is too short: %v < 2 (%v)", conn.LocalAddr(), n, addr)
+			continue
+		}
+
+		var reader *simpleTunnelReader
+		if simpleTunnelListenerReaderCacheSize > 0 {
+			for _, entry := range cache {
+				if entry.HasAddress(addr) {
+					reader = entry
+					break
+				}
+			}
+		}
+
+		if reader == nil {
+			vpn.logger.Debugf(`%v> cache-miss: %v`, conn.LocalAddr(), addr)
+
+			copy(addrBuf, addr.IP)
+			binary.LittleEndian.PutUint16(addrBuf[len(addr.IP):], uint16(addr.Port))
+			fullAddr := addrBuf[:2+len(addr.IP)]
+
+			readerI, err := vpn.simpleTunnelReaderMap.GetByBytes(fullAddr)
+			if err != nil {
+				vpn.logger.Debugf(`%v> there's no reader for %v: %v`, conn.LocalAddr(), addr, err)
+				continue
+			}
+			reader = readerI.(*simpleTunnelReader)
+
+			if simpleTunnelListenerReaderCacheSize > 0 {
+				if len(cache) < simpleTunnelListenerReaderCacheSize {
+					cache = append(cache, reader)
+				} else {
+					// TODO: use LRU instead:
+					cache[randIntn(simpleTunnelListenerReaderCacheSize)] = reader
+				}
+			}
+		}
+
+		reader.enqueue(conn, addr, buf[:n])
+	}
 }
 
 func (vpn *VPN) directConnectorTryNow() {
@@ -358,20 +552,33 @@ func (vpn *VPN) deleteLinks() (err error) {
 }
 
 func (vpn *VPN) Close() (err error) {
-	defer func() { err = errors.Wrap(err) }()
-
 	if !atomic.CompareAndSwapUint32(&vpn.state, 1, 0) {
 		return ErrAlreadyClosed
 	}
 
-	err = vpn.wgctl.Close()
+	err0 := errors.Wrap(vpn.wgctl.Close())
 	if err != nil {
-		return
+		vpn.logger.Error(err0)
 	}
 
-	err = vpn.deleteLinks()
-	if err != nil {
-		return
+	err1 := errors.Wrap(vpn.deleteLinks())
+	if err1 != nil {
+		vpn.logger.Error(err1)
+	}
+
+	err2 := vpn.simpleTunnelListener.Close()
+	if err2 != nil {
+		vpn.logger.Error(err2)
+	}
+
+	if err0 != nil {
+		err = err0
+	}
+	if err1 != nil {
+		err = err1
+	}
+	if err2 != nil {
+		err = err2
 	}
 
 	return
@@ -661,23 +868,26 @@ func (vpn *VPN) NewStream(stream Stream, peerAddr AddrInfo) {
 	}
 }
 
-func (vpn *VPN) cancelTryingConnect(peerID peer.ID) bool {
-	var cancelFunc *context.CancelFunc
-	_ = vpn.waitingForResponseContextCancelFunc.UnsetIf(peerID, func(value interface{}) bool {
-		cancelFunc, _ = value.(*context.CancelFunc)
-		return true
-	})
-	if cancelFunc != nil {
+func (vpn *VPN) cancelPingSenderLoop(peerID peer.ID) (r bool) {
+	for {
+		var cancelFunc *context.CancelFunc
+		_ = vpn.pingSenderLoopCancelFunc.UnsetIf(peerID, func(value interface{}) bool {
+			cancelFunc, _ = value.(*context.CancelFunc)
+			return true
+		})
+		if cancelFunc == nil {
+			break
+		}
 		(*cancelFunc)()
-		return true
+		r = true
 	}
 
-	return false
+	return
 }
 
 func (vpn *VPN) newTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
-	vpn.cancelTryingConnect(peerAddr.ID)
+	vpn.cancelPingSenderLoop(peerAddr.ID)
 
 	peerID := peerAddr.ID
 
@@ -826,154 +1036,28 @@ func (vpn *VPN) newTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) 
 
 }
 
-func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []net.Conn) {
-	remotePubKeyI, err := peerAddr.ID.ExtractPublicKey()
+func getPublicKeyFromPeerID(id peer.ID) (pubKey ed25519.PublicKey, err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	remotePubKeyI, err := id.ExtractPublicKey()
 	if err != nil {
-		vpn.logger.Error(`unable to extract public key from ID %v: %v`, peerAddr.ID, err)
 		return
 	}
 	remotePubKeyRaw, err := remotePubKeyI.Raw()
 	if err != nil {
-		vpn.logger.Error(`unable to extract public key bytes (peer.ID == %v): %v`, peerAddr.ID, err)
 		return
 	}
-	remotePubKey := ed25519.PublicKey(remotePubKeyRaw)
+	return ed25519.PublicKey(remotePubKeyRaw), nil
+}
 
-	myPubKey := vpn.GetPublicKey()
-
+func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs []*net.UDPAddr) {
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	if prevCancelFunc, _ := vpn.waitingForResponseContextCancelFunc.Swap(peerAddr.ID, &cancelFunc); prevCancelFunc != nil {
+	if prevCancelFunc, _ := vpn.pingSenderLoopCancelFunc.Swap(peerAddr.ID, &cancelFunc); prevCancelFunc != nil {
 		(*prevCancelFunc.(*context.CancelFunc))()
 	}
 
-	var chosenConnStorage atomic.Value
-	go func() {
-		select {
-		case <-ctx.Done():
-		}
-		var chosenConn *net.UDPConn
-		if chosenConnI := chosenConnStorage.Load(); chosenConnI != nil {
-			chosenConn = chosenConnI.(*net.UDPConn)
-		}
-		vpn.logger.Debugf("received signal \"ctx.Done()\", closing all waiting connections (chosenConn == %v; which won't be closed)", chosenConn)
-		for _, conn := range conns {
-			if conn == chosenConn {
-				continue
-			}
-			_ = conn.Close()
-		}
-	}()
-
-	for _, conn := range conns {
-		go func(conn net.Conn) {
-			pingSize := uint(binary.Size(&MessagePing{}))
-			pongSize := uint(binary.Size(&MessagePong{}))
-			readBuf := make([]byte, binary.Size(MessageType(0))+int(max(pingSize, pongSize))+1)
-			for {
-				n, err := conn.Read(readBuf[:])
-				vpn.logger.Debugf("conn.Read(readBuf[:]) -> %v (%v)", err, conn.RemoteAddr())
-				if err != nil {
-					select {
-					case <-ctx.Done():
-					default:
-						if err == syscall.ECONNREFUSED {
-							vpn.logger.Debugf("ECONNREFUSED (%v), try again soon", conn.RemoteAddr())
-							time.Sleep(time.Millisecond * 100) // TODO: remove this too often reading (make it event driven)
-							continue
-						}
-						vpn.logger.Debugf("unable to read message: %v (%v)", err, conn.RemoteAddr().String())
-						_ = conn.Close()
-					}
-				}
-				if n < 2 {
-					vpn.logger.Error("message is too short: %v < 2 (%v)", n, conn.RemoteAddr().String())
-					_ = conn.Close()
-					return
-				}
-
-				recvTS := time.Now()
-
-				var messagePong MessagePong
-
-				msgType := MessageType(binary.LittleEndian.Uint16(readBuf[:]))
-				switch msgType {
-				case MessageTypePing:
-					if err := messagePong.MessagePing.Read(readBuf[2:n]); err != nil {
-						vpn.logger.Debugf("incorrect message: %v (%v)", err, conn.RemoteAddr())
-						continue
-					}
-					if err := messagePong.MessagePing.VerifySender(remotePubKey); err != nil {
-						vpn.logger.Debugf("remote signature is invalid in ping from peer %v: %v (%v)", peerAddr.ID, err, conn.RemoteAddr())
-						continue
-					}
-
-					messagePong.ReceiveTS = recvTS.UnixNano()
-					messagePong.SendTS = time.Now().UnixNano()
-					if err := messagePong.SignRecipient(vpn.privKey); err != nil {
-						vpn.logger.Error(errors.Wrap(err, `unable to sign a message`))
-						cancelFunc()
-						return
-					}
-					_, err := conn.Write(messagePong.Bytes())
-					if err != nil {
-						vpn.logger.Debugf(`unable to send a message: %v (%v)`, err, conn.RemoteAddr().String())
-						_ = conn.Close()
-						return
-					}
-					continue
-				case MessageTypePong:
-					if err := messagePong.Read(readBuf[2:n]); err != nil {
-						vpn.logger.Error(errors.Wrap(err, "incorrect message (%v)", conn.RemoteAddr()))
-						continue
-					}
-
-					if err := messagePong.VerifyRecipient(remotePubKey); err != nil {
-						vpn.logger.Debugf("remove signature is invalid in pong from peer %v: %v (%v)", peerAddr.ID, err, conn.RemoteAddr())
-						continue
-					}
-					if err := messagePong.VerifySender(myPubKey); err != nil {
-						vpn.logger.Debugf("my signature is invalid in pong from peer %v: %v (%v)", peerAddr.ID, err, conn.RemoteAddr())
-						continue
-					}
-
-					switch {
-					case messagePong.SequenceID < 10:
-						messagePing := messagePong.MessagePing
-						messagePing.SequenceID++
-						if err := messagePing.SignSender(vpn.privKey); err != nil {
-							vpn.logger.Error(errors.Wrap(err, `unable to sign a message`))
-							cancelFunc()
-							return
-						}
-						_, err := conn.Write(messagePing.Bytes())
-						if err != nil {
-							vpn.logger.Debugf(`unable to send a message: %v (%v)`, err, conn.RemoteAddr())
-							_ = conn.Close()
-							return
-						}
-						continue
-					case messagePong.SequenceID == 10:
-						chosenConnStorage.Store(conn)
-						cancelFunc()
-						go func() {
-							if err := vpn.newTunnelConnection(conn, peerAddr); err != nil {
-								vpn.logger.Error(errors.Wrap(err, `unable to open a tunnel connection (%v)`, conn.RemoteAddr()))
-							}
-						}()
-					default:
-						vpn.logger.Debugf(`unexpected sequence ID: %v (%v)`, messagePong.SequenceID, conn.RemoteAddr())
-						continue
-					}
-				default:
-					vpn.logger.Debugf("unknown message type: %v (%v)", msgType, conn.RemoteAddr())
-					continue
-				}
-			}
-		}(conn)
-	}
-
 	defer func() {
-		err := vpn.waitingForResponseContextCancelFunc.UnsetIf(peerAddr.ID, func(value interface{}) bool {
+		err := vpn.pingSenderLoopCancelFunc.UnsetIf(peerAddr.ID, func(value interface{}) bool {
 			return value.(*context.CancelFunc) == &cancelFunc
 		})
 		if err == nil {
@@ -981,34 +1065,32 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []net.Conn) {
 		}
 	}()
 
+	sendBuf := make([]byte, sizeOfMessageType+sizeOfMessagePing)
+	if err := binary.Write(bytes.NewBuffer(sendBuf), binary.LittleEndian, MessageTypePing); err != nil {
+		vpn.logger.Error(errors.Wrap(err))
+		return
+	}
+
+	messagePing := MessagePing{}
 	for {
-		messagePing := MessagePing{}
 		messagePing.SendTS = time.Now().UnixNano()
 		err := messagePing.SignSender(vpn.privKey)
 		if err != nil {
 			vpn.logger.Error(errors.Wrap(err, "unable to sign a message"))
 			return
 		}
-		var buf bytes.Buffer
-		if err = binary.Write(&buf, binary.LittleEndian, MessageTypePing); err != nil {
-			return
-		}
-		buf.Write(messagePing.Bytes())
-		newConns := make([]net.Conn, 0, len(conns))
-		for _, conn := range conns {
-			_, err := conn.Write(buf.Bytes())
-			if err != nil {
-				vpn.logger.Debugf(`unable to send message: %v (%v)`, err, conn.RemoteAddr().String())
-				_ = conn.Close()
-				continue
+		_ = messagePing.Write(sendBuf[sizeOfMessageType:])
+		for _, addr := range addrs {
+			var conn *net.UDPConn
+			if addr.Port == int(remoteUsualPort) {
+				conn = vpn.simpleTunnelListener
+			} else {
+				conn = vpn.simpleTunnelExternalListener
 			}
-			newConns = append(newConns, conn)
-		}
-		conns = newConns
-
-		if len(conns) == 0 {
-			vpn.logger.Debugf("unable to connect to peer %v using old addresses", peerAddr.ID)
-			return
+			_, err := conn.WriteToUDP(sendBuf, addr)
+			if err != nil {
+				vpn.logger.Debugf(`%v> unable to send message: %v (%v)`, conn.LocalAddr(), err, addr)
+			}
 		}
 
 		wakeuper := time.NewTimer(time.Second * time.Duration(rand.Intn(120)))
@@ -1022,14 +1104,48 @@ func (vpn *VPN) tryingConnectLoop(peerAddr AddrInfo, conns []net.Conn) {
 	}
 }
 
-func (vpn *VPN) startTryingConnect(peerAddr AddrInfo, conns []net.Conn) {
-	go vpn.tryingConnectLoop(peerAddr, conns)
+func addrToKey(addr *net.UDPAddr) []byte {
+	addrBuf := make([]byte, 2+net.IPv6len)
+	copy(addrBuf, addr.IP)
+	binary.LittleEndian.PutUint16(addrBuf[len(addr.IP):], uint16(addr.Port))
+	fullAddr := addrBuf[:2+len(addr.IP)]
+	return fullAddr
+}
+
+func (vpn *VPN) createSimpleTunnelReaders(peerAddr AddrInfo, addrs []*net.UDPAddr) {
+	var reader *simpleTunnelReader
+	var err error
+	reader, err = newSimpleTunnelReader(vpn, peerAddr, addrs, func() error { /* Close() func */
+		for _, addr := range addrs {
+			key := addrToKey(addr)
+			_ = vpn.simpleTunnelReaderMap.UnsetIf(key, func(value interface{}) bool {
+				return value.(*simpleTunnelReader) == reader
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		vpn.logger.Error(errors.Wrap(err, `unable to create a tunnel reader`))
+		return
+	}
+
+	for _, addr := range addrs {
+		key := addrToKey(addr)
+		// TODO: we should limit number of possible readers, otherwise it could be used for DoS attacks (to get the node run out of memory)
+		_ = vpn.simpleTunnelReaderMap.Set(key, reader)
+	}
+}
+
+func (vpn *VPN) startSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, addrs []*net.UDPAddr) {
+	vpn.createSimpleTunnelReaders(peerAddr, addrs)
+	go vpn.pingSenderLoop(peerAddr, remoteUsualPort, addrs)
 }
 
 func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	var addrs []net.IP
+	var remoteUsualPort uint16
+	var addrs []*net.UDPAddr
 	for _, maddr := range peerAddr.Addrs {
 		toSkip := false
 		for _, chType := range channelTypes {
@@ -1047,43 +1163,33 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 			vpn.logger.Debugf(`skipping multiaddr %v: not an IPv4 address`, maddr.String())
 			continue
 		}
+		ip := net.ParseIP(addrString)
+		portString, err := maddr.ValueForProtocol(multiaddr.P_TCP)
+		if err != nil {
+			vpn.logger.Debugf(`skipping multiaddr %v: not an TCP address`, maddr.String())
+			continue
+		}
+		port, err := strconv.ParseInt(portString, 10, 64)
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, `unable to parse port`, port, maddr.String()))
+			continue
+		}
+		if ip.IsLoopback() {
+			remoteUsualPort = uint16(port)
+		}
 		found := false
 		for _, addr := range addrs {
-			if addr.String() == addrString {
+			if addr.IP.String() == addrString && addr.Port == int(port) {
 				found = true
 				break
 			}
 		}
 		if !found {
-			addrs = append(addrs, net.ParseIP(addrString))
+			addrs = append(addrs, &net.UDPAddr{IP: ip, Port: int(port)})
 		}
 	}
 
-	var conns []net.Conn
-	for _, addr := range addrs {
-		if addr.IsLoopback() {
-			continue
-		}
-		vpn.logger.Debugf(`creating a connection to %v`, addr.String())
-		conn, err := dialUDPReuse("udp", &net.UDPAddr{
-			Port: ipvpnTunnelPortSimpleTunnel,
-		}, &net.UDPAddr{
-			IP:   addr,
-			Port: ipvpnTunnelPortSimpleTunnel,
-		})
-		if err != nil {
-			vpn.logger.Error(errors.Wrap(err, "unable to open connection", addr.String()))
-			continue
-		}
-		err = udpSetNoFragmentSyscall(conn)
-		if err != nil {
-			vpn.logger.Error(errors.Wrap(err, "unable to set noFragment on connection", addr.String()))
-			continue
-		}
-		conns = append(conns, conn)
-	}
-
-	vpn.startTryingConnect(peerAddr, conns)
+	vpn.startSendingPings(peerAddr, remoteUsualPort, addrs)
 	return
 }
 

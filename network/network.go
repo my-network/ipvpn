@@ -132,9 +132,7 @@ func addressesConfig() ipfsConfig.Addresses {
 }
 
 func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
-	defer func() {
-		err = errors.Wrap(err)
-	}()
+	defer func() { err = errors.Wrap(err) }()
 
 	logger.Debugf(`generating keys`)
 
@@ -213,9 +211,6 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 	}
 
 	return
-}
-
-type VPN interface {
 }
 
 func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, logger Logger, streamHandlers ...StreamHandler) (mesh *Network, err error) {
@@ -446,7 +441,10 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	// Set new addrs
 	mesh.ipfsNode.PeerHost.Network().Peerstore().SetAddrs(addrInfo.ID, data.AddrInfo.Addrs, time.Minute*5)
 
-	if data.AddrInfo.Addrs[0].String() != stream.Conn().RemoteMultiaddr().String() && (isIncoming && strings.HasSuffix(stream.Conn().RemoteMultiaddr().String(), `/quic`)) {
+	if stream != nil &&
+		data.AddrInfo.Addrs[0].String() != stream.Conn().RemoteMultiaddr().String() &&
+		(isIncoming && strings.HasSuffix(stream.Conn().RemoteMultiaddr().String(), `/quic`)) {
+
 		var msg [9]byte
 		msg[0] = byte(MessageTypeStopConnectionOnYourSide)
 		mesh.logger.Infof("sending status data: %v %v", msg[0], uint64(data.Latencies[0]))
@@ -482,6 +480,11 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 		mesh.logger.Debugf("closing connection %v (!= %v)", stream.Conn().RemoteMultiaddr().String(), data.AddrInfo.Addrs[0].String())
 		_ = stream.Conn().Close()
 
+		stream = nil
+	}
+
+	if stream == nil {
+		var err error
 		stream, err = mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, addrInfo.ID, p2pProtocolID)
 		if err != nil {
 			mesh.logger.Debugf("unable create a new stream to %v: %v", addrInfo.ID, errors.Wrap(err))
@@ -535,7 +538,10 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 			mesh.logger.Debugf("found peer: %v: %v", peerID, peerAddr.Addrs)
 
 			if peerID == mesh.ipfsNode.PeerHost.ID() {
-				mesh.logger.Debugf("my ID, skip")
+				mesh.logger.Debugf("my ID, notifing stream handlers about my addrInfo")
+				for _, streamHandler := range mesh.streamHandlers {
+					streamHandler.SetMyAddrs(peerAddr.Addrs)
+				}
 				continue
 			}
 
@@ -605,9 +611,7 @@ func (mesh *Network) connector(ipfsCid cid.Cid) {
 }
 
 func (mesh *Network) start() (err error) {
-	defer func() {
-		err = errors.Wrap(err)
-	}()
+	defer func() { err = errors.Wrap(err) }()
 
 	mesh.logger.Debugf(`starting an IPFS node`)
 
@@ -634,6 +638,10 @@ func (mesh *Network) start() (err error) {
 			return err
 		}
 	}
+
+	mesh.logger.Debugf(`registering local discovery handler`)
+
+	mesh.ipfsNode.Discovery.RegisterNotifee(mesh)
 
 	mesh.logger.Debugf(`starting to listen for the input streams handler`)
 
@@ -725,18 +733,37 @@ func (mesh *Network) start() (err error) {
 }
 
 func (mesh *Network) Close() (err error) {
-	defer func() {
-		err = errors.Wrap(err)
-	}()
+	defer func() { err = errors.Wrap(err) }()
 	mesh.logger.Debugf(`closing an IPFS node`)
 	mesh.ipfsContextCancelFunc()
 	return mesh.ipfsNode.Close()
 }
 
+func (mesh *Network) handlePeerFound(addrInfo peer.AddrInfo) (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	mesh.logger.Debugf("handlerPeerFound: %v: connect with optimal path", addrInfo.ID)
+	stream := mesh.tryConnectByOptimalPath(nil, &addrInfo, false)
+
+	if stream != nil {
+		mesh.logger.Debugf("handlerPeerFound: %v: add stream", addrInfo.ID)
+		if err = mesh.addStream(stream, addrInfo); err != nil {
+			return
+		}
+	}
+
+	mesh.logger.Debugf("handlerPeerFound: %v: end", addrInfo.ID)
+	return
+}
+
+func (mesh *Network) HandlePeerFound(addrInfo peer.AddrInfo) {
+	if err := mesh.handlePeerFound(addrInfo); err != nil {
+		mesh.logger.Error(errors.Wrap(err))
+	}
+}
+
 func (mesh *Network) sendAuthData(stream Stream) (err error) {
-	defer func() {
-		err = errors.Wrap(err)
-	}()
+	defer func() { err = errors.Wrap(err) }()
 
 	var buf bytes.Buffer
 	buf.WriteString(string(mesh.ipfsNode.Identity))
@@ -752,9 +779,7 @@ func (mesh *Network) sendAuthData(stream Stream) (err error) {
 }
 
 func (mesh *Network) recvAndCheckAuthData(stream Stream) (err error) {
-	defer func() {
-		err = errors.Wrap(err)
-	}()
+	defer func() { err = errors.Wrap(err) }()
 
 	var buf bytes.Buffer
 	buf.WriteString(string(stream.Conn().RemotePeer()))
@@ -777,9 +802,7 @@ func (mesh *Network) recvAndCheckAuthData(stream Stream) (err error) {
 }
 
 func (mesh *Network) saveIPFSRepositoryConfig(cfg *ipfsConfig.Config) (err error) {
-	defer func() {
-		err = errors.Wrap(err)
-	}()
+	defer func() { err = errors.Wrap(err) }()
 
 	err = mesh.ipfsNode.Repo.SetConfig(cfg)
 	if err != nil {
@@ -790,9 +813,7 @@ func (mesh *Network) saveIPFSRepositoryConfig(cfg *ipfsConfig.Config) (err error
 }
 
 func (mesh *Network) addToKnownPeers(peerAddr AddrInfo) (err error) {
-	defer func() {
-		err = errors.Wrap(err)
-	}()
+	defer func() { err = errors.Wrap(err) }()
 
 	mesh.knownPeersLocker.Lock()
 	defer mesh.knownPeersLocker.Unlock()

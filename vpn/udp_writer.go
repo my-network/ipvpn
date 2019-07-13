@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"io"
 	"net"
 
 	"github.com/xaionaro-go/errors"
@@ -8,13 +9,15 @@ import (
 
 type udpWriter struct {
 	*net.UDPConn
-	addr *net.UDPAddr
+	addr       *net.UDPAddr
+	readCloser io.ReadCloser
 }
 
-func newUDPWriter(conn *net.UDPConn, addr *net.UDPAddr) *udpWriter {
+func newUDPWriter(conn *net.UDPConn, readCloser io.ReadCloser, addr *net.UDPAddr) *udpWriter {
 	return &udpWriter{
-		UDPConn: conn,
-		addr:    addr,
+		UDPConn:    conn,
+		addr:       addr,
+		readCloser: readCloser,
 	}
 }
 
@@ -24,4 +27,12 @@ func (w *udpWriter) Write(b []byte) (size int, err error) {
 		err = errors.Wrap(err)
 	}
 	return
+}
+
+func (w *udpWriter) Read(b []byte) (size int, err error) {
+	return w.readCloser.Read(b)
+}
+
+func (w *udpWriter) Close() error {
+	return w.readCloser.Close()
 }

@@ -1,5 +1,9 @@
 package vpn
 
+import (
+	"encoding/binary"
+)
+
 type MessageType uint16
 
 const (
@@ -8,4 +12,8 @@ const (
 	MessageTypePong
 	MessageTypeConfig
 	MessageTypePacket
+)
+
+var (
+	sizeOfMessageType = binary.Size(MessageTypePing)
 )

@@ -6,12 +6,17 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"golang.org/x/crypto/ed25519"
+	"io"
 
 	"github.com/xaionaro-go/errors"
 )
 
 var (
 	ErrInvalidSignature = errors.New(`invalid signature`)
+)
+
+var (
+	sizeOfMessagePing = binary.Size(MessagePing{})
 )
 
 type MessagePingData struct {
@@ -26,11 +31,19 @@ type MessagePing struct {
 
 func (pingData *MessagePingData) Bytes() []byte {
 	result := make([]byte, binary.Size(pingData))
-	err := binary.Write(bytes.NewBuffer(result), binary.LittleEndian, pingData)
+	err := pingData.Write(result)
 	if err != nil {
 		panic(err)
 	}
 	return result
+}
+
+func (pingData *MessagePingData) Write(b []byte) error {
+	return pingData.WriteTo(bytes.NewBuffer(b))
+}
+
+func (pingData *MessagePingData) WriteTo(writer io.Writer) error {
+	return binary.Write(writer, binary.LittleEndian, pingData)
 }
 
 func (ping *MessagePing) SignSender(privKey ed25519.PrivateKey) (err error) {
@@ -56,7 +69,7 @@ func (ping *MessagePing) VerifySender(pubKey ed25519.PublicKey) (err error) {
 
 func (ping *MessagePing) Bytes() []byte {
 	result := make([]byte, binary.Size(ping))
-	err := binary.Write(bytes.NewBuffer(result), binary.LittleEndian, ping)
+	err := ping.Write(result)
 	if err != nil {
 		panic(err)
 	}
@@ -69,4 +82,12 @@ func (ping *MessagePing) Read(b []byte) error {
 	}
 
 	return errors.Wrap(binary.Read(bytes.NewReader(b), binary.LittleEndian, ping))
+}
+
+func (ping *MessagePing) Write(b []byte) error {
+	return ping.WriteTo(bytes.NewBuffer(b))
+}
+
+func (ping *MessagePing) WriteTo(writer io.Writer) error {
+	return binary.Write(writer, binary.LittleEndian, ping)
 }
