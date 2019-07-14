@@ -19,9 +19,9 @@ An `ipvpn` node is also a full `ipfs` node, so it consumes some traffic backgrou
 # NAT traversal
 
 Used techniques:
- * [UPnP IGD](https://en.wikipedia.org/wiki/Internet_Gateway_Device_Protocol)
  * [UDP hole punching](https://en.wikipedia.org/wiki/UDP_hole_punching)
- * Relaying
+ * Planned: [UPnP IGD](https://en.wikipedia.org/wiki/Internet_Gateway_Device_Protocol)
+ * Planned: Relaying
 
 # Requirements
 
