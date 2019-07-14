@@ -49,7 +49,7 @@ ping -c 5 10.197.203.1
 * `my_unique_network_here` should be replaced by a name of you virtual private network
 * `my_password_here` should be replaced by some secret string
 
-That's it. If `my_unique_network_here` and `my_password_here` will match through all of our nodes then they will build an overlay
+That's it. If `my_unique_network_here` and `my_password_here` will match through all of your nodes then they will build an overlay
 network automatically. 
 
 # Similar projects
