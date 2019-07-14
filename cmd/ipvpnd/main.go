@@ -17,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/xaionaro-go/errors"
+	"github.com/xaionaro-go/pinentry"
 
 	"github.com/my-network/ipvpn/config"
 	"github.com/my-network/ipvpn/helpers"
@@ -164,9 +165,26 @@ func writeStringToFile(dir, path, data string, perms os.FileMode) error {
 	if err = file.Chmod(perms); err != nil {
 		return errors.Wrap(err, "unable to set permissions on file", filePath)
 	}
-	if _, err = file.WriteString(data); err != nil {
+	if _, err = file.WriteString(data+"\n"); err != nil {
 		return errors.Wrap(err, "unable to write to file", filePath)
 	}
+	return nil
+}
+
+func savePassword(dataDir string, newPassword []byte, cipher cipher.Block) error {
+	// This application is aimed on goofy computer users, so we encrypt the password
+	// just to protect it from being _accidentally_ transferred to third parties (like
+	// giving a not-wiped-up flash drive to a friend)
+	passwordEncryptedHex, err := encryptHex(cipher, newPassword)
+	if err != nil {
+		return errors.Wrap(err, "unable to encrypt&encode the password")
+	}
+
+	err = writeStringToFile(dataDir, "password.encrypted-hex", passwordEncryptedHex, 0400)
+	if err != nil {
+		return errors.Wrap(err, `unable to write the password to the file`)
+	}
+
 	return nil
 }
 
@@ -189,7 +207,26 @@ func main() {
 		logrus.Debugf("Configuration == %v", config.Get())
 	}
 	networkID, err := readStringFromFileTrim(dataDir, "network_id.txt")
-	fatalIf(err)
+	if err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()) {
+		pinentryClient, err := pinentry.NewPinentryClient()
+		fatalIf(err)
+
+		pinentryClient.SetTitle(`MyNet credentials`)
+		pinentryClient.SetPrompt(`My network name`)
+		pinentryClient.SetCancel(`Exit`)
+		pinentryClient.SetOK(`Next`)
+
+		var networkIDBytes []byte
+		networkIDBytes, err = pinentryClient.GetPin()
+		fatalIf(err)
+		pinentryClient.Close()
+
+		networkID = string(networkIDBytes)
+		err = writeStringToFile(dataDir, "network_id.txt", networkID, 0400)
+		fatalIf(err)
+	} else {
+		fatalIf(err)
+	}
 
 	cipher, err := aes.NewCipher(toSize([]byte(peerName), aes.BlockSize*2))
 	fatalIf(err)
@@ -203,23 +240,35 @@ func main() {
 	}
 	switch {
 	case err == nil:
-		// This application is aimed on goofy computer users, so we encrypt the password
-		// just to protect it from being _accidentally_ transferred to third parties (like
-		// giving a not-wiped-up flash drive to a friend)
-		passwordEncryptedHex, err := encryptHex(cipher, password)
-		fatalIf(errors.Wrap(err, "unable to encrypt&encode the password"))
-
-		err = writeStringToFile(dataDir, "password.encrypted-hex", passwordEncryptedHex, 0400)
+		err = savePassword(dataDir, password, cipher)
 		fatalIf(err)
 
 		_ = os.Remove(filepath.Join(dataDir, passwordSourceFile))
 		fatalIf(err)
 	case err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()):
 		passwordEncryptedHex, err := readStringFromFileTrim(dataDir, "password.encrypted-hex")
-		fatalIf(err)
+		switch {
+		case err == nil:
+			password, err = unhexDecrypt(cipher, passwordEncryptedHex)
+			fatalIf(errors.Wrap(err, "unable to decode&decrypt the password"))
+		case err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()):
+			pinentryClient, err := pinentry.NewPinentryClient()
+			fatalIf(err)
 
-		password, err = unhexDecrypt(cipher, passwordEncryptedHex)
-		fatalIf(errors.Wrap(err, "unable to decode&decrypt the password"))
+			pinentryClient.SetTitle(`MyNet credentials`)
+			pinentryClient.SetPrompt(`Password`)
+			pinentryClient.SetCancel(`Exit`)
+			pinentryClient.SetOK(`Enter`)
+			password, err = pinentryClient.GetPin()
+			fatalIf(err)
+			pinentryClient.Close()
+
+			err = savePassword(dataDir, password, cipher)
+			fatalIf(err)
+		default:
+			fatalIf(err)
+		}
+
 	default:
 		fatalIf(err)
 	}
