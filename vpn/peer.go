@@ -60,7 +60,7 @@ type Peer struct {
 	SimpleTunnelAddrToWG *net.UDPAddr
 	IsTrusted            TrustConfig
 	WgPubKey             wgtypes.Key
-	channelStatistics    [channelType_max]channelStatistics
+	channelStatistics    [ChannelType_max]channelStatistics
 }
 
 type Peers []*Peer
@@ -106,7 +106,7 @@ func (peer *Peer) Close() (err error) {
 	return
 }
 
-func (peer *Peer) Start(chType channelType) (err error) {
+func (peer *Peer) Start(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	peer.locker.Lock()
@@ -250,7 +250,7 @@ func (peer *Peer) replyWithPong(pingBytes []byte, writer io.Writer) (err error) 
 	return
 }
 
-func (peer *Peer) considerRTT(chType channelType, rtt time.Duration) (err error) {
+func (peer *Peer) considerRTT(chType ChannelType, rtt time.Duration) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	if rtt.Nanoseconds() < 0 {
@@ -277,7 +277,7 @@ func (peer *Peer) considerRTT(chType channelType, rtt time.Duration) (err error)
 	return
 }
 
-func (peer *Peer) considerPong(chType channelType, pong *MessagePong) (err error) {
+func (peer *Peer) considerPong(chType ChannelType, pong *MessagePong) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	recvTS := time.Now()
@@ -299,7 +299,7 @@ func (peer *Peer) considerPong(chType channelType, pong *MessagePong) (err error
 	return
 }
 
-func (peer *Peer) considerPongBytes(chType channelType, pongBytes []byte) (err error) {
+func (peer *Peer) considerPongBytes(chType ChannelType, pongBytes []byte) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	var pong MessagePong
@@ -333,14 +333,14 @@ func (peer *Peer) forwardPacketToWG(b []byte, writer io.Writer) (err error) {
 	return
 }
 
-func (peer *Peer) tunnelToWgForwarderLoop(chType channelType) {
+func (peer *Peer) tunnelToWgForwarderLoop(chType ChannelType) {
 	buffer := [peerBufferSize]byte{}
 
 	var conn io.ReadWriter
 	switch chType {
-	case channelTypeIPFS:
+	case ChannelTypeIPFS:
 		conn = newUDPWriter(peer.IPFSTunnelConnToWG, peer.IPFSStream, &peer.VPN.wgnets[chType].WGListenerAddr)
-	case channelTypeTunnel:
+	case ChannelTypeTunnel:
 		conn = newUDPWriter(peer.SimpleTunnelConnToWG, peer.SimpleTunnelConn, &peer.VPN.wgnets[chType].WGListenerAddr)
 	default:
 		panic(fmt.Errorf("invalid channel type: %v", chType))
@@ -398,24 +398,24 @@ func (peer *Peer) tunnelToWgForwarderLoop(chType channelType) {
 	}
 }
 
-func (peer *Peer) startTunnelReader(chType channelType) (err error) {
+func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	switch chType {
-	case channelTypeIPFS, channelTypeTunnel:
+	case ChannelTypeIPFS, ChannelTypeTunnel:
 		go peer.tunnelToWgForwarderLoop(chType)
 	}
 
 	return
 }
 
-func (peer *Peer) SendPing(chType channelType) (err error) {
+func (peer *Peer) SendPing(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	switch chType {
-	case channelTypeDirect:
+	case ChannelTypeDirect:
 		var remoteVPNIP net.IP
-		if remoteVPNIP, err = peer.VPN.GetIP(peer.IntAlias.Value, channelTypeDirect); err != nil {
+		if remoteVPNIP, err = peer.VPN.GetIP(peer.IntAlias.Value, ChannelTypeDirect); err != nil {
 			return
 		}
 		go func() {
@@ -428,12 +428,12 @@ func (peer *Peer) SendPing(chType channelType) (err error) {
 				peer.VPN.logger.Error(errors.Wrap(err))
 			}
 		}()
-	case channelTypeIPFS, channelTypeTunnel:
+	case ChannelTypeIPFS, ChannelTypeTunnel:
 		var writer io.Writer
 		switch chType {
-		case channelTypeIPFS:
+		case ChannelTypeIPFS:
 			writer = peer.IPFSStream
-		case channelTypeTunnel:
+		case ChannelTypeTunnel:
 			writer = peer.SimpleTunnelConn
 		}
 		if writer == nil {
@@ -461,17 +461,17 @@ func (peer *Peer) SendPing(chType channelType) (err error) {
 	return
 }
 
-func (peer *Peer) GetRemoteRealIP(chType channelType) net.IP {
+func (peer *Peer) GetRemoteRealIP(chType ChannelType) net.IP {
 	peer.locker.RLock()
 	defer peer.locker.RUnlock()
 
 	switch chType {
-	case channelTypeDirect:
+	case ChannelTypeDirect:
 		if peer.DirectAddr == nil {
 			return nil
 		}
 		return peer.DirectAddr.IP
-	case channelTypeIPFS:
+	case ChannelTypeIPFS:
 		if peer.IPFSStream == nil {
 			return nil
 		}
@@ -482,7 +482,7 @@ func (peer *Peer) GetRemoteRealIP(chType channelType) net.IP {
 			return nil
 		}
 		return net.ParseIP(addr4String)
-	case channelTypeTunnel:
+	case ChannelTypeTunnel:
 		if peer.SimpleTunnelConn == nil {
 			return nil
 		}
@@ -493,8 +493,8 @@ func (peer *Peer) GetRemoteRealIP(chType channelType) net.IP {
 	return nil
 }
 
-func (peer *Peer) GetOptimalChannel(chTypes ...channelType) (optimalChannelType channelType) {
-	optimalChannelType = channelType_undefined
+func (peer *Peer) GetOptimalChannel(chTypes ...ChannelType) (optimalChannelType ChannelType) {
+	optimalChannelType = ChannelType_undefined
 	minRTT := time.Duration(time.Hour)
 
 	for _, chType := range chTypes {
@@ -516,7 +516,7 @@ func (peer *Peer) GetOptimalChannel(chTypes ...channelType) (optimalChannelType 
 	return
 }
 
-func (peer *Peer) switchAutoroutedPathToChannel(chType channelType) (err error) {
+func (peer *Peer) switchAutoroutedPathToChannel(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	peer.VPN.logger.Infof("switching the auto-routed address for %v to %v", peer.ID, chType)
@@ -526,7 +526,7 @@ func (peer *Peer) switchAutoroutedPathToChannel(chType channelType) (err error) 
 	return
 }
 
-func (peer *Peer) toWireGuardConfig(chType channelType) (peerCfg wgtypes.PeerConfig, err error) {
+func (peer *Peer) toWireGuardConfig(chType ChannelType) (peerCfg wgtypes.PeerConfig, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	internalIP, err := peer.VPN.GetIP(peer.IntAlias.Value, chType)
@@ -554,11 +554,11 @@ func (peer *Peer) toWireGuardConfig(chType channelType) (peerCfg wgtypes.PeerCon
 	peer.VPN.logger.Debugf("peerCfg: %v", peerCfg)
 
 	switch chType {
-	case channelTypeDirect:
+	case ChannelTypeDirect:
 		peerCfg.Endpoint = peer.DirectAddr
-	case channelTypeIPFS:
+	case ChannelTypeIPFS:
 		peerCfg.Endpoint = peer.IPFSTunnelAddrToWG
-	case channelTypeTunnel:
+	case ChannelTypeTunnel:
 		peerCfg.Endpoint = peer.SimpleTunnelAddrToWG
 	}
 
@@ -677,11 +677,11 @@ func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) (err error) {
 	return
 }
 
-func (peer *Peer) startTunnelWriter(chType channelType) (err error) {
+func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	switch chType {
-	case channelTypeIPFS:
+	case ChannelTypeIPFS:
 		if peer.IPFSTunnelConnToWG, peer.IPFSTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
 			IP:   net.ParseIP(`127.0.0.1`),
 			Port: 0, // automatically assign a free port
@@ -689,7 +689,7 @@ func (peer *Peer) startTunnelWriter(chType channelType) (err error) {
 			return
 		}
 		go peer.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, peer.IPFSStream)
-	case channelTypeTunnel:
+	case ChannelTypeTunnel:
 		if peer.SimpleTunnelConnToWG, peer.SimpleTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
 			IP:   net.ParseIP(`127.0.0.1`),
 			Port: 0, // automatically assign a free port
@@ -702,7 +702,7 @@ func (peer *Peer) startTunnelWriter(chType channelType) (err error) {
 	return
 }
 
-func (peers Peers) ToWireGuardConfigs(chType channelType) (result []wgtypes.PeerConfig, err error) {
+func (peers Peers) ToWireGuardConfigs(chType ChannelType) (result []wgtypes.PeerConfig, err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	for _, peer := range peers {

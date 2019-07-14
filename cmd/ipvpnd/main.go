@@ -22,6 +22,7 @@ import (
 	"github.com/my-network/ipvpn/config"
 	"github.com/my-network/ipvpn/helpers"
 	"github.com/my-network/ipvpn/network"
+	"github.com/my-network/ipvpn/router"
 	"github.com/my-network/ipvpn/vpn"
 )
 
@@ -278,10 +279,14 @@ func main() {
 	_, subnet, err := net.ParseCIDR(config.Get().NetworkSubnet)
 	fatalIf(err)
 
+	routerInstance := router.NewRouter()
+
 	vpnLogger := &logger{"[vpn]", true, config.Get().DumpVPNCommunications}
 
 	vpnInstance, err := vpn.New(filepath.Join(dataDir, "int_alias.json"), *subnet, vpnLogger)
 	fatalIf(err)
+
+	routerInstance.Start(vpnInstance)
 
 	defer func() { _ = vpnInstance.Close() }()
 

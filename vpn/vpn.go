@@ -68,13 +68,14 @@ type VPN struct {
 	psk                                []byte
 	state                              uint32
 	wgctl                              *wgctrl.Client
-	wgnets                             [channelType_max]WGNet
+	wgnets                             [ChannelType_max]WGNet
 	directConnectorTrigger             chan struct{}
 	simpleTunnelListener               *net.UDPConn
 	simpleTunnelExternalListener       *net.UDPConn
 	simpleTunnelExternalListenerLocker sync.RWMutex
 	simpleTunnelReaderMap              atomicmap.Map
 	myExternalPort                     uint16
+	upperHandlers                      []UpperHandler
 
 	pingSenderLoopCancelFunc atomicmap.Map
 }
@@ -102,7 +103,7 @@ func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, er
 		maskOnes, maskBits := subnet.Mask.Size()
 		maskOnes += 2 // Splitting the subnet to 4, so in each mask amount of one's is increased to 2
 		newMask := net.CIDRMask(maskOnes, maskBits)
-		for idx, chType := range channelTypes {
+		for idx, chType := range ChannelTypes {
 			wgnet := &vpn.wgnets[chType]
 			wgnet.Subnet.IP, err = getIPByOffset(subnet.IP, uint64(idx)*1<<uint(maskBits-maskOnes))
 			wgnet.Subnet.Mask = newMask
@@ -139,9 +140,13 @@ func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, er
 	return
 }
 
+func (vpn *VPN) AddUpperHandler(upperHandler UpperHandler) {
+	vpn.upperHandlers = append(vpn.upperHandlers, upperHandler)
+}
+
 func (vpn *VPN) GetNetworkMaximalSize() uint64 {
 	addressLength := net.IPv6len * 8
-	subnet := vpn.wgnets[channelTypeDirect].Subnet
+	subnet := vpn.wgnets[ChannelTypeDirect].Subnet
 	_, bits := subnet.Mask.Size()
 	if subnet.IP.To4() != nil {
 		addressLength = net.IPv4len * 8
@@ -186,7 +191,7 @@ func getIPByOffset(subnetIP net.IP, offset uint64) (resultIP net.IP, err error) 
 	return
 }
 
-func (vpn *VPN) GetIP(intAlias uint64, chType channelType) (resultIP net.IP, err error) {
+func (vpn *VPN) GetIP(intAlias uint64, chType ChannelType) (resultIP net.IP, err error) {
 	defer func() { err = errors.Wrap(err) }()
 	defer func() { vpn.logger.Debugf("GetIP(%v, %v) -> %v, %v", intAlias, chType, resultIP, err) }()
 
@@ -200,7 +205,7 @@ func (vpn *VPN) GetIP(intAlias uint64, chType channelType) (resultIP net.IP, err
 	return getIPByOffset(subnet.IP, intAlias)
 }
 
-func (vpn *VPN) subnetContainsMultiaddr(maddr multiaddr.Multiaddr, chType channelType) bool {
+func (vpn *VPN) subnetContainsMultiaddr(maddr multiaddr.Multiaddr, chType ChannelType) bool {
 	addr4, err := maddr.ValueForProtocol(multiaddr.P_IP4)
 	if err != nil {
 		return false
@@ -210,10 +215,10 @@ func (vpn *VPN) subnetContainsMultiaddr(maddr multiaddr.Multiaddr, chType channe
 }
 
 func (vpn *VPN) IsBadAddress(maddr multiaddr.Multiaddr) bool {
-	return vpn.subnetContainsMultiaddr(maddr, channelTypeIPFS)
+	return vpn.subnetContainsMultiaddr(maddr, ChannelTypeIPFS)
 }
 
-func (vpn *VPN) GetMyIP(chType channelType) (net.IP, error) {
+func (vpn *VPN) GetMyIP(chType ChannelType) (net.IP, error) {
 	return vpn.GetIP(vpn.intAlias.Value, chType)
 }
 
@@ -238,7 +243,7 @@ func (vpn *VPN) Start() (err error) {
 		return ErrAlreadyStarted
 	}
 
-	for _, chType := range channelTypes {
+	for _, chType := range ChannelTypes {
 		vpn.wgnets[chType].IfaceName, err = wgcreate.Create(vpn.ifaceNamePrefix+chType.String(), defaultMTU, true, &device.Logger{
 			Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard-"+chType.String()+"] ", 0),
 			Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard-"+chType.String()+"] ", 0),
@@ -476,7 +481,7 @@ func (vpn *VPN) directConnectorLoop() {
 		// Measure latencies to peers
 
 		for _, peer := range vpn.getPeers() {
-			for _, chType := range channelTypes {
+			for _, chType := range ChannelTypes {
 				if pingErrI := peer.SendPing(chType); pingErrI != nil {
 					pingErr := pingErrI.(errors.SmartError)
 					if pingErr.OriginalError() != ErrWriterIsNil {
@@ -506,8 +511,8 @@ func (vpn *VPN) directConnectorLoop() {
 		// Setup direct connections
 
 		for _, peer := range vpn.getPeers() {
-			chType := peer.GetOptimalChannel(channelTypeTunnel, channelTypeIPFS)
-			if chType == channelType_undefined {
+			chType := peer.GetOptimalChannel(ChannelTypeTunnel, ChannelTypeIPFS)
+			if chType == ChannelType_undefined {
 				continue
 			}
 			newDirectAddr := peer.GetRemoteRealIP(chType)
@@ -518,7 +523,7 @@ func (vpn *VPN) directConnectorLoop() {
 					Port: ipvpnWGPortDirect,
 				}
 				go func(peer *Peer) {
-					err := peer.Start(channelTypeDirect)
+					err := peer.Start(ChannelTypeDirect)
 					if err != nil {
 						vpn.logger.Error(errors.Wrap(err))
 						return
@@ -531,8 +536,8 @@ func (vpn *VPN) directConnectorLoop() {
 		// Auto-routing (use the best channel for auto-routed addresses)
 
 		for _, peer := range vpn.getPeers() {
-			chType := peer.GetOptimalChannel(channelTypeDirect, channelTypeTunnel, channelTypeIPFS)
-			if chType == channelType_undefined {
+			chType := peer.GetOptimalChannel(ChannelTypeDirect, ChannelTypeTunnel, ChannelTypeIPFS)
+			if chType == ChannelType_undefined {
 				continue
 			}
 			err := peer.switchAutoroutedPathToChannel(chType)
@@ -597,13 +602,13 @@ func (vpn *VPN) Close() (err error) {
 	return
 }
 
-func (vpn *VPN) getWGPort(chType channelType) uint16 {
+func (vpn *VPN) getWGPort(chType ChannelType) uint16 {
 	switch chType {
-	case channelTypeDirect:
+	case ChannelTypeDirect:
 		return ipvpnWGPortDirect
-	case channelTypeIPFS:
+	case ChannelTypeIPFS:
 		return ipvpnWGPortIPFS
-	case channelTypeTunnel:
+	case ChannelTypeTunnel:
 		return ipvpnWGPortSimpleTunnel
 	default:
 		panic(fmt.Errorf(`shouldn't happened: %v`, chType))
@@ -617,7 +622,7 @@ func (vpn *VPN) updateWireGuardConfiguration() (err error) {
 		return
 	}
 
-	for _, chType := range channelTypes {
+	for _, chType := range ChannelTypes {
 		var peersCfg []wgtypes.PeerConfig
 		peersCfg, err = vpn.getPeers().ToWireGuardConfigs(chType)
 		if err != nil {
@@ -742,7 +747,7 @@ func (vpn *VPN) recvIntAliases(conn io.Reader) (remoteIntAliases IntAliases, err
 func (vpn *VPN) setupIfaceIPAddress() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	for _, chType := range channelTypes {
+	for _, chType := range ChannelTypes {
 		var myIP net.IP
 		myIP, err = vpn.GetMyIP(chType)
 		if err != nil {
@@ -1015,19 +1020,19 @@ func (vpn *VPN) newTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) 
 
 	remoteIntAliases[0].Timestamp = time.Now().Add(-remoteIntAliases[0].Since)
 
-	var chType channelType
+	var chType ChannelType
 	switch connTyped := conn.(type) {
 	case Stream:
-		chType = channelTypeIPFS
+		chType = ChannelTypeIPFS
 		_ = peer.SetIPFSStream(connTyped)
 	case *udpWriter:
-		chType = channelTypeTunnel
+		chType = ChannelTypeTunnel
 		_ = peer.SetSimpleTunnelConn(connTyped)
 	case *net.UDPConn:
-		chType = channelTypeTunnel
+		chType = ChannelTypeTunnel
 		_ = peer.SetSimpleTunnelConn(connTyped)
 	case *udpClientSocket:
-		chType = channelTypeTunnel
+		chType = ChannelTypeTunnel
 		_ = peer.SetSimpleTunnelConn(connTyped)
 	}
 
@@ -1161,7 +1166,7 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 	var addrs []*net.UDPAddr
 	for _, maddr := range peerAddr.Addrs {
 		toSkip := false
-		for _, chType := range channelTypes {
+		for _, chType := range ChannelTypes {
 			if vpn.subnetContainsMultiaddr(maddr, chType) {
 				vpn.logger.Debugf(`skipping multiaddr %v: an internal VPN %v address`, maddr.String(), chType)
 				toSkip = true

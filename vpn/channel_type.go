@@ -1,36 +1,36 @@
 package vpn
 
-type channelType uint8
+type ChannelType uint8
 
 const (
-	channelType_undefined = channelType(iota)
+	ChannelType_undefined = ChannelType(iota)
 
-	channelTypeDirect
-	channelTypeIPFS
-	channelTypeTunnel
+	ChannelTypeDirect
+	ChannelTypeIPFS
+	ChannelTypeTunnel
 
-	channelType_max
+	ChannelType_max
 
-	channelTypeAutoRouted
+	ChannelTypeAutoRouted
 )
 
 var (
-	channelTypes = []channelType{
-		channelTypeDirect,
-		channelTypeIPFS,
-		channelTypeTunnel,
+	ChannelTypes = []ChannelType{
+		ChannelTypeDirect,
+		ChannelTypeIPFS,
+		ChannelTypeTunnel,
 	}
 )
 
-func (chType channelType) String() string {
+func (chType ChannelType) String() string {
 	switch chType {
-	case channelType_undefined:
+	case ChannelType_undefined:
 		return `undefined`
-	case channelTypeDirect:
+	case ChannelTypeDirect:
 		return `direct`
-	case channelTypeIPFS:
+	case ChannelTypeIPFS:
 		return `ipfs`
-	case channelTypeTunnel:
+	case ChannelTypeTunnel:
 		return `tunnel`
 	default:
 		return `unknown-type`
