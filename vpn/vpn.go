@@ -362,8 +362,11 @@ func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
 
 		portStr, err := addr.ValueForProtocol(multiaddr.P_TCP)
 		if err != nil {
-			vpn.logger.Error(errors.Wrap(err, `unable to extract TCP port from address`, addr))
-			break
+			portStr, err = addr.ValueForProtocol(multiaddr.P_UDP)
+			if err != nil {
+				vpn.logger.Error(errors.Wrap(err, `unable to extract TCP/UDP port from address`, addr))
+				break
+			}
 		}
 		port, err := strconv.ParseInt(portStr, 10, 64)
 		if err != nil {

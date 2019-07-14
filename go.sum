@@ -23,8 +23,6 @@ github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412 h1:w1UutsfOrms1J05zt7I
 github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412/go.mod h1:WPjqKcmVOxf0XSf3YxCJs6N6AOSrOx3obionmG7T0y0=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
 github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
-github.com/andlabs/ui v0.0.0-20180902183112-867a9e5a498d h1:4ianvxb8s3oyizgjuWWxGuTAUU+6JStcvj6BuHS4PVY=
-github.com/andlabs/ui v0.0.0-20180902183112-867a9e5a498d/go.mod h1:5G2EjwzgZUPnnReoKvPWVneT8APYbyKkihDVAHUi0II=
 github.com/armon/consul-api v0.0.0-20180202201655-eb2c6b5be1b6/go.mod h1:grANhF5doyWs3UAsr3K4I6qtAmlQcZDesFNEHPZAzj8=
 github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24TaqPxmxbtue+5NUziq4I4S80YR8gNf3Q=
 github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
@@ -669,6 +667,8 @@ github.com/multiformats/go-multistream v0.1.0/go.mod h1:fJTiDfXJVmItycydCnNx4+wS
 github.com/mwitkow/go-conntrack v0.0.0-20161129095857-cc309e4a2223/go.mod h1:qRWi+5nqEBWmkhHvq77mSJWrCKwh8bxhgT7d/eI7P4U=
 github.com/my-network/go-libp2p-quic-transport v0.1.2-0.20190702052731-897c7bdaec45 h1:f+sTa9cjsx/C4FISv1EE+cnQduhx04KGYywkALxNfvA=
 github.com/my-network/go-libp2p-quic-transport v0.1.2-0.20190702052731-897c7bdaec45/go.mod h1:b7i8clT6YZVXMV2tJK54nF8pqbX36rpcFKlL3KfDjnY=
+github.com/my-network/routewrapper v0.0.0-20190714184510-90e66eda123f h1:TQjpUGwnIFtAU7A2X2Lo03l1Zfo1JV0FG7VHrJmRySg=
+github.com/my-network/routewrapper v0.0.0-20190714184510-90e66eda123f/go.mod h1:irMlupbw0Sx0i/f7kNXT4eqWD0QBRbc1Mf29N84nWx4=
 github.com/my-network/wgcreate v0.0.0-20190630182225-f046f71f7cbb h1:u4WJOrB1YqTwbv1mnjenjEZzU6hifTyy8F/WP9+H4lA=
 github.com/my-network/wgcreate v0.0.0-20190630182225-f046f71f7cbb/go.mod h1:COtYbR/zKgLlarU9Db2rGyQ/Zstb7b2sT04BCD6aQMI=
 github.com/my-network/wgcreate v0.0.0-20190707165004-31e33f68f780 h1:gJtkeHWULoYoYvVOqMxA7vbWLp/43/ikMvuIT/1mE/s=
