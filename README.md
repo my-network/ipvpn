@@ -23,6 +23,16 @@ Used techniques:
  * [UDP hole punching](https://en.wikipedia.org/wiki/UDP_hole_punching)
  * Relaying
 
+# Requirements
+
+## Run:
+
+* Linux or MacOS only, yet
+
+## Build:
+* Linux or MacOS only, yet
+* Go>=1.13
+
 # Quick start
 
 Just run on *all* your nodes (the sample commands):
