@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	e "errors"
 	"fmt"
+	"github.com/libp2p/go-libp2p-core/protocol"
 	"io"
 	"io/ioutil"
 	"log"
@@ -138,6 +139,13 @@ func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, er
 	}
 
 	return
+}
+
+func (vpn *VPN) SetNetwork(mesh *network.Network) {
+}
+
+func (vpn *VPN) ProtocolID() protocol.ID {
+	return `/p2p/github.com/my-network/ipvpn/vpn`
 }
 
 func (vpn *VPN) AddUpperHandler(upperHandler UpperHandler) {

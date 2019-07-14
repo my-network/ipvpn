@@ -1,8 +1,9 @@
-package main
+package ipvpn
 
 import (
-	"github.com/sirupsen/logrus"
 	"io"
+
+	"github.com/sirupsen/logrus"
 )
 
 type logger struct {

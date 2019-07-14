@@ -11,6 +11,7 @@ We use:
   - Node discovery (using their DHT).
   - Fallback connector (when it's impossible to connect nodes directly).
   - STUN-replacement (tools to pass-trough a NAT).
+  - Messenger (to send notification among nodes). 
 * [WireGuard](https://www.wireguard.com/). It's used as the VPN implementation. If OS doesn't support WireGuard then we
   detect it and use an userspace implementation.
 

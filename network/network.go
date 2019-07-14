@@ -798,6 +798,12 @@ func (mesh *Network) start() (err error) {
 		mesh.logger.Debugf("success %v", peerID)
 	})
 
+	for _, streamHandler := range mesh.streamHandlers {
+		mesh.ipfsNode.PeerHost.SetStreamHandler(streamHandler.ProtocolID(), func(stream Stream) {
+			streamHandler.NewStream(stream, AddrInfo{ID: stream.Conn().RemotePeer()})
+		})
+	}
+
 	go func() {
 		mesh.logger.Debugf(`Notifying streamHandlers (such as VPN handler) about previously known peers (count == %v)`, len(mesh.knownPeers))
 		mesh.knownPeersLocker.RLock()
@@ -1127,9 +1133,12 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 	mesh.logger.Debugf(`a good stream, saving (remote peer: %v)`, stream.Conn().RemotePeer())
 	mesh.streams.Store(stream.Conn().RemotePeer(), stream)
 
+	requiredProtocolID := p2pProtocolID + `/vpn`
 	for _, streamHandler := range mesh.streamHandlers {
-		streamHandler.NewStream(stream, peerAddr)
-		streamHandler.ConsiderKnownPeer(peerAddr)
+		if streamHandler.ProtocolID() == requiredProtocolID {
+			go streamHandler.NewStream(stream, peerAddr)
+		}
+		go streamHandler.ConsiderKnownPeer(peerAddr)
 	}
 
 	go func() {
@@ -1139,4 +1148,8 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 		}
 	}()
 	return
+}
+
+func (mesh *Network) NewStream(peerID peer.ID, protocolID p2pprotocol.ID) (stream Stream, err error) {
+	return mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, protocolID)
 }
