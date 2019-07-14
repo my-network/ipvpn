@@ -165,7 +165,7 @@ func writeStringToFile(dir, path, data string, perms os.FileMode) error {
 	if err = file.Chmod(perms); err != nil {
 		return errors.Wrap(err, "unable to set permissions on file", filePath)
 	}
-	if _, err = file.WriteString(data+"\n"); err != nil {
+	if _, err = file.WriteString(data + "\n"); err != nil {
 		return errors.Wrap(err, "unable to write to file", filePath)
 	}
 	return nil

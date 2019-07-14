@@ -252,7 +252,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 
 	logger.Debugf(`loading "known_peers.json"`)
 
-	var knownPeers KnownPeers
+	knownPeers := KnownPeers{}
 	{
 		knownPeersJSON, knownPeersReadError := ioutil.ReadFile(filepath.Join(cacheDir, `known_peers.json`))
 		logger.Debugf(`loading "known_peers.json" err == %v`, knownPeersReadError)
@@ -269,7 +269,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 	var swarmAddrInfos []AddrInfo
 	{
 		swarmAddrInfosJSON, swarmAddrInfosReadError := ioutil.ReadFile(filepath.Join(cacheDir, `swarm_peers.json`))
-		logger.Debugf(`loading "known_peers.json" err == %v`, swarmAddrInfosReadError)
+		logger.Debugf(`loading "swarm_peers.json" err == %v`, swarmAddrInfosReadError)
 		if swarmAddrInfosReadError == nil {
 			swarmAddrInfosParseError := json.Unmarshal(swarmAddrInfosJSON, &swarmAddrInfos)
 			if swarmAddrInfosParseError != nil {
@@ -316,7 +316,23 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 					// leave a "continue" here just in case.
 					continue
 				}
-				for _, maddr := range sitSpot.Addresses {
+				for _, maddrString := range sitSpot.Addresses {
+					maddr, err := multiaddr.NewMultiaddr(maddrString)
+					if err != nil {
+						logger.Error(errors.Wrap(err, `unable to parse MultiAddr`, maddrString))
+						continue
+					}
+					if ipString, err := maddr.ValueForProtocol(multiaddr.P_IP4); err == nil {
+						if net.ParseIP(ipString).IsLoopback() {
+							continue
+						}
+					}
+					if ipString, err := maddr.ValueForProtocol(multiaddr.P_IP6); err == nil {
+						if net.ParseIP(ipString).IsLoopback() {
+							continue
+						}
+					}
+
 					peerString := maddr.String() + `/ipfs/` + knownPeer.ID.String()
 
 					found := false
@@ -763,7 +779,13 @@ func (mesh *Network) start() (err error) {
 				if time.Since(sitSpot.LastSuccessfulHandshakeTS) > sitSpotExpireInterval {
 					continue
 				}
-				addresses = append(addresses, sitSpot.Addresses...)
+				for _, maddrString := range sitSpot.Addresses {
+					maddr, err := multiaddr.NewMultiaddr(maddrString)
+					if err != nil {
+						mesh.logger.Error(errors.Wrap(err, `unable to parse MultiAddr`, maddrString))
+					}
+					addresses = append(addresses, maddr)
+				}
 			}
 			for _, streamHandler := range mesh.streamHandlers {
 				streamHandler.ConsiderKnownPeer(AddrInfo{ID: knownPeer.ID, Addrs: addresses})
@@ -975,7 +997,7 @@ findSitSpot:
 	for _, oneSitSpot := range knownPeer.SitSpots {
 		for _, maddrOld := range oneSitSpot.Addresses {
 			for _, maddrNew := range peerAddr.Addrs {
-				if maddrOld.String() == maddrNew.String() {
+				if maddrOld == maddrNew.String() {
 					sitSpot = oneSitSpot
 					break findSitSpot
 				}
@@ -988,7 +1010,9 @@ findSitSpot:
 		knownPeer.SitSpots = append(knownPeer.SitSpots, sitSpot)
 	}
 
-	sitSpot.Addresses = peerAddr.Addrs
+	for _, maddr := range peerAddr.Addrs {
+		sitSpot.Addresses = append(sitSpot.Addresses, maddr.String())
+	}
 	sitSpot.LastSuccessfulHandshakeTS = time.Now()
 
 	knownPeersJSON, err := json.Marshal(mesh.knownPeers)

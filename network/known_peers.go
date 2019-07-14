@@ -2,7 +2,6 @@ package network
 
 import (
 	"encoding/json"
-	p2pcore "github.com/libp2p/go-libp2p-core"
 	p2ppeer "github.com/libp2p/go-libp2p-core/peer"
 	"time"
 )
@@ -13,7 +12,7 @@ type KnownPeer struct {
 }
 
 type KnownPeerSitSpot struct {
-	Addresses                 []p2pcore.Multiaddr
+	Addresses                 []string
 	LastSuccessfulHandshakeTS time.Time
 }
 
@@ -35,7 +34,7 @@ func (peers KnownPeers) Reset() error {
 	return nil
 }
 
-func (peers KnownPeers) UnmarshalJSON(b []byte) error {
+func (peers *KnownPeers) UnmarshalJSON(b []byte) error {
 	var slice []*KnownPeer
 	if err := json.Unmarshal(b, &slice); err != nil {
 		return err
@@ -44,7 +43,7 @@ func (peers KnownPeers) UnmarshalJSON(b []byte) error {
 	_ = peers.Reset()
 
 	for _, peer := range slice {
-		peers[peer.ID] = peer
+		(*peers)[peer.ID] = peer
 	}
 
 	return nil
