@@ -14,6 +14,8 @@ We use:
 * [WireGuard](https://www.wireguard.com/). It's used as the VPN implementation. If OS doesn't support WireGuard then we
   detect it and use an userspace implementation.
 
+An `ipvpn` node is also a full `ipfs` node, so it consumes some traffic background.
+
 # NAT traversal
 
 Used techniques:
