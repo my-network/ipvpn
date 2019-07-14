@@ -4,7 +4,6 @@ go 1.13
 
 require (
 	github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412
-	github.com/andlabs/ui v0.0.0-20180902183112-867a9e5a498d // indirect
 	github.com/caarlos0/env v3.5.0+incompatible
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/ipfs/go-cid v0.0.2
@@ -12,6 +11,7 @@ require (
 	github.com/ipfs/go-ipfs-config v0.0.6
 	github.com/libp2p/go-libp2p v0.2.0
 	github.com/libp2p/go-libp2p-core v0.0.6
+	github.com/libp2p/go-libp2p-kbucket v0.2.0
 	github.com/libp2p/go-libp2p-peer v0.2.0
 	github.com/multiformats/go-multiaddr v0.0.4
 	github.com/multiformats/go-multihash v0.0.6

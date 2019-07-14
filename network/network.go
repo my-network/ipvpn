@@ -22,6 +22,7 @@ import (
 	"github.com/ipfs/go-cid"
 	ipfsConfig "github.com/ipfs/go-ipfs-config"
 	"github.com/ipfs/go-ipfs/core"
+	"github.com/ipfs/go-ipfs/core/bootstrap"
 	"github.com/ipfs/go-ipfs/plugin/loader"
 	"github.com/ipfs/go-ipfs/repo"
 	"github.com/ipfs/go-ipfs/repo/fsrepo"
@@ -29,6 +30,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
 	p2pprotocol "github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/libp2p/go-libp2p-kbucket"
 	"github.com/libp2p/go-libp2p/p2p/discovery"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
@@ -56,6 +58,7 @@ type Network struct {
 	publicSharedKeyword        []byte
 	privateSharedKeyword       []byte
 	ipfsNode                   *core.IpfsNode
+	ipfsCfg                    *core.BuildCfg
 	ipfsContext                context.Context
 	ipfsContextCancelFunc      func()
 	streams                    sync.Map
@@ -401,6 +404,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 		publicSharedKeyword:   generatePublicSharedKeyword(networkName, psk),
 		privateSharedKeyword:  generatePrivateSharedKeyword(networkName, psk),
 		ipfsNode:              ipfsNode,
+		ipfsCfg:               ipfsCfg,
 		ipfsContext:           ctx,
 		ipfsContextCancelFunc: cancelFunc,
 		streamHandlers:        streamHandlers,
@@ -647,6 +651,32 @@ func (mesh *Network) considerPeerAddr(peerAddr AddrInfo) {
 	}
 }
 
+func (mesh *Network) pubSubBasedConnector(ipfsCid cid.Cid) {
+	subscription, err := mesh.ipfsNode.PubSub.Subscribe(ipfsCid.String())
+	if err != nil {
+		mesh.logger.Error(errors.Wrap(err, `unable to subscriber via PubSub`))
+		return
+	}
+	for {
+		msg, err := subscription.Next(mesh.ipfsContext)
+		if err != nil {
+			mesh.logger.Debugf("subscription.Next() -> %v", err)
+			return
+		}
+
+		sourceID := msg.GetFrom()
+		mesh.logger.Debugf(`got pubsub message from %v`, sourceID)
+		addrInfo, err := mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, sourceID)
+		if err != nil {
+			mesh.logger.Debugf(`pubSubBasedConnector: FindPeer(..., "%v"): %v`, sourceID, err)
+			continue
+		}
+
+		mesh.logger.Debugf(`pubSubBasedConnector: considerPeerAddr...`)
+		mesh.considerPeerAddr(addrInfo)
+	}
+}
+
 func (mesh *Network) dhtBasedConnector(ipfsCid cid.Cid) {
 	mesh.logger.Debugf(`initializing output streams`)
 
@@ -803,10 +833,40 @@ func (mesh *Network) start() (err error) {
 	}()
 
 	go mesh.dhtBasedConnector(ipfsCid)
+	go mesh.pubSubBasedConnector(ipfsCid)
 
-	mesh.logger.Infof(`My ID: %v        Calling IPFS "DHT.Provide()" on the shared key (that will be used for the node discovery), Cid: %v`, mesh.ipfsNode.PeerHost.ID(), ipfsCid)
+	mesh.logger.Infof(`My ID: %v        Calling IPFS "DHT.Provide()"/"PubSub.Publish()" on the shared key (that will be used for the node discovery), Cid: %v`, mesh.ipfsNode.PeerHost.ID(), ipfsCid)
 
-	err = mesh.ipfsNode.DHT.Provide(mesh.ipfsContext, ipfsCid, true)
+	mesh.logger.Debugf("Routing.Publish()...")
+	err = mesh.ipfsNode.PubSub.Publish(ipfsCid.String(), ipfsCid.Bytes())
+	if err != nil {
+		mesh.logger.Debugf("Routing.Publish() -> %v", err)
+	}
+	for i := 1; i < 120; i++ {
+		err = mesh.ipfsNode.Routing.Bootstrap(mesh.ipfsContext)
+		if err != nil {
+			mesh.logger.Debugf("mesh.ipfsNode.Routing.Bootstrap(mesh.ipfsContext) -> %v", err)
+		}
+
+		mesh.logger.Debugf("Routing.Provide()")
+		err = mesh.ipfsNode.Routing.Provide(mesh.ipfsContext, ipfsCid, true)
+		if err == kbucket.ErrLookupFailure {
+			mesh.logger.Debugf("Got kbucket.ErrLookupFailure, retry in one second. It was try #%v", i)
+			err = mesh.ipfsNode.Bootstrap(bootstrap.BootstrapConfig{
+				ConnectionTimeout: time.Duration(i) * time.Second,
+				MinPeerThreshold:  10,
+				Period:            time.Minute,
+			})
+			if err != nil {
+				mesh.logger.Debugf("unable to re-bootstrap: %v", err)
+			}
+			time.Sleep(time.Duration(i) * time.Second)
+			continue
+		}
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return
 	}
@@ -820,7 +880,6 @@ func (mesh *Network) start() (err error) {
 
 	go func() {
 		go mesh.updateMyAddrInfo()
-		mesh.saveSwarmPeersAsBootstrapPeers()
 		ticker := time.NewTicker(time.Hour)
 		for {
 			select {
