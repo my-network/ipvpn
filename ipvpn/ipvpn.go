@@ -16,10 +16,13 @@ import (
 	"github.com/denisbrodbeck/machineid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/asaskevich/EventBus"
+
 	"github.com/xaionaro-go/errors"
 	"github.com/xaionaro-go/pinentry"
 
 	"github.com/my-network/ipvpn/config"
+	"github.com/my-network/ipvpn/eventbus"
 	"github.com/my-network/ipvpn/helpers"
 	"github.com/my-network/ipvpn/network"
 	"github.com/my-network/ipvpn/router"
@@ -184,9 +187,10 @@ func savePassword(dataDir string, newPassword []byte, cipher cipher.Block) error
 }
 
 type IPVPN struct {
-	Network *network.Network
-	VPN     *vpn.VPN
-	Router  *router.Router
+	Network  *network.Network
+	VPN      *vpn.VPN
+	Router   *router.Router
+	EventBus eventbus.EventBus
 }
 
 func NewIPVPN() (ipvpn *IPVPN, err error) {
@@ -308,9 +312,11 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 		return
 	}
 
+	ipvpn.EventBus = EventBus.New()
+
 	vpnLogger := &logger{"[vpn]", true, config.Get().DumpVPNCommunications}
 
-	ipvpn.VPN, err = vpn.New(filepath.Join(dataDir, "int_alias.json"), *subnet, vpnLogger)
+	ipvpn.VPN, err = vpn.New(ipvpn.EventBus, filepath.Join(dataDir, "int_alias.json"), *subnet, vpnLogger)
 	if err != nil {
 		return
 	}
@@ -320,14 +326,12 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 	agreeToBeRelay := false
 
 	routerLogger := &logger{"[router]", true, config.Get().DumpNetworkCommunications}
-	ipvpn.Router = router.NewRouter(routerLogger)
+	ipvpn.Router = router.NewRouter(ipvpn.EventBus, routerLogger)
 
-	ipvpn.Network, err = network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), agreeToBeRelay, netLogger, ipvpn.VPN, ipvpn.Router)
+	ipvpn.Network, err = network.New(ipvpn.EventBus, networkID, passwordHash, filepath.Join(dataDir, "network"), agreeToBeRelay, netLogger)
 	if err != nil {
 		return
 	}
-
-	ipvpn.VPN.AddUpperHandler(ipvpn.Router)
 
 	return
 }
@@ -337,5 +341,6 @@ func (ipvpn *IPVPN) Close() error {
 	_ = ipvpn.VPN.Close()
 	_ = ipvpn.Network.Close()
 
+	ipvpn.EventBus.Publish(eventbus.TopicFromApplicationClose)
 	return nil
 }

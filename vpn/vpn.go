@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	e "errors"
 	"fmt"
-	"github.com/libp2p/go-libp2p-core/protocol"
 	"io"
 	"io/ioutil"
 	"log"
@@ -21,7 +20,9 @@ import (
 
 	"github.com/agl/ed25519/extra25519"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/my-network/ipvpn/eventbus"
 	"github.com/my-network/ipvpn/network"
 	"github.com/my-network/wgcreate"
 	"github.com/xaionaro-go/atomicmap"
@@ -57,6 +58,7 @@ type Stream = network.Stream
 type AddrInfo = network.AddrInfo
 
 type VPN struct {
+	eventBus                           eventbus.EventBus
 	logger                             Logger
 	myID                               peer.ID
 	ifaceNamePrefix                    string
@@ -76,12 +78,11 @@ type VPN struct {
 	simpleTunnelExternalListenerLocker sync.RWMutex
 	simpleTunnelReaderMap              atomicmap.Map
 	myExternalPort                     uint16
-	upperHandlers                      []UpperHandler
 
 	pingSenderLoopCancelFunc atomicmap.Map
 }
 
-func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) {
+func New(eventBus eventbus.EventBus, intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) {
 	defer func() {
 		if err != nil {
 			err = errors.Wrap(err)
@@ -90,6 +91,7 @@ func New(intAliasFilePath string, subnet net.IPNet, logger Logger) (vpn *VPN, er
 	}()
 
 	vpn = &VPN{
+		eventBus:               eventBus,
 		logger:                 logger,
 		intAliasFilePath:       intAliasFilePath,
 		ifaceNamePrefix:        ipvpnIfaceNamePrefix,
@@ -146,10 +148,6 @@ func (vpn *VPN) SetNetwork(mesh *network.Network) {
 
 func (vpn *VPN) ProtocolID() protocol.ID {
 	return `/p2p/github.com/my-network/ipvpn/vpn`
-}
-
-func (vpn *VPN) AddUpperHandler(upperHandler UpperHandler) {
-	vpn.upperHandlers = append(vpn.upperHandlers, upperHandler)
 }
 
 func (vpn *VPN) GetNetworkMaximalSize() uint64 {
@@ -249,6 +247,11 @@ func (vpn *VPN) Start() (err error) {
 
 	if !atomic.CompareAndSwapUint32(&vpn.state, 0, 1) {
 		return ErrAlreadyStarted
+	}
+
+	err = vpn.eventBus.Subscribe(eventbus.TopicFromNetworkNewStream(vpn.ProtocolID()), vpn.NewStream)
+	if err != nil {
+		return
 	}
 
 	for _, chType := range ChannelTypes {

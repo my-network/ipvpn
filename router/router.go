@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"github.com/my-network/ipvpn/eventbus"
 	"golang.org/x/crypto/ed25519"
 	"math"
 	"net"
@@ -22,6 +23,7 @@ const (
 )
 
 type Router struct {
+	eventBus eventbus.EventBus
 	context   context.Context
 	stopFunc  context.CancelFunc
 	locker    sync.RWMutex
@@ -31,13 +33,14 @@ type Router struct {
 	peers     atomicmap.Map
 }
 
-func NewRouter(logger Logger) *Router {
+func New(eventBus eventbus.EventBus, logger Logger) *Router {
 	routeMgmt, err := routewrapper.NewRouteWrapper()
 	if err != nil {
 		panic(err)
 	}
 
 	router := &Router{
+		eventBus:eventBus,
 		routeMgmt: routeMgmt,
 		logger:    logger,
 		peers:     atomicmap.New(),

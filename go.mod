@@ -4,6 +4,7 @@ go 1.13
 
 require (
 	github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412
+	github.com/asaskevich/EventBus v0.0.0-20180315140547-d46933a94f05
 	github.com/caarlos0/env v3.5.0+incompatible
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/ipfs/go-cid v0.0.2

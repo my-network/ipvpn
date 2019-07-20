@@ -34,6 +34,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
+	"github.com/my-network/ipvpn/eventbus"
 	"github.com/xaionaro-go/errors"
 )
 
@@ -52,6 +53,7 @@ var (
 )
 
 type Network struct {
+	eventBus                   eventbus.EventBus
 	cacheDir                   string
 	logger                     Logger
 	networkName                string
@@ -62,7 +64,6 @@ type Network struct {
 	ipfsContext                context.Context
 	ipfsContextCancelFunc      func()
 	streams                    sync.Map
-	streamHandlers             []StreamHandler
 	callPathOptimizerCount     sync.Map
 	badConnectionCount         sync.Map
 	forbidOutcomingConnections sync.Map
@@ -217,7 +218,7 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 	return
 }
 
-func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, logger Logger, streamHandlers ...StreamHandler) (mesh *Network, err error) {
+func New(eventBus eventbus.EventBus, networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, logger Logger) (mesh *Network, err error) {
 	defer func() {
 		if err != nil {
 			mesh = nil
@@ -398,6 +399,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 	}
 
 	mesh = &Network{
+		eventBus:              eventBus,
 		cacheDir:              cacheDir,
 		logger:                logger,
 		networkName:           networkName,
@@ -407,7 +409,6 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 		ipfsCfg:               ipfsCfg,
 		ipfsContext:           ctx,
 		ipfsContextCancelFunc: cancelFunc,
-		streamHandlers:        streamHandlers,
 		knownPeers:            knownPeers,
 	}
 
@@ -589,9 +590,7 @@ func (mesh *Network) considerPeerAddr(peerAddr AddrInfo) {
 			return
 		}
 		//mesh.logger.Debugf("my ID, notifing stream handlers about my addrInfo: %v", peerAddr.Addrs)
-		for _, streamHandler := range mesh.streamHandlers {
-			streamHandler.SetMyAddrs(peerAddr.Addrs)
-		}
+		mesh.eventBus.Publish(eventbus.TopicFromNetworkSetMyAddrs, peerAddr.Addrs)
 		return
 	}
 
@@ -701,8 +700,70 @@ func (mesh *Network) dhtBasedConnector(ipfsCid cid.Cid) {
 	}
 }
 
+func (mesh *Network) SetStreamHandler(protocolID p2pprotocol.ID, streamHandler func(stream Stream, addrInfo AddrInfo)) {
+	mesh.ipfsNode.PeerHost.SetStreamHandler(protocolID, func(stream Stream) {
+		streamHandler(stream, AddrInfo{ID: stream.Conn().RemotePeer()})
+	})
+}
+
+func (mesh *Network) ModuleName() string {
+	return `Network`
+}
+
+func (mesh *Network) eventBusSendPong(moduleName string) {
+	eventbus.SendPong(mesh.eventBus, mesh.ModuleName(), moduleName)
+}
+
+func (mesh *Network) subscribe() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	err = mesh.eventBus.Subscribe(eventbus.TopicPing(mesh.ModuleName()), mesh.eventBusSendPong)
+	if err != nil {
+		return err
+	}
+
+	err = mesh.eventBus.Subscribe(eventbus.TopicToNetworkSetStreamHandler, mesh.SetStreamHandler)
+	if err != nil {
+		return err
+	}
+
+	return
+}
+
+func (mesh *Network) unsubscribe() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	err = mesh.eventBus.Unsubscribe(eventbus.TopicPing(mesh.ModuleName()), mesh.eventBusSendPong)
+	if err != nil {
+		return err
+	}
+
+	err = mesh.eventBus.Unsubscribe(eventbus.TopicToNetworkSetStreamHandler, mesh.SetStreamHandler)
+	if err != nil {
+		return err
+	}
+
+	return
+}
+
 func (mesh *Network) start() (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	mesh.logger.Debugf(`Waiting for VPN module`)
+
+	waitingForVPN := true
+	err = mesh.eventBus.SubscribeOnce(eventbus.TopicPong(mesh.ModuleName()), func(moduleName string) {
+		if moduleName == `vpn` {
+			waitingForVPN = false
+		}
+	})
+	if err != nil {
+		return
+	}
+	for waitingForVPN {
+		mesh.eventBus.Publish(eventbus.TopicPing(`vpn`), mesh.ModuleName())
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	mesh.logger.Debugf(`starting an IPFS node`)
 
@@ -714,21 +775,16 @@ func (mesh *Network) start() (err error) {
 		return
 	}
 
-	mesh.logger.Debugf(`sending configuration stream handlers`)
+	mesh.logger.Debugf(`sending configuration through the eventbus`)
 
-	for _, streamHandler := range mesh.streamHandlers {
-		streamHandler.SetID(mesh.ipfsNode.PeerHost.ID())
-		streamHandler.SetPSK(mesh.privateSharedKeyword)
-		privKey, err := mesh.ipfsNode.PrivateKey.Raw()
-		if err != nil {
-			return err
-		}
-		streamHandler.SetPrivateKey(privKey)
-		err = streamHandler.Start()
-		if err != nil {
-			return err
-		}
+	privKey, err := mesh.ipfsNode.PrivateKey.Raw()
+	if err != nil {
+		return err
 	}
+	mesh.eventBus.Publish(eventbus.TopicFromNetworkSetMyID, mesh.ipfsNode.PeerHost.ID())
+	mesh.eventBus.Publish(eventbus.TopicFromNetworkSetPSK, mesh.privateSharedKeyword)
+	mesh.eventBus.Publish(eventbus.TopicFromNetworkSetPrivateKey, privKey)
+	mesh.eventBus.Publish(eventbus.TopicFromNetworkReady)
 
 	mesh.logger.Debugf(`registering local discovery handler`)
 
@@ -798,14 +854,13 @@ func (mesh *Network) start() (err error) {
 		mesh.logger.Debugf("success %v", peerID)
 	})
 
-	for _, streamHandler := range mesh.streamHandlers {
-		mesh.ipfsNode.PeerHost.SetStreamHandler(streamHandler.ProtocolID(), func(stream Stream) {
-			streamHandler.NewStream(stream, AddrInfo{ID: stream.Conn().RemotePeer()})
-		})
+	err = mesh.subscribe()
+	if err != nil {
+		return
 	}
 
 	go func() {
-		mesh.logger.Debugf(`Notifying streamHandlers (such as VPN handler) about previously known peers (count == %v)`, len(mesh.knownPeers))
+		mesh.logger.Debugf(`Notifying through the eventbus about previously known peers (count == %v)`, len(mesh.knownPeers))
 		mesh.knownPeersLocker.RLock()
 		defer mesh.knownPeersLocker.RUnlock()
 
@@ -823,9 +878,7 @@ func (mesh *Network) start() (err error) {
 					addresses = append(addresses, maddr)
 				}
 			}
-			for _, streamHandler := range mesh.streamHandlers {
-				streamHandler.ConsiderKnownPeer(AddrInfo{ID: knownPeer.ID, Addrs: addresses})
-			}
+			mesh.eventBus.Publish(eventbus.TopicFromNetworkConsiderKnownPeer, AddrInfo{ID: knownPeer.ID, Addrs: addresses})
 		}
 	}()
 
@@ -903,6 +956,10 @@ func (mesh *Network) Close() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 	mesh.logger.Debugf(`closing an IPFS node`)
 	mesh.ipfsContextCancelFunc()
+	err = mesh.unsubscribe()
+	if err != nil {
+		panic(`unable to unsubscribe`)
+	}
 	return mesh.ipfsNode.Close()
 }
 
@@ -1133,13 +1190,8 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 	mesh.logger.Debugf(`a good stream, saving (remote peer: %v)`, stream.Conn().RemotePeer())
 	mesh.streams.Store(stream.Conn().RemotePeer(), stream)
 
-	requiredProtocolID := p2pProtocolID + `/vpn`
-	for _, streamHandler := range mesh.streamHandlers {
-		if streamHandler.ProtocolID() == requiredProtocolID {
-			go streamHandler.NewStream(stream, peerAddr)
-		}
-		go streamHandler.ConsiderKnownPeer(peerAddr)
-	}
+	mesh.eventBus.Publish(eventbus.TopicFromNetworkNewStream(p2pProtocolID + `/vpn`), stream, peerAddr)
+	mesh.eventBus.Publish(eventbus.TopicFromNetworkConsiderKnownPeer, peerAddr)
 
 	go func() {
 		err = mesh.addToKnownPeers(peerAddr)
