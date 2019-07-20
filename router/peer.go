@@ -64,9 +64,11 @@ func (peer *Peer) startOutgoingConnection() {
 		if peer.streamOutgoing != nil {
 			panic(`peer.streamOutgoing != nil`)
 		}
-		peer.streamOutgoing = helpers.NewReconnectableStream(peer.router.logger, func() (Stream, error) {
+		streamOutgoing := helpers.NewReconnectableStream(peer.router.logger, func() (Stream, error) {
 			return peer.router.mesh.NewStream(peer.id, peer.router.ProtocolID())
 		})
+		go streamOutgoing.Connect()
+		peer.streamOutgoing = streamOutgoing
 	})
 }
 

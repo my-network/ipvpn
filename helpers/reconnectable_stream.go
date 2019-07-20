@@ -19,12 +19,10 @@ func NewReconnectableStream(logger Logger, newFunc func() (Stream, error)) *Reco
 		newFunc: newFunc,
 	}
 
-	go stream.connect()
-
 	return stream
 }
 
-func (stream *ReconnectableStream) connect() {
+func (stream *ReconnectableStream) Connect() {
 	for {
 		streamRaw, err := stream.newFunc()
 		if err != nil {

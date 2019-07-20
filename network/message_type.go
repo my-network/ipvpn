@@ -7,4 +7,5 @@ const (
 	MessageTypeOK
 	MessageTypeStopConnectionOnYourSide
 	MessageTypeDontReconnect
+	MessageTypeCustom
 )

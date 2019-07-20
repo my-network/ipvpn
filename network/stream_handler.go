@@ -12,8 +12,9 @@ type StreamHandler interface {
 
 	ProtocolID() protocol.ID
 
-	NewStream(stream Stream, peerAddr AddrInfo)
+	NewIncomingStream(stream Stream, peerAddr AddrInfo)
 	ConsiderKnownPeer(peerAddr AddrInfo)
+	OnPeerConnect(peer.ID)
 
 	SetID(id peer.ID)
 	SetPrivateKey(privKey ed25519.PrivateKey)

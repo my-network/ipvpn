@@ -31,7 +31,7 @@ type Router struct {
 	peers     atomicmap.Map
 }
 
-func NewRouter(logger Logger) *Router {
+func New(logger Logger) *Router {
 	routeMgmt, err := routewrapper.NewRouteWrapper()
 	if err != nil {
 		panic(err)
@@ -76,8 +76,8 @@ func (router *Router) OnUpdateMyIP(ip net.IP) {
 
 }
 
-func (router *Router) OnPeerConnect(peerID PeerID, chType vpn.ChannelType, ip net.IP) {
-	router.logger.Debugf(`OnPeerConnect(%v, %v, %v)`, peerID, chType, ip)
+func (router *Router) OnNewRoute(peerID PeerID, chType vpn.ChannelType, ip net.IP) {
+	router.logger.Debugf(`OnNewRoute(%v, %v, %v)`, peerID, chType, ip)
 
 	router.considerNewRoute(router.createPeerIfNotExists(peerID), chType, ip)
 }
@@ -202,7 +202,7 @@ func (router *Router) considerNewRoute(peer *Peer, chType vpn.ChannelType, ip ne
 	}
 }
 
-func (router *Router) NewStream(stream Stream, peerAddr AddrInfo) {
+func (router *Router) NewIncomingStream(stream Stream, peerAddr AddrInfo) {
 	router.logger.Debugf(`new stream from %v`, peerAddr.ID)
 	peer := router.createPeerIfNotExists(peerAddr.ID)
 
@@ -216,7 +216,11 @@ func (router *Router) NewStream(stream Stream, peerAddr AddrInfo) {
 	})
 }
 
-func (router *Router) OnPeerDisconnect(peerID PeerID, chType vpn.ChannelType) {
+func (router *Router) OnRemoveRoute(peerID PeerID, chType vpn.ChannelType) {
+
+}
+
+func (router *Router) OnPeerConnect(peerID PeerID) {
 
 }
 

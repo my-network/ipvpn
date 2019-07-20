@@ -52,7 +52,8 @@ type Peer struct {
 	AddrInfo             AddrInfo
 	IntAlias             IntAlias
 	DirectAddr           *net.UDPAddr
-	IPFSStream           Stream
+	IPFSStreamIngoing    Stream
+	IPFSStreamOutgoing   Stream
 	IPFSTunnelAddrToWG   *net.UDPAddr
 	IPFSTunnelConnToWG   *net.UDPConn
 	SimpleTunnelConn     net.Conn
@@ -61,6 +62,11 @@ type Peer struct {
 	IsTrusted            TrustConfig
 	WgPubKey             wgtypes.Key
 	channelStatistics    [ChannelType_max]channelStatistics
+
+	ingoingStreamTunnelWriterRunning  bool
+	outgoingStreamTunnelWriterRunning bool
+	ingoingStreamTunnelReaderRunning  bool
+	outgoingStreamTunnelReaderRunning bool
 }
 
 type Peers []*Peer
@@ -71,7 +77,12 @@ func (peer *Peer) Close() (err error) {
 	peer.locker.Lock()
 	defer peer.locker.Unlock()
 
-	err = peer.IPFSStream.Close()
+	err = peer.IPFSStreamIngoing.Close()
+	if err != nil {
+		peer.VPN.logger.Error(errors.Wrap(err))
+	}
+
+	err = peer.IPFSStreamOutgoing.Close()
 	if err != nil {
 		peer.VPN.logger.Error(errors.Wrap(err))
 	}
@@ -333,18 +344,8 @@ func (peer *Peer) forwardPacketToWG(b []byte, writer io.Writer) (err error) {
 	return
 }
 
-func (peer *Peer) tunnelToWgForwarderLoop(chType ChannelType) {
+func (peer *Peer) tunnelToWgForwarderLoop(chType ChannelType, conn io.ReadWriteCloser) {
 	buffer := [peerBufferSize]byte{}
-
-	var conn io.ReadWriter
-	switch chType {
-	case ChannelTypeIPFS:
-		conn = newUDPWriter(peer.IPFSTunnelConnToWG, peer.IPFSStream, &peer.VPN.wgnets[chType].WGListenerAddr)
-	case ChannelTypeTunnel:
-		conn = newUDPWriter(peer.SimpleTunnelConnToWG, peer.SimpleTunnelConn, &peer.VPN.wgnets[chType].WGListenerAddr)
-	default:
-		panic(fmt.Errorf("invalid channel type: %v", chType))
-	}
 
 	for {
 		size, err := conn.Read(buffer[:])
@@ -401,9 +402,33 @@ func (peer *Peer) tunnelToWgForwarderLoop(chType ChannelType) {
 func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	peer.locker.Lock()
+	defer peer.locker.Unlock()
+
 	switch chType {
-	case ChannelTypeIPFS, ChannelTypeTunnel:
-		go peer.tunnelToWgForwarderLoop(chType)
+	case ChannelTypeIPFS:
+		if peer.IPFSStreamIngoing != nil && !peer.ingoingStreamTunnelReaderRunning {
+			peer.ingoingStreamTunnelReaderRunning = true
+			ingoingConn := newUDPWriter(peer.IPFSTunnelConnToWG, peer.IPFSStreamIngoing, &peer.VPN.wgnets[chType].WGListenerAddr)
+			go func() {
+				peer.tunnelToWgForwarderLoop(chType, ingoingConn)
+				peer.ingoingStreamTunnelReaderRunning = false
+			}()
+		}
+
+		if peer.IPFSStreamOutgoing != nil && !peer.outgoingStreamTunnelReaderRunning {
+			peer.outgoingStreamTunnelReaderRunning = true
+			outgoingConn := newUDPWriter(peer.IPFSTunnelConnToWG, peer.IPFSStreamOutgoing, &peer.VPN.wgnets[chType].WGListenerAddr)
+			go func() {
+				peer.tunnelToWgForwarderLoop(chType, outgoingConn)
+				peer.outgoingStreamTunnelReaderRunning = false
+			}()
+		}
+	case ChannelTypeTunnel:
+		conn := newUDPWriter(peer.SimpleTunnelConnToWG, peer.SimpleTunnelConn, &peer.VPN.wgnets[chType].WGListenerAddr)
+		go peer.tunnelToWgForwarderLoop(chType, conn)
+	default:
+		panic(fmt.Errorf("invalid channel type: %v", chType))
 	}
 
 	return
@@ -432,7 +457,7 @@ func (peer *Peer) SendPing(chType ChannelType) (err error) {
 		var writer io.Writer
 		switch chType {
 		case ChannelTypeIPFS:
-			writer = peer.IPFSStream
+			writer = peer.IPFSStream()
 		case ChannelTypeTunnel:
 			writer = peer.SimpleTunnelConn
 		}
@@ -472,10 +497,11 @@ func (peer *Peer) GetRemoteRealIP(chType ChannelType) net.IP {
 		}
 		return peer.DirectAddr.IP
 	case ChannelTypeIPFS:
-		if peer.IPFSStream == nil {
+		ipfsStream := peer.IPFSStream()
+		if ipfsStream == nil {
 			return nil
 		}
-		maddr := peer.IPFSStream.Conn().RemoteMultiaddr()
+		maddr := ipfsStream.Conn().RemoteMultiaddr()
 		addr4String, err := maddr.ValueForProtocol(multiaddr.P_IP4)
 		if err != nil {
 			peer.VPN.logger.Debugf(`unable to parse IPv4 address from multiaddr %v`, maddr)
@@ -601,6 +627,11 @@ func (peer *Peer) wgToTunnelForwarderLoop(wgConn io.Reader, tunnelConn io.Writer
 			}
 			return
 		}
+
+		if err != nil {
+			peer.VPN.logger.Infof(`unable to write to tunnel connection: %v`, err)
+			return
+		}
 	}
 }
 
@@ -629,26 +660,55 @@ func newUDPListener(addrIn *net.UDPAddr) (conn *net.UDPConn, addr *net.UDPAddr, 
 	return
 }
 
-func (peer *Peer) stopIPFSStream() (err error) {
+func (peer *Peer) stopIPFSStream(isOutgoing bool) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	if peer.IPFSStream != nil {
-		_ = peer.IPFSStream.Close()
+	peer.locker.Lock()
+	defer peer.locker.Unlock()
+	if isOutgoing {
+		if peer.IPFSStreamOutgoing != nil {
+			_ = peer.IPFSStreamOutgoing.Close()
+			peer.IPFSStreamOutgoing = nil
+		}
+	} else {
+		if peer.IPFSStreamIngoing != nil {
+			_ = peer.IPFSStreamIngoing.Close()
+			peer.IPFSStreamIngoing = nil
+		}
 	}
-	if peer.IPFSTunnelConnToWG != nil {
-		_ = peer.IPFSTunnelConnToWG.Close()
+	noStreamsLeft := peer.IPFSStreamOutgoing == nil && peer.IPFSStreamIngoing == nil
+
+	if noStreamsLeft {
+		if peer.IPFSTunnelConnToWG != nil {
+			_ = peer.IPFSTunnelConnToWG.Close()
+		}
 	}
 
 	return
 }
 
-func (peer *Peer) SetIPFSStream(stream Stream) (err error) {
+func (peer *Peer) IPFSStream() Stream {
+	peer.locker.RLock()
+	defer peer.locker.RUnlock()
+	if peer.IPFSStreamIngoing != nil {
+		return peer.IPFSStreamIngoing
+	}
+
+	return peer.IPFSStreamOutgoing
+}
+
+func (peer *Peer) SetIPFSStream(stream Stream, isOutgoing bool) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	peer.locker.Lock()
 	defer peer.locker.Unlock()
-	_ = peer.stopIPFSStream()
-	peer.IPFSStream = stream
+	_ = peer.stopIPFSStream(isOutgoing)
+
+	if isOutgoing {
+		peer.IPFSStreamOutgoing = stream
+	} else {
+		peer.IPFSStreamIngoing = stream
+	}
 
 	return
 }
@@ -680,21 +740,42 @@ func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) (err error) {
 func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	peer.locker.Lock()
+	defer peer.locker.Unlock()
+
 	switch chType {
 	case ChannelTypeIPFS:
-		if peer.IPFSTunnelConnToWG, peer.IPFSTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
-			IP:   net.ParseIP(`127.0.0.1`),
-			Port: 0, // automatically assign a free port
-		}); err != nil {
-			return
+		if peer.IPFSTunnelConnToWG == nil {
+			if peer.IPFSTunnelConnToWG, peer.IPFSTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
+				IP:   net.ParseIP(`127.0.0.1`),
+				Port: 0, // automatically assign a free port
+			}); err != nil {
+				return
+			}
 		}
-		go peer.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, peer.IPFSStream)
+
+		if peer.IPFSStreamIngoing != nil && !peer.ingoingStreamTunnelWriterRunning {
+			peer.ingoingStreamTunnelWriterRunning = true
+			go func() {
+				peer.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, peer.IPFSStreamIngoing)
+				peer.ingoingStreamTunnelWriterRunning = false
+			}()
+		}
+		if peer.IPFSStreamOutgoing != nil && !peer.outgoingStreamTunnelWriterRunning {
+			peer.outgoingStreamTunnelWriterRunning = true
+			go func() {
+				peer.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, peer.IPFSStreamOutgoing)
+				peer.outgoingStreamTunnelWriterRunning = false
+			}()
+		}
 	case ChannelTypeTunnel:
-		if peer.SimpleTunnelConnToWG, peer.SimpleTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
-			IP:   net.ParseIP(`127.0.0.1`),
-			Port: 0, // automatically assign a free port
-		}); err != nil {
-			return
+		if peer.SimpleTunnelConnToWG == nil {
+			if peer.SimpleTunnelConnToWG, peer.SimpleTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
+				IP:   net.ParseIP(`127.0.0.1`),
+				Port: 0, // automatically assign a free port
+			}); err != nil {
+				return
+			}
 		}
 		go peer.wgToTunnelForwarderLoop(peer.SimpleTunnelConnToWG, peer.SimpleTunnelConn)
 	}

@@ -310,7 +310,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 
 	vpnLogger := &logger{"[vpn]", true, config.Get().DumpVPNCommunications}
 
-	ipvpn.VPN, err = vpn.New(filepath.Join(dataDir, "int_alias.json"), *subnet, vpnLogger)
+	ipvpn.VPN, err = vpn.New(filepath.Join(dataDir, "vpn"), *subnet, vpnLogger)
 	if err != nil {
 		return
 	}
@@ -320,7 +320,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 	agreeToBeRelay := false
 
 	routerLogger := &logger{"[router]", true, config.Get().DumpNetworkCommunications}
-	ipvpn.Router = router.NewRouter(routerLogger)
+	ipvpn.Router = router.New(routerLogger)
 
 	ipvpn.Network, err = network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), agreeToBeRelay, netLogger, ipvpn.VPN, ipvpn.Router)
 	if err != nil {

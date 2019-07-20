@@ -6,6 +6,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"encoding/json"
+	e "errors"
 	"io/ioutil"
 	"math"
 	"net"
@@ -49,6 +50,14 @@ const (
 
 var (
 	sitSpotExpireInterval = time.Hour * 24 * 30
+	bufferSize            = 1 << 16
+)
+
+var (
+	ErrPeerNotFound      = e.New(`peer not found`)
+	ErrMessageTooShort   = e.New(`message too short`)
+	ErrMessageTooLong    = e.New(`message too long`)
+	ErrUnexpectedMessage = e.New(`unexpected message`)
 )
 
 type Network struct {
@@ -61,11 +70,13 @@ type Network struct {
 	ipfsCfg                    *core.BuildCfg
 	ipfsContext                context.Context
 	ipfsContextCancelFunc      func()
+	streamsLocker              sync.Mutex
 	streams                    sync.Map
 	streamHandlers             []StreamHandler
 	callPathOptimizerCount     sync.Map
 	badConnectionCount         sync.Map
 	forbidOutcomingConnections sync.Map
+	messageHandlerMap          sync.Map
 	knownPeers                 KnownPeers
 	knownPeersLocker           sync.RWMutex
 }
@@ -701,6 +712,116 @@ func (mesh *Network) dhtBasedConnector(ipfsCid cid.Cid) {
 	}
 }
 
+func (mesh *Network) SetMessageHandler(topic string, handler func(Stream, []byte)) {
+	if _, loaded := mesh.messageHandlerMap.LoadOrStore(topic, handler); loaded {
+		panic(`a message handler is already set for topic ` + topic)
+	}
+}
+
+var (
+	sendMessageBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, bufferSize)
+		},
+	}
+)
+
+func (mesh *Network) SendBroadcastMessage(topic string, msg []byte) (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	mesh.streams.Range(func(key, value interface{}) bool {
+		peerID := key.(p2pcore.PeerID)
+		newErr := mesh.SendMessage(peerID, topic, msg)
+		if newErr != nil {
+			err = newErr
+		}
+		return true
+	})
+
+	return
+}
+
+func (mesh *Network) SendMessage(peerID peer.ID, topic string, msg []byte) (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	if len(topic)+len(msg)+4 >= bufferSize {
+		return ErrMessageTooLong
+	}
+
+	streamI, _ := mesh.streams.Load(peerID)
+	if streamI == nil {
+		return ErrPeerNotFound
+	}
+	stream := streamI.(Stream)
+
+	buf := sendMessageBufferPool.Get().([]byte)
+	binary.LittleEndian.PutUint16(buf, uint16(MessageTypeCustom))
+	binary.LittleEndian.PutUint16(buf[2:], uint16(len(topic)))
+	copy(buf[4:], topic)
+	copy(buf[4+len(topic):], msg)
+	_, err = stream.Write(buf[:2+2+len(topic)+len(msg)])
+	sendMessageBufferPool.Put(buf)
+	return err
+}
+
+func (mesh *Network) onReceiveMessageCustom(stream Stream, topic string, payload []byte) {
+	messageHandlerI, loaded := mesh.messageHandlerMap.Load(topic)
+	if !loaded {
+		mesh.logger.Infof(`Received a message with topic "%v" from %v, but I don't know what to do with it`, topic, stream.Conn().RemotePeer())
+		return
+	}
+	messageHandler := messageHandlerI.(func(Stream, []byte))
+	mesh.logger.Debugf(`found a message handler for topic "%v"`, topic)
+	messageHandler(stream, payload)
+}
+
+func (mesh *Network) streamHandler(stream Stream) {
+	buf := make([]byte, bufferSize)
+	for {
+		n, err := stream.Read(buf)
+		if err != nil {
+			mesh.logger.Infof(`a control stream to peer %v is closed: %v`, stream.Conn().RemotePeer(), err)
+			break
+		}
+
+		if n < 2 {
+			mesh.logger.Error(errors.Wrap(ErrMessageTooShort, n))
+			continue
+		}
+
+		msgType := MessageType(binary.LittleEndian.Uint16(buf))
+		payload := buf[2:n]
+		switch msgType {
+		case MessageTypeCustom:
+			if len(payload) < 2 {
+				mesh.logger.Error(errors.Wrap(ErrMessageTooShort, n))
+				continue
+			}
+			topicLength := binary.LittleEndian.Uint16(payload)
+			payload = payload[2:]
+			if len(payload) < int(topicLength) {
+				mesh.logger.Error(errors.Wrap(ErrMessageTooShort, n, len(payload), topicLength))
+				continue
+			}
+			topic := string(payload[:topicLength])
+			payload = payload[topicLength:]
+			mesh.logger.Debugf(`received a custom message with topic "%v" from %v, payload: %v`, topic, stream.Conn().RemotePeer(), payload)
+			mesh.onReceiveMessageCustom(stream, topic, payload)
+		default:
+			mesh.logger.Error(errors.Wrap(ErrUnexpectedMessage, msgType, payload))
+		}
+	}
+
+	_ = stream.Close()
+
+	mesh.streamsLocker.Lock()
+	streamI, _ := mesh.streams.Load(stream.Conn().RemotePeer())
+	if streamI == stream {
+		mesh.streams.Delete(stream.Conn().RemotePeer())
+	}
+	mesh.streamsLocker.Unlock()
+}
+
 func (mesh *Network) start() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
@@ -800,7 +921,7 @@ func (mesh *Network) start() (err error) {
 
 	for _, streamHandler := range mesh.streamHandlers {
 		mesh.ipfsNode.PeerHost.SetStreamHandler(streamHandler.ProtocolID(), func(stream Stream) {
-			streamHandler.NewStream(stream, AddrInfo{ID: stream.Conn().RemotePeer()})
+			streamHandler.NewIncomingStream(stream, AddrInfo{ID: stream.Conn().RemotePeer()})
 		})
 	}
 
@@ -1131,14 +1252,23 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 	}
 
 	mesh.logger.Debugf(`a good stream, saving (remote peer: %v)`, stream.Conn().RemotePeer())
+	mesh.streamsLocker.Lock()
+	defer mesh.streamsLocker.Unlock()
+	oldStreamI, _ := mesh.streams.Load(stream.Conn().RemotePeer())
+	if oldStreamI != nil {
+		_ = oldStreamI.(Stream).Close()
+	}
 	mesh.streams.Store(stream.Conn().RemotePeer(), stream)
 
-	requiredProtocolID := p2pProtocolID + `/vpn`
+	go mesh.streamHandler(stream)
+
 	for _, streamHandler := range mesh.streamHandlers {
-		if streamHandler.ProtocolID() == requiredProtocolID {
-			go streamHandler.NewStream(stream, peerAddr)
-		}
 		go streamHandler.ConsiderKnownPeer(peerAddr)
+		/*stream, err := mesh.NewStream(peerAddr.ID, streamHandler.ProtocolID())
+		if err != nil {
+			mesh.logger.Error(errors.Wrap(err))
+		}
+		streamHandler.NewStream(stream, peerAddr, true)*/
 	}
 
 	go func() {

@@ -8,6 +8,6 @@ import (
 
 type UpperHandler interface {
 	OnUpdateMyIP(ip net.IP)
-	OnPeerConnect(peerID peer.ID, chType ChannelType, ip net.IP)
-	OnPeerDisconnect(peerID peer.ID, chType ChannelType)
+	OnNewRoute(peerID peer.ID, chType ChannelType, ip net.IP)
+	OnRemoveRoute(peerID peer.ID, chType ChannelType)
 }
