@@ -46,6 +46,7 @@ var (
 	ErrAlreadyClosed      = e.New(`already closed`)
 	ErrAlreadyStarted     = e.New(`already started`)
 	ErrWrongMessageLength = e.New(`wrong message length`)
+	ErrInvalidPeerID      = e.New(`invalid peer ID`)
 )
 
 type Stream = network.Stream
@@ -667,7 +668,7 @@ func (vpn *VPN) updateWireGuardConfiguration() (err error) {
 		wgCfg := wgtypes.Config{
 			PrivateKey:   &wgtypes.Key{},
 			ListenPort:   &[]int{wgPort}[0],
-			FirewallMark: &[]int{1}[0],
+			FirewallMark: &[]int{192 + int(chType)}[0],
 			Peers:        peersCfg,
 			ReplacePeers: true,
 		}
@@ -878,19 +879,11 @@ func (vpn *VPN) LoadConfig() (err error) {
 		}
 		if vpn.IntAlias.Timestamp.UnixNano() < time.Date(2019, 06, 23, 19, 47, 29, 0, time.UTC).UnixNano() { // if the computer has a broken battery and the clock shows wrong value
 			vpn.IntAlias.Timestamp = time.Now()
-			err = vpn.SaveConfig()
-			if err != nil {
-				return
-			}
 		}
 	} else {
 		vpn.IntAlias.Value = 1
 		vpn.IntAlias.Timestamp = time.Now()
 		vpn.IntAlias.MaxNetworkSize = 1
-		err = vpn.SaveConfig()
-		if err != nil {
-			return
-		}
 	}
 
 	return
@@ -898,6 +891,15 @@ func (vpn *VPN) LoadConfig() (err error) {
 
 func (vpn *VPN) SaveConfig() (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	if vpn.Config.IntAlias.PeerID == "" {
+		return ErrInvalidPeerID
+	}
+
+	err = os.MkdirAll(vpn.dirPath, 0750)
+	if err != nil {
+		return err
+	}
 
 	configPath := filepath.Join(vpn.dirPath, `config.json`)
 	vpn.logger.Debugf("saving the config %v to %v", vpn.Config, configPath)

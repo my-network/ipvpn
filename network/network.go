@@ -58,6 +58,7 @@ var (
 	ErrMessageTooShort   = e.New(`message too short`)
 	ErrMessageTooLong    = e.New(`message too long`)
 	ErrUnexpectedMessage = e.New(`unexpected message`)
+	ErrNetworkIsNil      = e.New(`network is nil`)
 )
 
 type Network struct {
@@ -729,6 +730,10 @@ var (
 func (mesh *Network) SendBroadcastMessage(topic string, msg []byte) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	if mesh == nil {
+		return ErrNetworkIsNil
+	}
+
 	mesh.streams.Range(func(key, value interface{}) bool {
 		peerID := key.(p2pcore.PeerID)
 		newErr := mesh.SendMessage(peerID, topic, msg)
@@ -838,6 +843,7 @@ func (mesh *Network) start() (err error) {
 	mesh.logger.Debugf(`sending configuration stream handlers`)
 
 	for _, streamHandler := range mesh.streamHandlers {
+		streamHandler.SetNetwork(mesh)
 		streamHandler.SetID(mesh.ipfsNode.PeerHost.ID())
 		streamHandler.SetPSK(mesh.privateSharedKeyword)
 		privKey, err := mesh.ipfsNode.PrivateKey.Raw()
