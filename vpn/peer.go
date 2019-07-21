@@ -1128,6 +1128,9 @@ func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 
 	switch chType {
 	case ChannelTypeIPFS:
+		if peer.IPFSTunnelConnToWG == nil {
+			panic(`should not happen`)
+		}
 		if peer.IPFSForwarderStreamIngoing != nil && !peer.ingoingForwarderStreamTunnelWriterRunning {
 			peer.ingoingForwarderStreamTunnelWriterRunning = true
 			go func(stream Stream) {

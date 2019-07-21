@@ -9,6 +9,8 @@ import (
 	"hash/crc32"
 	"io/ioutil"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,6 +194,12 @@ type IPVPN struct {
 func NewIPVPN() (ipvpn *IPVPN, err error) {
 	defer func() { err = errors.Wrap(err) }()
 	ipvpn = &IPVPN{}
+
+	if addr := config.Get().PprofNetAddress; addr != "" {
+		go func() {
+			logrus.Error(http.ListenAndServe(addr, nil))
+		}()
+	}
 
 	dataDir := config.Get().DataDirectory
 

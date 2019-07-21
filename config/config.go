@@ -17,6 +17,7 @@ type config struct {
 	DumpVPNCommunications     bool   `env:"IPVPN_NETWORK_DUMP_VPN"`
 	DumpNetworkCommunications bool   `env:"IPVPN_NETWORK_DUMP_MESH"`
 	DumpConfiguration         bool   `env:"IPVPN_DUMP_CONFIG"`
+	PprofNetAddress           string `env:"IPVPN_PPROF_NET_ADDRESS"`
 }
 
 func (cfg config) String() string {

@@ -905,6 +905,9 @@ func (vpn *VPN) LoadConfig() (err error) {
 		vpn.IntAlias.Timestamp = time.Now()
 		vpn.IntAlias.MaxNetworkSize = 1
 	}
+	if vpn.Peers == nil {
+		vpn.Peers = map[string]PeerConfig{}
+	}
 
 	return
 }
