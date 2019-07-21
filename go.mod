@@ -15,7 +15,7 @@ require (
 	github.com/libp2p/go-libp2p-peer v0.2.0
 	github.com/multiformats/go-multiaddr v0.0.4
 	github.com/multiformats/go-multihash v0.0.6
-	github.com/my-network/routewrapper v0.0.0-20190714184510-90e66eda123f
+	github.com/my-network/routewrapper v0.0.0-20190720192949-2e94b90580e3
 	github.com/my-network/wgcreate v0.0.0-20190707165004-31e33f68f780
 	github.com/sirupsen/logrus v1.4.2
 	github.com/sparrc/go-ping v0.0.0-20190613174326-4e5b6552494c

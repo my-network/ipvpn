@@ -667,8 +667,8 @@ github.com/multiformats/go-multistream v0.1.0/go.mod h1:fJTiDfXJVmItycydCnNx4+wS
 github.com/mwitkow/go-conntrack v0.0.0-20161129095857-cc309e4a2223/go.mod h1:qRWi+5nqEBWmkhHvq77mSJWrCKwh8bxhgT7d/eI7P4U=
 github.com/my-network/go-libp2p-quic-transport v0.1.2-0.20190702052731-897c7bdaec45 h1:f+sTa9cjsx/C4FISv1EE+cnQduhx04KGYywkALxNfvA=
 github.com/my-network/go-libp2p-quic-transport v0.1.2-0.20190702052731-897c7bdaec45/go.mod h1:b7i8clT6YZVXMV2tJK54nF8pqbX36rpcFKlL3KfDjnY=
-github.com/my-network/routewrapper v0.0.0-20190714184510-90e66eda123f h1:TQjpUGwnIFtAU7A2X2Lo03l1Zfo1JV0FG7VHrJmRySg=
-github.com/my-network/routewrapper v0.0.0-20190714184510-90e66eda123f/go.mod h1:irMlupbw0Sx0i/f7kNXT4eqWD0QBRbc1Mf29N84nWx4=
+github.com/my-network/routewrapper v0.0.0-20190720192949-2e94b90580e3 h1:vWG+WlXA0DWmLWM6MdYRSxVDyEQ8n2V/3nQCZA0Psnk=
+github.com/my-network/routewrapper v0.0.0-20190720192949-2e94b90580e3/go.mod h1:irMlupbw0Sx0i/f7kNXT4eqWD0QBRbc1Mf29N84nWx4=
 github.com/my-network/wgcreate v0.0.0-20190630182225-f046f71f7cbb h1:u4WJOrB1YqTwbv1mnjenjEZzU6hifTyy8F/WP9+H4lA=
 github.com/my-network/wgcreate v0.0.0-20190630182225-f046f71f7cbb/go.mod h1:COtYbR/zKgLlarU9Db2rGyQ/Zstb7b2sT04BCD6aQMI=
 github.com/my-network/wgcreate v0.0.0-20190707165004-31e33f68f780 h1:gJtkeHWULoYoYvVOqMxA7vbWLp/43/ikMvuIT/1mE/s=

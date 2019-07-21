@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	e "errors"
+	"fmt"
 	"io/ioutil"
 	"math"
 	"net"
@@ -29,6 +30,7 @@ import (
 	"github.com/ipfs/go-ipfs/repo/fsrepo"
 	p2pcore "github.com/libp2p/go-libp2p-core"
 	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	p2pprotocol "github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/libp2p/go-libp2p-kbucket"
@@ -80,6 +82,7 @@ type Network struct {
 	messageHandlerMap          sync.Map
 	knownPeers                 KnownPeers
 	knownPeersLocker           sync.RWMutex
+	tryConnectChannel          chan AddrInfo
 }
 
 type Stream = p2pcore.Stream
@@ -421,6 +424,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 		ipfsContextCancelFunc: cancelFunc,
 		streamHandlers:        streamHandlers,
 		knownPeers:            knownPeers,
+		tryConnectChannel:     make(chan AddrInfo),
 	}
 
 	err = mesh.start()
@@ -433,6 +437,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 }
 
 type addrInfoWithLatencies struct {
+	Network            *Network
 	BadConnectionCount []uint64
 	Latencies          []time.Duration
 	AddrInfo           *AddrInfo
@@ -443,6 +448,16 @@ func (data *addrInfoWithLatencies) Less(i, j int) bool {
 	if data.BadConnectionCount[i] != data.BadConnectionCount[j] {
 		return data.BadConnectionCount[i] < data.BadConnectionCount[j]
 	}
+	ipA, errA := data.AddrInfo.Addrs[i].ValueForProtocol(multiaddr.P_IP4)
+	ipB, errB := data.AddrInfo.Addrs[j].ValueForProtocol(multiaddr.P_IP4)
+	if errA == nil && errB == nil && ipA == ipB {
+		_, udpAErr := data.AddrInfo.Addrs[i].ValueForProtocol(multiaddr.P_UDP)
+		_, udpBErr := data.AddrInfo.Addrs[j].ValueForProtocol(multiaddr.P_UDP)
+		if udpAErr == nil && udpBErr != nil {
+			return true
+		}
+		return false
+	}
 	return data.Latencies[i] < data.Latencies[j]
 }
 func (data *addrInfoWithLatencies) Swap(i, j int) {
@@ -452,12 +467,53 @@ func (data *addrInfoWithLatencies) Swap(i, j int) {
 }
 
 func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, isIncoming bool) Stream {
+	// Removing bad addresses
+	{
+		var maddrs []multiaddr.Multiaddr
+		for _, maddr := range addrInfo.Addrs {
+			isBad := false
+			if isBad == false {
+				if ip, err := maddr.ValueForProtocol(multiaddr.P_IP4); err == nil {
+					if net.ParseIP(ip).IsLoopback() {
+						mesh.logger.Debugf(`Address %v is a loopback address, skipping`, maddr)
+						isBad = true
+					}
+				}
+			}
+			if isBad == false {
+				if ip, err := maddr.ValueForProtocol(multiaddr.P_IP6); err == nil {
+					if net.ParseIP(ip).IsLoopback() {
+						mesh.logger.Debugf(`Address %v is a loopback address, skipping`, maddr)
+						isBad = true
+					}
+				}
+			}
+			if isBad == false {
+				for _, streamHandler := range mesh.streamHandlers {
+					if streamHandler.IsBadAddress(maddr) {
+						mesh.logger.Debugf(`Address %v is banned by stream handler %v`, maddr, streamHandler.ProtocolID())
+						isBad = true
+						break
+					}
+				}
+			}
+			if isBad {
+				continue
+			}
+			mesh.logger.Debugf(`Address %v is good, adding to the list`, maddr)
+			maddrs = append(maddrs, maddr)
+		}
+		addrInfo.Addrs = maddrs
+	}
+
 	// Init data
 	data := addrInfoWithLatencies{
+		Network:            mesh,
 		BadConnectionCount: make([]uint64, len(addrInfo.Addrs)),
 		Latencies:          make([]time.Duration, len(addrInfo.Addrs)),
 		AddrInfo:           addrInfo,
 	}
+
 	for idx, addr := range addrInfo.Addrs {
 		badConnectionCount, ok := mesh.badConnectionCount.Load(addr.String())
 		if !ok {
@@ -552,10 +608,16 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	}
 
 	if stream == nil {
+		mesh.logger.Debugf("stream == nil, Connect(), NewStream(): %v", *addrInfo)
 		var err error
+		err = mesh.ipfsNode.PeerHost.Connect(mesh.ipfsContext, *addrInfo)
+		if err != nil {
+			mesh.logger.Debugf("unable to connect to %v: %v", addrInfo.ID, errors.Wrap(err))
+		}
 		stream, err = mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, addrInfo.ID, p2pProtocolID)
 		if err != nil {
-			mesh.logger.Debugf("unable create a new stream to %v: %v", addrInfo.ID, errors.Wrap(err))
+			mesh.logger.Infof("unable create a new stream to %v: %v", addrInfo.ID, errors.Wrap(err, fmt.Sprintf("%T", err)))
+			return nil
 		}
 	}
 
@@ -582,7 +644,7 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	case MessageTypeStopConnectionOnYourSide:
 		mesh.logger.Infof("remote side wishes to initiate connection from it's side")
 		if latency >= data.Latencies[0] {
-			mesh.logger.Infof("their latency is higher, not complying", latency, data.Latencies[0])
+			mesh.logger.Infof("their latency is higher, not complying: %v %v", latency, data.Latencies[0])
 			return stream
 		}
 		_ = stream.Close()
@@ -620,47 +682,7 @@ func (mesh *Network) considerPeerAddr(peerAddr AddrInfo) {
 		mesh.logger.Debugf("peer's addresses: %v", peerAddr.Addrs)
 	}
 
-	/*if t, ok := mesh.forbidOutcomingConnections.Load(peerID); ok {
-		until := t.(time.Time)
-		if until.After(time.Now()) {
-			mesh.logger.Debugf("we promised not to try to connect to this node: %v", peerID)
-			return
-		}
-		mesh.forbidOutcomingConnections.Delete(peerID)
-	}*/
-
-	mesh.logger.Debugf("mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)...")
-	stream, err := mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)
-	if err != nil {
-		mesh.logger.Infof("unable to connect to peer %v: %v", peerID, err)
-		return
-	}
-	mesh.logger.Debugf("new stream: %v", stream.Conn().RemoteMultiaddr())
-
-	stream = mesh.tryConnectByOptimalPath(stream, &peerAddr, false)
-	if stream == nil {
-		mesh.logger.Debugf("no opened stream, skip")
-		return
-	}
-
-	/*shouldContinue, alreadyOptimal := mesh.tryConnectByOptimalPath(stream, &addrInfo, false)
-	if !shouldContinue {
-		mesh.logger.Debugf("no more tries to connect to %v", peerID)
-		mesh.forbidOutcomingConnections.Store(peerID, time.Now().Add(5 * time.Minute))
-		continue
-	}
-	if !alreadyOptimal {
-		stream, err = mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, p2pProtocolID)
-		if err != nil {
-			mesh.logger.Infof("unable to connect to peer %v: %v", peerID, err)
-			continue
-		}
-	}*/
-	err = mesh.addStream(stream, peerAddr)
-	if err != nil {
-		mesh.logger.Debugf("got error from addStream(): %v", err)
-		return
-	}
+	mesh.tryConnectChannel <- peerAddr
 }
 
 func (mesh *Network) pubSubBasedConnector(ipfsCid cid.Cid) {
@@ -760,11 +782,11 @@ func (mesh *Network) SendMessage(peerID peer.ID, topic string, msg []byte) (err 
 	stream := streamI.(Stream)
 
 	buf := sendMessageBufferPool.Get().([]byte)
-	binary.LittleEndian.PutUint16(buf, uint16(MessageTypeCustom))
-	binary.LittleEndian.PutUint16(buf[2:], uint16(len(topic)))
-	copy(buf[4:], topic)
-	copy(buf[4+len(topic):], msg)
-	_, err = stream.Write(buf[:2+2+len(topic)+len(msg)])
+	buf[0] = uint8(MessageTypeCustom)
+	binary.LittleEndian.PutUint16(buf[1:], uint16(len(topic)))
+	copy(buf[3:], topic)
+	copy(buf[3+len(topic):], msg)
+	_, err = stream.Write(buf[:1+2+len(topic)+len(msg)])
 	sendMessageBufferPool.Put(buf)
 	return err
 }
@@ -781,21 +803,23 @@ func (mesh *Network) onReceiveMessageCustom(stream Stream, topic string, payload
 }
 
 func (mesh *Network) streamHandler(stream Stream) {
+	defer mesh.logger.Debugf(`endof streamHandler for %v`, stream.Conn().RemotePeer())
+
 	buf := make([]byte, bufferSize)
 	for {
 		n, err := stream.Read(buf)
 		if err != nil {
-			mesh.logger.Infof(`a control stream to peer %v is closed: %v`, stream.Conn().RemotePeer(), err)
+			mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
 			break
 		}
 
-		if n < 2 {
+		if n < 1 {
 			mesh.logger.Error(errors.Wrap(ErrMessageTooShort, n))
 			continue
 		}
 
-		msgType := MessageType(binary.LittleEndian.Uint16(buf))
-		payload := buf[2:n]
+		msgType := MessageType(buf[0])
+		payload := buf[1:n]
 		switch msgType {
 		case MessageTypeCustom:
 			if len(payload) < 2 {
@@ -817,6 +841,7 @@ func (mesh *Network) streamHandler(stream Stream) {
 		}
 	}
 
+	mesh.logger.Debugf(`stream.Close()`)
 	_ = stream.Close()
 
 	mesh.streamsLocker.Lock()
@@ -827,8 +852,55 @@ func (mesh *Network) streamHandler(stream Stream) {
 	mesh.streamsLocker.Unlock()
 }
 
+func (mesh *Network) tryConnectChannelHandler() {
+	isAlreadyTrying := map[peer.ID]bool{}
+	pendingTries := map[peer.ID]*AddrInfo{}
+
+	for {
+		select {
+		case <-mesh.ipfsContext.Done():
+			return
+		case addrInfo := <-mesh.tryConnectChannel:
+			mesh.logger.Debugf(`got an addrInfo from tryConnectChannel: %v`, addrInfo)
+
+			if isAlreadyTrying[addrInfo.ID] {
+				mesh.logger.Debugf(`already trying to connect to %v, pending`, addrInfo.ID)
+				pendingTries[addrInfo.ID] = &addrInfo
+				continue
+			}
+			oldStreamI, _ := mesh.streams.Load(addrInfo.ID)
+			if oldStreamI != nil {
+				if mesh.ipfsNode.PeerHost.Network().Connectedness(addrInfo.ID) == network.Connected {
+					mesh.logger.Debugf(`already connected to %v, skipping`, addrInfo.ID)
+					continue
+				}
+				mesh.logger.Debugf(`strange, we have a stream, but not connected to %v. Reconnecting`, addrInfo.ID)
+				oldStream := oldStreamI.(Stream)
+				_ = oldStream.Close()
+			}
+
+			isAlreadyTrying[addrInfo.ID] = true
+			go func(addrInfo AddrInfo) {
+				mesh.tryConnect(addrInfo)
+				delete(isAlreadyTrying, addrInfo.ID)
+
+				pendingAddrInfo := pendingTries[addrInfo.ID]
+				if pendingAddrInfo != nil {
+					delete(pendingTries, addrInfo.ID)
+					mesh.logger.Debugf(`resending to tryConnectChannel a pending try to connect to: %v`, addrInfo)
+					mesh.tryConnectChannel <- *pendingAddrInfo
+				}
+			}(addrInfo)
+		}
+	}
+}
+
 func (mesh *Network) start() (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	mesh.logger.Debugf(`running tryConnect channel handler`)
+
+	go mesh.tryConnectChannelHandler()
 
 	mesh.logger.Debugf(`starting an IPFS node`)
 
@@ -926,10 +998,20 @@ func (mesh *Network) start() (err error) {
 	})
 
 	for _, streamHandler := range mesh.streamHandlers {
-		mesh.ipfsNode.PeerHost.SetStreamHandler(streamHandler.ProtocolID(), func(stream Stream) {
-			streamHandler.NewIncomingStream(stream, AddrInfo{ID: stream.Conn().RemotePeer()})
-		})
+		func(streamHandler StreamHandler) {
+			mesh.ipfsNode.PeerHost.SetStreamHandlerMatch(streamHandler.ProtocolID(), func(s string) bool {
+				isMatch := strings.HasPrefix(s, string(streamHandler.ProtocolID()))
+				mesh.logger.Debugf("StreamHandlerMatch: %v %v %v", s, streamHandler.ProtocolID(), isMatch)
+				return isMatch
+			}, func(stream Stream) {
+				peerID := stream.Conn().RemotePeer()
+				mesh.logger.Debugf(`NewStream for %v from %v`, stream.Protocol(), peerID)
+				streamHandler.NewIncomingStream(stream, AddrInfo{ID: peerID})
+			})
+			mesh.logger.Debugf(`Registered a stream handler for %v`, streamHandler.ProtocolID())
+		}(streamHandler)
 	}
+	mesh.logger.Debugf(`In total registered stream handlers for %v`, mesh.ipfsNode.PeerHost.Mux().Protocols())
 
 	go func() {
 		mesh.logger.Debugf(`Notifying streamHandlers (such as VPN handler) about previously known peers (count == %v)`, len(mesh.knownPeers))
@@ -1033,20 +1115,42 @@ func (mesh *Network) Close() (err error) {
 	return mesh.ipfsNode.Close()
 }
 
-func (mesh *Network) handlePeerFound(addrInfo peer.AddrInfo) (err error) {
-	defer func() { err = errors.Wrap(err) }()
-
-	mesh.logger.Debugf("handlerPeerFound: %v: connect with optimal path", addrInfo.ID)
+func (mesh *Network) tryConnect(addrInfo AddrInfo) {
+	mesh.logger.Debugf("tryConnect: %v: tryConnectByOptimalPath", addrInfo.ID)
 	stream := mesh.tryConnectByOptimalPath(nil, &addrInfo, false)
 
 	if stream != nil {
-		mesh.logger.Debugf("handlerPeerFound: %v: add stream", addrInfo.ID)
-		if err = mesh.addStream(stream, addrInfo); err != nil {
+		mesh.logger.Debugf("tryConnect: %v: add stream", addrInfo.ID)
+		if err := mesh.addStream(stream, addrInfo); err != nil {
+			mesh.logger.Error(errors.Wrap(err))
 			return
 		}
 	}
 
-	mesh.logger.Debugf("handlerPeerFound: %v: end", addrInfo.ID)
+	mesh.logger.Debugf("tryConnect: %v: end", addrInfo.ID)
+}
+
+func (mesh *Network) handlePeerFound(addrInfo peer.AddrInfo) (err error) {
+	defer func() { err = errors.Wrap(err) }()
+	mesh.logger.Debugf("handlerPeerFound: %v", addrInfo.ID)
+
+	// MDNS discovery doesn't propose any connection using QUIC, so we add it manually:
+	if len(addrInfo.Addrs) == 1 {
+		maddr := addrInfo.Addrs[0]
+		if tcpPort, tcpErr := maddr.ValueForProtocol(multiaddr.P_TCP); tcpErr == nil {
+			ipString, ipErr := maddr.ValueForProtocol(multiaddr.P_IP4)
+			if ipErr == nil {
+				newMaddr, err := multiaddr.NewMultiaddr(`/ip4/` + ipString + `/udp/` + tcpPort + `/quic`)
+				if err != nil {
+					mesh.logger.Error(errors.Wrap(err))
+				} else {
+					addrInfo.Addrs = append(addrInfo.Addrs, newMaddr)
+				}
+			}
+		}
+	}
+
+	mesh.considerPeerAddr(addrInfo)
 	return
 }
 
@@ -1270,11 +1374,7 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 
 	for _, streamHandler := range mesh.streamHandlers {
 		go streamHandler.ConsiderKnownPeer(peerAddr)
-		/*stream, err := mesh.NewStream(peerAddr.ID, streamHandler.ProtocolID())
-		if err != nil {
-			mesh.logger.Error(errors.Wrap(err))
-		}
-		streamHandler.NewStream(stream, peerAddr, true)*/
+		go streamHandler.OnPeerConnect(peerAddr.ID)
 	}
 
 	go func() {
