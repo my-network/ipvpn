@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	e "errors"
 	"fmt"
-	"github.com/my-network/ipvpn/helpers"
 	"io"
 	"io/ioutil"
 	"log"
@@ -15,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -147,6 +147,11 @@ func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
 	peerConfig := vpn.Peers[peerID]
 	peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
 	vpn.Peers[peerID] = peerConfig
+
+	warnErr := vpn.SaveConfig()
+	if warnErr != nil {
+		vpn.logger.Error(errors.Wrap(warnErr))
+	}
 }
 
 func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
@@ -158,6 +163,11 @@ func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
 	peerConfig := vpn.Peers[peerID]
 	peerConfig.SimpleTunnelPort = binary.LittleEndian.Uint16(payload)
 	vpn.Peers[peerID] = peerConfig
+
+	warnErr := vpn.SaveConfig()
+	if warnErr != nil {
+		vpn.logger.Error(errors.Wrap(warnErr))
+	}
 }
 
 func (vpn *VPN) ProtocolID() protocol.ID {
@@ -351,9 +361,9 @@ func (vpn *VPN) notifyPeerAboutMyPort(peerID peer.ID, chType ChannelType, port u
 	var topic string
 	switch chType {
 	case ChannelTypeDirect:
-		topic = TopicRequestDirectPort
+		topic = TopicUpdateDirectPort
 	case ChannelTypeTunnel:
-		topic = TopicRequestSimpleTunnelPort
+		topic = TopicUpdateSimpleTunnelPort
 	default:
 		panic(fmt.Errorf(`unknown channel type: %v`, chType))
 	}
@@ -370,9 +380,9 @@ func (vpn *VPN) notifyPeersAboutMyPort(chType ChannelType, port uint16) {
 	var topic string
 	switch chType {
 	case ChannelTypeDirect:
-		topic = TopicRequestDirectPort
+		topic = TopicUpdateDirectPort
 	case ChannelTypeTunnel:
-		topic = TopicRequestSimpleTunnelPort
+		topic = TopicUpdateSimpleTunnelPort
 	default:
 		panic(fmt.Errorf(`unknown channel type: %v`, chType))
 	}
@@ -759,6 +769,9 @@ func (vpn *VPN) sendIntAliases(conn io.Writer) (err error) {
 	knownAliases := IntAliases{vpn.IntAlias.Copy()}
 	vpn.peers.Range(func(_, peerI interface{}) bool {
 		peer := peerI.(*Peer)
+		if peer.IntAlias.PeerID.String() == "" {
+			return true
+		}
 		knownAliases = append(knownAliases, peer.IntAlias.Copy())
 		return true
 	})
@@ -798,6 +811,7 @@ func (vpn *VPN) recvIntAliases(conn io.Reader) (remoteIntAliases IntAliases, err
 
 	err = remoteIntAliases.Unmarshal(vpn.buffer[:n])
 	if err != nil {
+		err = errors.Wrap(err, string(vpn.buffer[:n]))
 		return
 	}
 
@@ -971,10 +985,52 @@ func peerIDToWgPubKey(peerID peer.ID) (result wgtypes.Key, err error) {
 	return
 }*/
 
+func (vpn *VPN) GetOrCreatePeerByID(peerID peer.ID) *Peer {
+	if peerID == vpn.myID {
+		vpn.logger.Error(errors.New("got a connection to myself, should not happened, ever"))
+		return nil
+	}
+
+	wgPubKey, err := peerIDToWgPubKey(peerID)
+	if err != nil {
+		vpn.logger.Error(`unable to get a key for WG using peer ID: "%v"`, peerID)
+		return nil
+	}
+
+	vpn.newStreamLocker.Lock()
+	defer vpn.newStreamLocker.Unlock()
+
+	if oldPeerI, _ := vpn.peers.Load(peerID); oldPeerI != nil {
+		return oldPeerI.(*Peer)
+	}
+
+	vpn.logger.Infof(`now I know about a new peer %v, pubkey %v`, peerID, wgPubKey.String())
+
+	peer := &Peer{
+		ID:       peerID,
+		VPN:      vpn,
+		WgPubKey: wgPubKey,
+	}
+	vpn.peers.Store(peerID, peer)
+
+	return peer
+}
+
 func (vpn *VPN) newIncomingStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	return vpn.newTunnelConnection(stream, peerAddr)
+	peer := vpn.GetOrCreatePeerByID(peerAddr.ID)
+
+	switch {
+	case strings.HasPrefix(string(stream.Protocol()), string(vpn.ProtocolID()+`/wg/`)):
+		vpn.logger.Debugf(`newIncomingStream: wg for %v`, peerAddr.ID)
+		return peer.AddTunnelConnection(stream, peerAddr)
+	case strings.HasPrefix(string(stream.Protocol()), string(vpn.ProtocolID()+`/control/`)):
+		vpn.logger.Debugf(`newIncomingStream: control for %v`, peerAddr.ID)
+		return peer.AddControlStream(stream, peerAddr)
+	}
+
+	panic(`should not happen`)
 }
 
 func (vpn *VPN) NewIncomingStream(stream Stream, peerAddr AddrInfo) {
@@ -993,23 +1049,10 @@ func (vpn *VPN) NewIncomingStream(stream Stream, peerAddr AddrInfo) {
 func (vpn *VPN) OnPeerConnect(peerID peer.ID) {
 	vpn.logger.Debugf(`OnPeerConnect("%v")`, peerID)
 
-	outgoingStream := helpers.NewReconnectableStream(vpn.logger, func() (Stream, error) {
-		return vpn.mesh.NewStream(peerID, vpn.ProtocolID()+`/`+protocol.ID(vpn.myID.String()))
-	})
+	peer := vpn.GetOrCreatePeerByID(peerID)
 
-	outgoingStream.Connect()
-
-	vpn.logger.Debugf(`Got a NewStream (%v)`, vpn.ProtocolID())
-
-	err := vpn.newTunnelConnection(outgoingStream, AddrInfo{ID: peerID})
-	if err != nil {
-		vpn.logger.Error(errors.Wrap(err))
-		err := outgoingStream.Close()
-		if err != nil {
-			vpn.logger.Error(errors.Wrap(err))
-			return
-		}
-	}
+	peer.onNoControlStreamsLeft()
+	peer.onNoForwarderStreamsLeft()
 }
 
 func (vpn *VPN) cancelPingSenderLoop(peerID peer.ID) (r bool) {
@@ -1027,173 +1070,6 @@ func (vpn *VPN) cancelPingSenderLoop(peerID peer.ID) (r bool) {
 	}
 
 	return
-}
-
-func (vpn *VPN) newTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) (err error) {
-	defer func() { err = errors.Wrap(err) }()
-	vpn.cancelPingSenderLoop(peerAddr.ID)
-
-	peerID := peerAddr.ID
-
-	wgPubKeyTunnel, err := peerIDToWgPubKey(peerID)
-	if err != nil {
-		return
-	}
-	vpn.logger.Debugf("new tunnel connection to %v, pubkey %v", peerID, wgPubKeyTunnel)
-	defer vpn.logger.Debugf("finished to setup of a new tunnel connection to %v, pubkey %v", peerID, wgPubKeyTunnel)
-
-	/*
-		// WireGuard doesn't support multiple endpoints for one peer, so we do a separate WireGuard
-		// peer for the direct endpoint
-		wgPubKeyDirect := shiftWgKey(&wgPubKeyTunnel)
-	*/
-	// We've separated WG interfaces, so there's no need to separate keys anymore
-	wgPubKeyDirect := wgPubKeyTunnel
-
-	vpn.newStreamLocker.Lock()
-	defer vpn.newStreamLocker.Unlock()
-
-	if peerID == vpn.myID {
-		return errors.New("got a connection to myself, should not happened, ever")
-	}
-	err = vpn.sendIntAliases(conn)
-	if err != nil {
-		return
-	}
-
-	remoteIntAliases, err := vpn.recvIntAliases(conn)
-	if err != nil {
-		return
-	}
-	notMyIntAliases := map[uint64]*IntAlias{}
-	vpn.peers.Range(func(_, peerI interface{}) bool {
-		peer := peerI.(*Peer)
-		notMyIntAliases[peer.IntAlias.Value] = &peer.IntAlias
-		return true
-	})
-	for _, remoteIntAlias := range remoteIntAliases {
-		if remoteIntAlias.PeerID == vpn.IntAlias.PeerID {
-			continue
-		}
-		remoteIntAlias.Timestamp = time.Now().Add(-remoteIntAlias.Since)
-		notMyIntAliases[remoteIntAlias.Value] = remoteIntAlias
-	}
-	if remoteIntAliases[0].Value == vpn.IntAlias.Value {
-		changeOnRemoteSide := false
-		if vpn.IntAlias.MaxNetworkSize > remoteIntAliases[0].MaxNetworkSize {
-			changeOnRemoteSide = true
-		} else if vpn.IntAlias.MaxNetworkSize == remoteIntAliases[0].MaxNetworkSize {
-			if vpn.IntAlias.Timestamp.UnixNano() > remoteIntAliases[0].Timestamp.UnixNano() {
-				changeOnRemoteSide = true
-			} else if vpn.IntAlias.Timestamp.UnixNano() == remoteIntAliases[0].Timestamp.UnixNano() {
-				if vpn.myID < peerID {
-					changeOnRemoteSide = true
-				}
-			}
-		}
-
-		if changeOnRemoteSide {
-			vpn.logger.Debugf("int alias collision, remote side should change it's alias %v <?= %v , %v <?= %v, %v >? %v",
-				vpn.IntAlias.Value, remoteIntAliases[0].Value,
-				vpn.IntAlias.Timestamp, remoteIntAliases[0].Timestamp,
-				vpn.myID, peerID)
-
-			err = vpn.sendIntAliases(conn)
-			if err != nil {
-				return
-			}
-			remoteIntAliases, err = vpn.recvIntAliases(conn)
-			if err != nil {
-				return
-			}
-			if remoteIntAliases[0].Value == vpn.IntAlias.Value {
-				return errors.New("remote side decided not to change it's int alias, close connection")
-			}
-		} else {
-			vpn.logger.Debugf("int alias collision, changing our int alias")
-			networkSize := vpn.GetNetworkMaximalSize()
-			for i := uint64(1); i < networkSize; i++ {
-				if notMyIntAliases[i] == nil {
-					err = vpn.SetIntAlias(i)
-					if err != nil {
-						return
-					}
-					break
-				}
-			}
-			err = vpn.sendIntAliases(conn)
-			if err != nil {
-				return
-			}
-			_, err = vpn.recvIntAliases(conn)
-			if err != nil {
-				return
-			}
-
-			warnErr := vpn.SaveConfig()
-			if warnErr != nil {
-				vpn.logger.Error(errors.Wrap(err))
-			}
-		}
-	}
-
-	vpn.logger.Debugf("negotiations with %v are complete", peerAddr.ID)
-
-	isNew := false
-	var peer *Peer
-	if oldPeerI, _ := vpn.peers.Load(peerID); oldPeerI != nil {
-		peer = oldPeerI.(*Peer)
-	} else {
-		peer = &Peer{
-			ID:       peerAddr.ID,
-			VPN:      vpn,
-			IntAlias: *remoteIntAliases[0],
-			WgPubKey: wgPubKeyDirect,
-		}
-		isNew = true
-	}
-
-	vpn.logger.Debugf("isNew: %v", isNew)
-
-	remoteIntAliases[0].Timestamp = time.Now().Add(-remoteIntAliases[0].Since)
-
-	var chType ChannelType
-	switch connTyped := conn.(type) {
-	case *helpers.ReconnectableStream:
-		chType = ChannelTypeIPFS
-		_ = peer.SetIPFSStream(connTyped, true)
-	case Stream:
-		chType = ChannelTypeIPFS
-		_ = peer.SetIPFSStream(connTyped, false)
-	case *udpWriter:
-		chType = ChannelTypeTunnel
-		_ = peer.SetSimpleTunnelConn(connTyped)
-	case *net.UDPConn:
-		chType = ChannelTypeTunnel
-		_ = peer.SetSimpleTunnelConn(connTyped)
-	case *udpClientSocket:
-		chType = ChannelTypeTunnel
-		_ = peer.SetSimpleTunnelConn(connTyped)
-	}
-
-	vpn.logger.Debugf("peer.Start(%v)", chType)
-
-	err = peer.Start(chType)
-	if err != nil {
-		return
-	}
-
-	if isNew {
-		vpn.peers.Store(peerID, peer)
-	}
-
-	saveErr := vpn.SaveConfig()
-	if saveErr != nil {
-		vpn.logger.Error(saveErr)
-	}
-
-	return
-
 }
 
 func getPublicKeyFromPeerID(id peer.ID) (pubKey ed25519.PublicKey, err error) {
@@ -1307,6 +1183,9 @@ func (vpn *VPN) startSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, add
 
 func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	vpn.requestPortInfo(peerAddr.ID, ChannelTypeDirect)
+	vpn.requestPortInfo(peerAddr.ID, ChannelTypeTunnel)
 
 	var remoteUsualPort uint16
 	var addrs []*net.UDPAddr

@@ -11,7 +11,6 @@ const (
 	MessageTypePing
 	MessageTypePong
 	MessageTypeConfig
-	MessageTypePacket
 )
 
 var (

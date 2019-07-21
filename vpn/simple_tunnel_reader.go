@@ -58,6 +58,8 @@ type simpleTunnelReader struct {
 	createTS                      time.Time
 	queue                         chan *simpleTunnelReaderQueueItem
 	messagePong                   MessagePong
+	mySideIsReady                 bool
+	remoteSideIsReady             bool
 }
 
 func newSimpleTunnelReader(vpn *VPN, peerAddrRemote AddrInfo, addrs []*net.UDPAddr, gcFunc func() error) (reader *simpleTunnelReader, err error) {
@@ -153,6 +155,19 @@ func (r *simpleTunnelReader) queueScheduler() {
 
 func (r *simpleTunnelReader) processMessage(msg *simpleTunnelReaderQueueItem) {
 	r.doProcessMessage(msg)
+
+	if r.mySideIsReady && r.remoteSideIsReady {
+		conn := msg.conn
+		addrLocal := conn.LocalAddr()
+		addrRemote := msg.addrRemote
+
+		r.connectionInitContextStopFunc()
+		peer := r.vpn.GetOrCreatePeerByID(r.peerAddrRemote.ID)
+		if err := peer.AddTunnelConnection(newUDPWriter(conn, r, addrRemote), r.peerAddrRemote); err != nil {
+			r.vpn.logger.Error(errors.Wrap(err, `unable to open a tunnel connection`, addrLocal, addrRemote))
+		}
+	}
+
 	msg.Release()
 }
 
@@ -173,6 +188,10 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 		if err := r.messagePong.MessagePing.VerifySender(r.publicKeyRemote); err != nil {
 			r.vpn.logger.Debugf("%v> remote signature is invalid in ping from peer %v: %v (%v)", addrLocal, r.peerAddrRemote.ID, err, addrRemote)
 			return
+		}
+
+		if r.messagePong.SequenceID == 11 {
+			r.remoteSideIsReady = true
 		}
 
 		r.messagePong.ReceiveTS = recvTS.UnixNano()
@@ -205,7 +224,10 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 		}
 
 		switch {
-		case r.messagePong.SequenceID < 10:
+		case r.messagePong.SequenceID <= 10:
+			if r.messagePong.SequenceID == 10 {
+				r.mySideIsReady = true
+			}
 			messagePing := &r.messagePong.MessagePing
 			messagePing.SequenceID++
 			if err := messagePing.SignSender(r.vpn.privKey); err != nil {
@@ -218,12 +240,6 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 				r.vpn.logger.Debugf(`%v> unable to send a message: %v (%v)`, addrLocal, err, addrRemote)
 				_ = conn.Close()
 				return
-			}
-			return
-		case r.messagePong.SequenceID == 10:
-			r.connectionInitContextStopFunc()
-			if err := r.vpn.newTunnelConnection(newUDPWriter(conn, r, addrRemote), r.peerAddrRemote); err != nil {
-				r.vpn.logger.Error(errors.Wrap(err, `unable to open a tunnel connection`, addrLocal, addrRemote))
 			}
 			return
 		default:
