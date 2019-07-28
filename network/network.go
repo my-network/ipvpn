@@ -1438,3 +1438,7 @@ func (mesh *Network) ClosePeer(peerID peer.ID) {
 		}
 	}
 }
+
+func (mesh *Network) ConnectPeer(peerID peer.ID) {
+	mesh.considerPeerAddr(AddrInfo{ID: peerID})
+}

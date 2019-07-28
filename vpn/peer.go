@@ -96,6 +96,13 @@ func (peer *Peer) LockDo(fn func()) {
 	fn()
 }
 
+func (peer *Peer) RLockDo(fn func()) {
+	peer.locker.RLock()
+	defer peer.locker.RUnlock()
+
+	fn()
+}
+
 func (peer *Peer) Start() {
 	peer.LockDo(func() {
 		peer.context, peer.contextCancelFunc = context.WithCancel(context.Background())
@@ -1128,7 +1135,7 @@ func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 				}
 				if peer.IPFSForwarderStreamOutgoing == nil {
 					peer.VPN.logger.Debugf(`peer<%v>.IPFSForwarderStreamOutgoing == nil`, peer.ID)
-					peer.VPN.OnPeerConnect(peer.ID)
+					peer.VPN.ReconnectToPeer(peer.ID)
 				}
 				peer.locker.Unlock()
 			}(peer.IPFSForwarderStreamIngoing)
@@ -1149,7 +1156,7 @@ func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 				}
 				if peer.IPFSForwarderStreamIngoing == nil {
 					peer.VPN.logger.Debugf(`peer<%v>.IPFSForwarderStreamIngoing == nil`, peer.ID)
-					peer.VPN.OnPeerConnect(peer.ID)
+					peer.VPN.ReconnectToPeer(peer.ID)
 				}
 				peer.locker.Unlock()
 			}(peer.IPFSForwarderStreamOutgoing)
@@ -1438,8 +1445,15 @@ func (peer *Peer) IPFSControlStream() Stream {
 func (peer *Peer) SetIPFSControlStream(stream Stream, isOutgoing bool) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	peer.VPN.logger.Debugf(`peer<%v>.SetIPFSControlStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
-	defer peer.VPN.logger.Debugf(`endof peer<%v>.SetIPFSControlStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
+	conn := stream.Conn()
+	if conn == nil {
+		peer.VPN.logger.Debugf(`peer<%v>.SetIPFSControlStream(stream, %v): conn == nil`, peer.ID, isOutgoing)
+		peer.VPN.ReconnectToPeer(peer.ID)
+		return nil
+	}
+
+	peer.VPN.logger.Debugf(`peer<%v>.SetIPFSControlStream("%v", %v)`, peer.ID, conn.RemotePeer(), isOutgoing)
+	defer peer.VPN.logger.Debugf(`endof peer<%v>.SetIPFSControlStream("%v", %v)`, peer.ID, conn.RemotePeer(), isOutgoing)
 
 	peer.LockDo(func() {
 		_ = peer.stopIPFSControlStream(isOutgoing)

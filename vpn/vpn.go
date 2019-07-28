@@ -1128,10 +1128,12 @@ func (vpn *VPN) newIncomingStream(stream Stream, peerAddr AddrInfo) (err error) 
 func (vpn *VPN) NewIncomingStream(stream Stream, peerAddr AddrInfo) {
 	vpn.logger.Debugf(`NewIncomingStream from %v`, peerAddr.ID)
 
-	vpn.newIncomingStreamChan <- struct {
-		Stream
-		AddrInfo
-	}{stream, peerAddr}
+	go func() {
+		vpn.newIncomingStreamChan <- struct {
+			Stream
+			AddrInfo
+		}{stream, peerAddr}
+	}()
 }
 
 func (vpn *VPN) OnPeerConnect(peerID peer.ID) {
@@ -1147,8 +1149,13 @@ func (vpn *VPN) onPeerConnect(peerID peer.ID) error {
 	peer := vpn.GetOrCreatePeerByID(peerID)
 
 	go func() {
-		peer.onNoControlStreamsLeftChan <- struct{}{}
-		peer.onNoForwarderStreamsLeftChan <- struct{}{}
+		peer.RLockDo(func() {
+			if peer.IsFinished() {
+				return
+			}
+			peer.onNoControlStreamsLeftChan <- struct{}{}
+			peer.onNoForwarderStreamsLeftChan <- struct{}{}
+		})
 	}()
 	return nil
 }
@@ -1358,4 +1365,9 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 
 func (vpn *VPN) ConsiderKnownPeer(peerAddr AddrInfo) {
 	vpn.considerKnownPeerChan <- peerAddr
+}
+
+func (vpn *VPN) ReconnectToPeer(peerID peer.ID) {
+	vpn.mesh.ClosePeer(peerID)
+	vpn.mesh.ConnectPeer(peerID)
 }
