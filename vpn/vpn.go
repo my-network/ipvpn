@@ -218,6 +218,7 @@ func (vpn *VPN) ProtocolID() protocol.ID {
 
 func (vpn *VPN) AddUpperHandler(upperHandler UpperHandler) {
 	vpn.logger.Debugf(`AddUpperHandler`)
+	vpn.logger.Debugf(`/AddUpperHandler`)
 
 	vpn.LockDo(func() {
 		vpn.upperHandlers = append(vpn.upperHandlers, upperHandler)
@@ -1136,15 +1137,19 @@ func (vpn *VPN) NewIncomingStream(stream Stream, peerAddr AddrInfo) {
 func (vpn *VPN) OnPeerConnect(peerID peer.ID) {
 	vpn.logger.Debugf(`OnPeerConnect("%v")`, peerID)
 
-	vpn.onPeerConnectChan <- peerID
+	go func() {
+		vpn.onPeerConnectChan <- peerID
+	}()
 }
 
 func (vpn *VPN) onPeerConnect(peerID peer.ID) error {
 	vpn.logger.Debugf(`onPeerConnect("%v")`, peerID)
 	peer := vpn.GetOrCreatePeerByID(peerID)
 
-	peer.onNoControlStreamsLeftChan <- struct{}{}
-	peer.onNoForwarderStreamsLeftChan <- struct{}{}
+	go func() {
+		peer.onNoControlStreamsLeftChan <- struct{}{}
+		peer.onNoForwarderStreamsLeftChan <- struct{}{}
+	}()
 	return nil
 }
 
