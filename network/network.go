@@ -51,7 +51,7 @@ const (
 )
 
 var (
-	sitSpotExpireInterval = time.Hour * 24 * 30
+	addressExpireInterval = time.Hour * 24 * 30
 	bufferSize            = 1 << 16
 )
 
@@ -328,13 +328,10 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 				sitSpots = sitSpots[:sitSpotsPerPeerLimit]
 			}
 			for _, sitSpot := range sitSpots {
-				if time.Since(sitSpot.LastSuccessfulHandshakeTS) > sitSpotExpireInterval {
-					// We actually could put "break" here instead of "continue", because sitSpots are already
-					// sorted by LastSuccessfulHandshakeTS. But performance is not important here, so we
-					// leave a "continue" here just in case.
-					continue
-				}
-				for _, maddrString := range sitSpot.Addresses {
+				for maddrString, lastSeenTS := range sitSpot.Addresses {
+					if time.Since(lastSeenTS) > addressExpireInterval {
+						continue
+					}
 					maddr, err := multiaddr.NewMultiaddr(maddrString)
 					if err != nil {
 						logger.Error(errors.Wrap(err, `unable to parse MultiAddr`, maddrString))
@@ -616,7 +613,8 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 		}
 		stream, err = mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, addrInfo.ID, p2pProtocolID)
 		if err != nil {
-			mesh.logger.Infof("unable create a new stream to %v: %v", addrInfo.ID, errors.Wrap(err, fmt.Sprintf("%T", err)))
+			mesh.logger.Debugf("%v", errors.Wrap(err))
+			mesh.logger.Infof("unable create a new stream to %v: %v (%v)", addrInfo.ID, err, fmt.Sprintf("%T", err))
 			return nil
 		}
 	}
@@ -771,7 +769,7 @@ func (mesh *Network) SendBroadcastMessage(topic string, msg []byte) (err error) 
 func (mesh *Network) SendMessage(peerID peer.ID, topic string, msg []byte) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	if len(topic)+len(msg)+4 >= bufferSize {
+	if len(topic)+len(msg)+6 >= bufferSize {
 		return ErrMessageTooLong
 	}
 
@@ -784,9 +782,10 @@ func (mesh *Network) SendMessage(peerID peer.ID, topic string, msg []byte) (err 
 	buf := sendMessageBufferPool.Get().([]byte)
 	buf[0] = uint8(MessageTypeCustom)
 	binary.LittleEndian.PutUint16(buf[1:], uint16(len(topic)))
-	copy(buf[3:], topic)
-	copy(buf[3+len(topic):], msg)
-	_, err = stream.Write(buf[:1+2+len(topic)+len(msg)])
+	copy(buf[1+2:], topic)
+	binary.LittleEndian.PutUint16(buf[1+2+len(topic):], uint16(len(msg)))
+	copy(buf[1+2+len(topic)+2:], msg)
+	_, err = stream.Write(buf[:1+2+len(topic)+2+len(msg)])
 	sendMessageBufferPool.Put(buf)
 	return err
 }
@@ -806,8 +805,10 @@ func (mesh *Network) streamHandler(stream Stream) {
 	defer mesh.logger.Debugf(`endof streamHandler for %v`, stream.Conn().RemotePeer())
 
 	buf := make([]byte, bufferSize)
+
+streamHandlerLoop:
 	for {
-		n, err := stream.Read(buf)
+		n, err := stream.Read(buf[:1])
 		if err != nil {
 			mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
 			break
@@ -819,25 +820,62 @@ func (mesh *Network) streamHandler(stream Stream) {
 		}
 
 		msgType := MessageType(buf[0])
-		payload := buf[1:n]
 		switch msgType {
 		case MessageTypeCustom:
+			n, err := stream.Read(buf[:2])
+			if err != nil {
+				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				break streamHandlerLoop
+			}
+			payload := buf[0:n]
+
 			if len(payload) < 2 {
 				mesh.logger.Error(errors.Wrap(ErrMessageTooShort, n))
 				continue
 			}
+
 			topicLength := binary.LittleEndian.Uint16(payload)
-			payload = payload[2:]
+
+			n, err = stream.Read(buf[:topicLength])
+			if err != nil {
+				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				break streamHandlerLoop
+			}
+			payload = buf[0:n]
+
 			if len(payload) < int(topicLength) {
 				mesh.logger.Error(errors.Wrap(ErrMessageTooShort, n, len(payload), topicLength))
 				continue
 			}
+
 			topic := string(payload[:topicLength])
-			payload = payload[topicLength:]
-			mesh.logger.Debugf(`received a custom message with topic "%v" from %v, payload: %v`, topic, stream.Conn().RemotePeer(), payload)
+
+			n, err = stream.Read(buf[:2])
+			if err != nil {
+				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				break streamHandlerLoop
+			}
+			payload = buf[0:n]
+
+			payloadLength := binary.LittleEndian.Uint16(payload)
+
+			n, err = stream.Read(buf[:payloadLength])
+			if err != nil {
+				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				break streamHandlerLoop
+			}
+			payload = buf[0:payloadLength]
+
+			if len(payload) < int(payloadLength) {
+				mesh.logger.Error(errors.Wrap(ErrMessageTooShort, n, len(payload), payloadLength))
+				continue
+			}
+
+			mesh.logger.Debugf(`received a custom message with topic "%v" from %v, payload: %v %v`, topic, stream.Conn().RemotePeer(), string(payload), payload)
 			mesh.onReceiveMessageCustom(stream, topic, payload)
 		default:
-			mesh.logger.Error(errors.Wrap(ErrUnexpectedMessage, msgType, payload))
+			mesh.logger.Error(errors.Wrap(ErrUnexpectedMessage, msgType))
+			_, _ = stream.Read(buf)
 		}
 	}
 
@@ -1021,10 +1059,10 @@ func (mesh *Network) start() (err error) {
 		for _, knownPeer := range mesh.knownPeers {
 			var addresses []multiaddr.Multiaddr
 			for _, sitSpot := range knownPeer.SitSpots {
-				if time.Since(sitSpot.LastSuccessfulHandshakeTS) > sitSpotExpireInterval {
-					continue
-				}
-				for _, maddrString := range sitSpot.Addresses {
+				for maddrString, lastSeenTS := range sitSpot.Addresses {
+					if time.Since(lastSeenTS) > addressExpireInterval {
+						continue
+					}
 					maddr, err := multiaddr.NewMultiaddr(maddrString)
 					if err != nil {
 						mesh.logger.Error(errors.Wrap(err, `unable to parse MultiAddr`, maddrString))
@@ -1291,7 +1329,7 @@ func (mesh *Network) addToKnownPeers(peerAddr AddrInfo) (err error) {
 	var sitSpot *KnownPeerSitSpot
 findSitSpot:
 	for _, oneSitSpot := range knownPeer.SitSpots {
-		for _, maddrOld := range oneSitSpot.Addresses {
+		for maddrOld, _ := range oneSitSpot.Addresses {
 			for _, maddrNew := range peerAddr.Addrs {
 				if maddrOld == maddrNew.String() {
 					sitSpot = oneSitSpot
@@ -1306,10 +1344,12 @@ findSitSpot:
 		knownPeer.SitSpots = append(knownPeer.SitSpots, sitSpot)
 	}
 
-	for _, maddr := range peerAddr.Addrs {
-		sitSpot.Addresses = append(sitSpot.Addresses, maddr.String())
+	if sitSpot.Addresses == nil {
+		sitSpot.Addresses = map[string]time.Time{}
 	}
-	sitSpot.LastSuccessfulHandshakeTS = time.Now()
+	for _, maddr := range peerAddr.Addrs {
+		sitSpot.Addresses[maddr.String()] = time.Now()
+	}
 
 	knownPeersJSON, err := json.Marshal(mesh.knownPeers)
 	if err != nil {

@@ -12,8 +12,7 @@ type KnownPeer struct {
 }
 
 type KnownPeerSitSpot struct {
-	Addresses                 []string
-	LastSuccessfulHandshakeTS time.Time
+	Addresses map[string]time.Time
 }
 
 type KnownPeers map[p2ppeer.ID]*KnownPeer

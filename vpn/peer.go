@@ -86,7 +86,6 @@ func (peer *Peer) Close() (err error) {
 		if err != nil {
 			peer.VPN.logger.Error(errors.Wrap(err))
 		}
-		peer.IPFSControlStreamIngoing = nil
 	}
 
 	if peer.IPFSControlStreamOutgoing != nil {
@@ -94,7 +93,6 @@ func (peer *Peer) Close() (err error) {
 		if err != nil {
 			peer.VPN.logger.Error(errors.Wrap(err))
 		}
-		peer.IPFSControlStreamOutgoing = nil
 	}
 
 	if peer.IPFSForwarderStreamIngoing != nil {
@@ -102,7 +100,6 @@ func (peer *Peer) Close() (err error) {
 		if err != nil {
 			peer.VPN.logger.Error(errors.Wrap(err))
 		}
-		peer.IPFSForwarderStreamIngoing = nil
 	}
 
 	if peer.IPFSForwarderStreamOutgoing != nil {
@@ -110,7 +107,6 @@ func (peer *Peer) Close() (err error) {
 		if err != nil {
 			peer.VPN.logger.Error(errors.Wrap(err))
 		}
-		peer.IPFSForwarderStreamOutgoing = nil
 	}
 
 	if peer.IPFSTunnelConnToWG != nil {
@@ -213,8 +209,12 @@ func (peer *Peer) onNoForwarderStreamsLeft() {
 	})
 
 	outgoingStream.Connect()
+	if outgoingStream.Stream == nil {
+		vpn.logger.Infof(`Lost the IPFS connection to %v`, peer.ID)
+		return
+	}
 
-	vpn.logger.Debugf(`New outgoing traffic forward stream for peer %v`, peer.ID)
+	vpn.logger.Debugf(`A new outgoing traffic forward stream for peer %v`, peer.ID)
 
 	err := peer.AddTunnelConnection(outgoingStream, AddrInfo{ID: peer.ID})
 	if err != nil {
@@ -249,6 +249,69 @@ func (peer *Peer) AddControlStream(stream Stream, peerAddr AddrInfo) (err error)
 	return
 }
 
+func (peer *Peer) sendIntAliases(conn io.Writer) (err error) {
+	defer func() { err = errors.Wrap(err) }()
+	vpn := peer.VPN
+
+	vpn.logger.Debugf("sendIntAlias()")
+
+	knownAliases := IntAliases{vpn.IntAlias.Copy()}
+	vpn.peers.Range(func(_, peerI interface{}) bool {
+		peer := peerI.(*Peer)
+		if peer.IntAlias.PeerID.String() == "" {
+			return true
+		}
+		knownAliases = append(knownAliases, peer.IntAlias.Copy())
+		return true
+	})
+	for _, intAlias := range knownAliases {
+		intAlias.Since = time.Since(intAlias.Timestamp)
+		intAlias.Timestamp = time.Time{}
+	}
+	b, err := knownAliases.Marshal()
+	if err != nil {
+		return
+	}
+
+	n, err := conn.Write(b)
+	vpn.logger.Debugf("sendIntAlias(): stream.Write(): %v %v %v", n, err, string(b))
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (peer *Peer) recvIntAliases(conn io.Reader) (remoteIntAliases IntAliases, err error) {
+	defer func() { err = errors.Wrap(err, fmt.Errorf("%T", err)) }()
+	vpn := peer.VPN
+
+	buf := make([]byte, bufferSize)
+
+	vpn.logger.Debugf("recvIntAlias(): stream.Read()...")
+	n, err := conn.Read(buf)
+	vpn.logger.Debugf("recvIntAlias(): stream.Read(): %v %v %v", n, err, string(vpn.buffer[:n]))
+
+	if n >= bufferSize {
+		return nil, errors.New("too big message")
+	}
+	if err != nil {
+		return
+	}
+
+	err = remoteIntAliases.Unmarshal(buf[:n])
+	if err != nil {
+		err = errors.Wrap(err, string(buf[:n]))
+		return
+	}
+
+	if len(remoteIntAliases) == 0 {
+		return nil, errors.New("empty slice")
+	}
+
+	return
+}
+
 func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
@@ -260,12 +323,14 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 	vpn.newStreamLocker.Lock()
 	defer vpn.newStreamLocker.Unlock()
 
-	err = vpn.sendIntAliases(conn)
+	err = peer.sendIntAliases(conn)
 	if err != nil {
 		return
 	}
 
-	remoteIntAliases, err := vpn.recvIntAliases(conn)
+	vpn.newStreamLocker.Unlock()
+	remoteIntAliases, err := peer.recvIntAliases(conn)
+	vpn.newStreamLocker.Lock()
 	if err != nil {
 		return
 	}
@@ -302,11 +367,13 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 				vpn.IntAlias.Timestamp, remoteIntAliases[0].Timestamp,
 				vpn.myID, peer.ID)
 
-			err = vpn.sendIntAliases(conn)
+			err = peer.sendIntAliases(conn)
 			if err != nil {
 				return
 			}
-			remoteIntAliases, err = vpn.recvIntAliases(conn)
+			vpn.newStreamLocker.Unlock()
+			remoteIntAliases, err = peer.recvIntAliases(conn)
+			vpn.newStreamLocker.Lock()
 			if err != nil {
 				return
 			}
@@ -325,11 +392,13 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 					break
 				}
 			}
-			err = vpn.sendIntAliases(conn)
+			err = peer.sendIntAliases(conn)
 			if err != nil {
 				return
 			}
-			_, err = vpn.recvIntAliases(conn)
+			vpn.newStreamLocker.Unlock()
+			_, err = peer.recvIntAliases(conn)
+			vpn.newStreamLocker.Lock()
 			if err != nil {
 				return
 			}
@@ -659,7 +728,7 @@ func (peer *Peer) controlStreamReaderLoop(conn io.ReadWriteCloser) {
 		size, err := conn.Read(buffer[:])
 		if err != nil {
 			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
-				peer.VPN.logger.Infof("IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
+				peer.VPN.logger.Infof("[control] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
 				peer.VPN.logger.Error(errors.Wrap(err))
 			}
@@ -711,7 +780,7 @@ func (peer *Peer) tunnelToWgForwarderLoop(conn io.ReadWriteCloser) {
 		size, err := conn.Read(buffer[:])
 		if err != nil {
 			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
-				peer.VPN.logger.Infof("IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
+				peer.VPN.logger.Infof("[tunnel] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
 				peer.VPN.logger.Error(errors.Wrap(err))
 			}
@@ -798,6 +867,10 @@ func (peer *Peer) SendPing(chType ChannelType) (err error) {
 
 	switch chType {
 	case ChannelTypeDirect, ChannelTypeTunnel:
+		if peer.IntAlias.Value == 0 {
+			peer.VPN.logger.Debugf(`peer<%v>.SendPing(%v): peer.IntAlias.Value == 0`, peer.ID, chType)
+			return
+		}
 		var remoteVPNIP net.IP
 		if remoteVPNIP, err = peer.VPN.GetIP(peer.IntAlias.Value, ChannelTypeDirect); err != nil {
 			return
@@ -874,10 +947,12 @@ func (peer *Peer) GetRemoteRealIP(chType ChannelType) net.IP {
 
 func (peer *Peer) GetOptimalChannel(chTypes ...ChannelType) (optimalChannelType ChannelType) {
 	optimalChannelType = ChannelType_undefined
-	minRTT := time.Duration(time.Hour)
+	minRTT := time.Duration(time.Second)
 
 	for _, chType := range chTypes {
 		stats := &peer.channelStatistics[chType]
+		peer.VPN.logger.Debugf(`peer<%v>.GetOptimalChannel(%v): %v: check: %v %v %v`, peer.ID, chTypes, chType, stats.RTT, minRTT, stats.SamplesCount)
+
 		stats.locker.RLock()
 		if stats.SamplesCount == 0 {
 			stats.locker.RUnlock()
@@ -1018,12 +1093,10 @@ func (peer *Peer) stopIPFSForwarderStream(isOutgoing bool) (err error) {
 	if isOutgoing {
 		if peer.IPFSForwarderStreamOutgoing != nil {
 			_ = peer.IPFSForwarderStreamOutgoing.Close()
-			peer.IPFSForwarderStreamOutgoing = nil
 		}
 	} else {
 		if peer.IPFSForwarderStreamIngoing != nil {
 			_ = peer.IPFSForwarderStreamIngoing.Close()
-			peer.IPFSForwarderStreamIngoing = nil
 		}
 	}
 
@@ -1036,12 +1109,10 @@ func (peer *Peer) stopIPFSControlStream(isOutgoing bool) (err error) {
 	if isOutgoing {
 		if peer.IPFSControlStreamOutgoing != nil {
 			_ = peer.IPFSControlStreamOutgoing.Close()
-			peer.IPFSControlStreamOutgoing = nil
 		}
 	} else {
 		if peer.IPFSControlStreamIngoing != nil {
 			_ = peer.IPFSControlStreamIngoing.Close()
-			peer.IPFSControlStreamIngoing = nil
 		}
 	}
 
@@ -1133,8 +1204,8 @@ func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 		}
 		if peer.IPFSForwarderStreamIngoing != nil && !peer.ingoingForwarderStreamTunnelWriterRunning {
 			peer.ingoingForwarderStreamTunnelWriterRunning = true
-			go func(stream Stream) {
-				peer.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, stream)
+			go func(connToWG net.Conn, stream Stream) {
+				peer.wgToTunnelForwarderLoop(connToWG, stream)
 				peer.VPN.logger.Debugf(`endof peer<%v>.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, peer.IPFSForwarderStreamIngoing)`, peer.ID)
 				peer.locker.Lock()
 				peer.ingoingForwarderStreamTunnelWriterRunning = false
@@ -1144,12 +1215,12 @@ func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 					peer.IPFSForwarderStreamIngoing = nil
 				}
 				peer.locker.Unlock()
-			}(peer.IPFSForwarderStreamIngoing)
+			}(peer.IPFSTunnelConnToWG, peer.IPFSForwarderStreamIngoing)
 		}
 		if peer.IPFSForwarderStreamOutgoing != nil && !peer.outgoingForwarderStreamTunnelWriterRunning {
 			peer.outgoingForwarderStreamTunnelWriterRunning = true
-			go func(stream Stream) {
-				peer.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, stream)
+			go func(connToWG net.Conn, stream Stream) {
+				peer.wgToTunnelForwarderLoop(connToWG, stream)
 				peer.VPN.logger.Debugf(`endof peer<%v>.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, peer.IPFSForwarderStreamOutgoing)`, peer.ID)
 				peer.locker.Lock()
 				peer.outgoingForwarderStreamTunnelWriterRunning = false
@@ -1159,7 +1230,7 @@ func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 					peer.IPFSForwarderStreamOutgoing = nil
 				}
 				peer.locker.Unlock()
-			}(peer.IPFSForwarderStreamOutgoing)
+			}(peer.IPFSTunnelConnToWG, peer.IPFSForwarderStreamOutgoing)
 		}
 	case ChannelTypeTunnel:
 		if peer.SimpleTunnelConnToWG == nil {

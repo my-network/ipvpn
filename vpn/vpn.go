@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	e "errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -55,6 +54,7 @@ type AddrInfo = network.AddrInfo
 type VPN struct {
 	Config
 
+	locker                       sync.RWMutex
 	logger                       Logger
 	mesh                         *network.Network
 	myID                         peer.ID
@@ -121,6 +121,11 @@ func New(dirPath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) 
 }
 
 func (vpn *VPN) SetNetwork(mesh *network.Network) {
+	vpn.logger.Debugf(`SetNetwork`)
+
+	vpn.locker.Lock()
+	defer vpn.locker.Unlock()
+
 	vpn.mesh = mesh
 
 	// TODO: unset the handlers on Close()
@@ -131,18 +136,34 @@ func (vpn *VPN) SetNetwork(mesh *network.Network) {
 }
 
 func (vpn *VPN) handleRequestDirectPort(stream Stream, payload []byte) {
+	vpn.logger.Debugf(`handleRequestDirectPort`)
+
+	vpn.locker.RLock()
+	defer vpn.locker.RUnlock()
+
 	vpn.notifyPeerAboutMyPort(stream.Conn().RemotePeer(), ChannelTypeDirect, vpn.Config.DirectWGPort)
 }
 
 func (vpn *VPN) handleRequestSimpleTunnelPort(stream Stream, payload []byte) {
-	vpn.notifyPeerAboutMyPort(stream.Conn().RemotePeer(), ChannelTypeDirect, vpn.Config.SimpleTunnelPort)
+	vpn.logger.Debugf(`handleRequestSimpleTunnelPort`)
+
+	vpn.locker.RLock()
+	defer vpn.locker.RUnlock()
+
+	vpn.notifyPeerAboutMyPort(stream.Conn().RemotePeer(), ChannelTypeTunnel, vpn.Config.SimpleTunnelPort)
 }
 
 func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
+	vpn.logger.Debugf(`handleUpdateDirectPort`)
+
 	if len(payload) != 2 {
 		vpn.logger.Error(errors.Wrap(ErrWrongMessageLength, len(payload), payload))
 		return
 	}
+
+	vpn.locker.RLock()
+	defer vpn.locker.RUnlock()
+
 	peerID := stream.Conn().RemotePeer().String()
 	peerConfig := vpn.Peers[peerID]
 	peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
@@ -155,10 +176,16 @@ func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
 }
 
 func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
+	vpn.logger.Debugf(`handleUpdateSimpleTunnelPort`)
+
 	if len(payload) != 2 {
 		vpn.logger.Error(errors.Wrap(ErrWrongMessageLength, len(payload), payload))
 		return
 	}
+
+	vpn.locker.RLock()
+	defer vpn.locker.RUnlock()
+
 	peerID := stream.Conn().RemotePeer().String()
 	peerConfig := vpn.Peers[peerID]
 	peerConfig.SimpleTunnelPort = binary.LittleEndian.Uint16(payload)
@@ -175,10 +202,20 @@ func (vpn *VPN) ProtocolID() protocol.ID {
 }
 
 func (vpn *VPN) AddUpperHandler(upperHandler UpperHandler) {
+	vpn.logger.Debugf(`AddUpperHandler`)
+
+	vpn.locker.Lock()
+	defer vpn.locker.Unlock()
+
 	vpn.upperHandlers = append(vpn.upperHandlers, upperHandler)
 }
 
 func (vpn *VPN) GetNetworkMaximalSize() uint64 {
+	vpn.logger.Debugf(`GetNetworkMaximalSize`)
+
+	vpn.locker.RLock()
+	defer vpn.locker.RUnlock()
+
 	addressLength := net.IPv6len * 8
 	subnet := vpn.wgnets[ChannelTypeDirect].Subnet
 	_, bits := subnet.Mask.Size()
@@ -189,6 +226,11 @@ func (vpn *VPN) GetNetworkMaximalSize() uint64 {
 }
 
 func (vpn *VPN) SetID(newID peer.ID) {
+	vpn.logger.Debugf(`SetID`)
+
+	vpn.locker.Lock()
+	defer vpn.locker.Unlock()
+
 	vpn.myID = newID
 	vpn.Config.IntAlias.PeerID = vpn.myID
 	err := vpn.SaveConfig()
@@ -229,7 +271,9 @@ func (vpn *VPN) GetIP(intAlias uint64, chType ChannelType) (resultIP net.IP, err
 	defer func() { err = errors.Wrap(err) }()
 	defer func() { vpn.logger.Debugf("GetIP(%v, %v) -> %v, %v", intAlias, chType, resultIP, err) }()
 
-	subnet := vpn.wgnets[chType].Subnet
+	vpn.logger.Debugf(`GetIP`)
+
+	subnet := vpn.wgnets[chType].Subnet // TODO: read this value atomically
 
 	maskOnes, maskBits := subnet.Mask.Size()
 	if intAlias >= 1<<uint32(maskBits-maskOnes) {
@@ -240,10 +284,15 @@ func (vpn *VPN) GetIP(intAlias uint64, chType ChannelType) (resultIP net.IP, err
 }
 
 func (vpn *VPN) subnetContainsMultiaddr(maddr multiaddr.Multiaddr, chType ChannelType) bool {
+	vpn.logger.Debugf(`subnetContainsMultiaddr`)
+
 	addr4, err := maddr.ValueForProtocol(multiaddr.P_IP4)
 	if err != nil {
 		return false
 	}
+	vpn.locker.RLock()
+	defer vpn.locker.RUnlock()
+
 	subnet := vpn.wgnets[chType].Subnet
 	return subnet.Contains(net.ParseIP(addr4))
 }
@@ -273,9 +322,15 @@ func (vpn *VPN) IsStarted() bool {
 func (vpn *VPN) Start() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	vpn.logger.Debugf(`Start`)
+	defer vpn.logger.Debugf(`/Start`)
+
 	if !atomic.CompareAndSwapUint32(&vpn.state, 0, 1) {
 		return ErrAlreadyStarted
 	}
+
+	vpn.locker.Lock()
+	defer vpn.locker.Unlock()
 
 	for _, chType := range ChannelTypes {
 		vpn.wgnets[chType].IfaceName, err = wgcreate.Create(vpn.ifaceNamePrefix+chType.String(), defaultMTU, true, &device.Logger{
@@ -511,6 +566,7 @@ func (vpn *VPN) directConnectorLoop() {
 
 		// Measure latencies to peers
 
+		vpn.logger.Debugf(`directConnectorLoop(): starting a measuring of latencies to peers`)
 		for _, peer := range vpn.getPeers() {
 			for _, chType := range ChannelTypes {
 				if pingErrI := peer.SendPing(chType); pingErrI != nil {
@@ -530,31 +586,38 @@ func (vpn *VPN) directConnectorLoop() {
 		time.Sleep(time.Millisecond * 500)
 
 		// Wait for signal to start the routines
+		vpn.logger.Debugf(`directConnectorLoop(): waiting`)
 		select {
 		case <-ticker.C:
 		case <-vpn.directConnectorTrigger:
-			for { // If we already have a queue of requests time we should run an iteration only once, so clearing the queue
-				timer := time.NewTimer(time.Millisecond)
+			timer := time.NewTimer(time.Millisecond)
+			finishedWaiting := false
+			for finishedWaiting { // If we already have a queue of requests time we should run an iteration only once, so clearing the queue
 				select {
 				case <-vpn.directConnectorTrigger:
 				case <-timer.C:
+					finishedWaiting = true
 				}
-				timer.Stop()
 			}
+			timer.Stop()
 		}
 
 		// Setup direct connections
 
+		vpn.logger.Debugf(`directConnectorLoop(): trying to setup direct connections`)
 		for _, peer := range vpn.getPeers() {
 			chType := peer.GetOptimalChannel(ChannelTypeTunnel, ChannelTypeIPFS)
+			vpn.logger.Debugf(`directConnectorLoop(): trying to setup a direct connection to %v. Optimal channel: %v`, peer.ID, chType)
 			if chType == ChannelType_undefined {
 				continue
 			}
 			go func(peer *Peer, chType ChannelType) {
 				newDirectAddr := peer.GetRemoteRealIP(chType)
+				vpn.logger.Debugf(`directConnectorLoop(): go: locking the peer...`)
 				peer.locker.Lock()
 				defer peer.locker.Unlock()
-				if peer.DirectAddr == nil && peer.DirectAddr.IP.String() != newDirectAddr.String() {
+				vpn.logger.Debugf(`directConnectorLoop(): go: locked the peer. newDirectAddr == %v (%v)`, newDirectAddr, chType)
+				if peer.DirectAddr == nil || peer.DirectAddr.IP.String() != newDirectAddr.String() {
 					port := vpn.getPeerPort(peer.ID, ChannelTypeDirect)
 					vpn.logger.Debugf(`vpn.getPeerPort("%v", ChannelTypeDirect) -> %v`, peer.ID, port)
 					if port == 0 {
@@ -626,9 +689,16 @@ func (vpn *VPN) Close() (err error) {
 		vpn.logger.Error(err1)
 	}
 
-	err2 := vpn.simpleTunnelListener.Close()
-	if err2 != nil {
-		vpn.logger.Error(err2)
+	var err2 error
+	if vpn.simpleTunnelListener != nil {
+		vpn.logger.Debugf(`Close(): simpleTunnelListener != nil`)
+		vpn.locker.RLock()
+		defer vpn.locker.RUnlock()
+
+		err2 = vpn.simpleTunnelListener.Close()
+		if err2 != nil {
+			vpn.logger.Error(err2)
+		}
 	}
 
 	if err0 != nil {
@@ -687,11 +757,39 @@ func (vpn *VPN) updateWireGuardConfiguration() (err error) {
 			extra25519.PrivateKeyToCurve25519((*[32]byte)(wgCfg.PrivateKey), &privKey)
 		}
 
-		vpn.logger.Debugf("wgCfg for %v with pubkey %v is %v", chType, wgCfg.PrivateKey.PublicKey(), wgCfg)
+		// On MacOS function vpn.wgctl.ConfigureDevice hangs sometimes, so we were have to add this hacks here :(
+		{
+			tryingToConfigureTheDevice := true
+			endChan := make(chan struct{})
+			for tryingToConfigureTheDevice {
+				go func() {
+					vpn.logger.Debugf("wgCfg for %v (interface: %v) with pubkey %v is %v", chType, vpn.wgnets[chType].IfaceName, wgCfg.PrivateKey.PublicKey(), wgCfg)
 
-		err = vpn.wgctl.ConfigureDevice(vpn.wgnets[chType].IfaceName, wgCfg)
-		if err != nil {
-			return
+					err = vpn.wgctl.ConfigureDevice(vpn.wgnets[chType].IfaceName, wgCfg)
+					endChan <- struct{}{}
+					if err != nil {
+						return
+					}
+
+					vpn.logger.Debugf("/wgCfg for %v (interface: %v) with pubkey %v is %v", chType, vpn.wgnets[chType].IfaceName, wgCfg.PrivateKey.PublicKey(), wgCfg)
+				}()
+
+				waitTimer := time.NewTimer(time.Second * 5)
+				select {
+				case <-endChan:
+					waitTimer.Stop()
+					tryingToConfigureTheDevice = false
+					continue
+				case <-waitTimer.C:
+					vpn.logger.Error(`timed-out`)
+					vpn.wgnets[chType].IfaceName, err = wgcreate.Create(vpn.ifaceNamePrefix+chType.String(), defaultMTU, true, &device.Logger{
+						Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard-"+chType.String()+"] ", 0),
+						Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard-"+chType.String()+"] ", 0),
+						Error: log.New(vpn.logger.GetErrorWriter(), "[wireguard-"+chType.String()+"] ", 0),
+					})
+				}
+			}
+			close(endChan)
 		}
 
 		if wgPort == 0 {
@@ -761,67 +859,6 @@ func (vpn *VPN) GetPSK() []byte {
 	return vpn.psk
 }
 
-func (vpn *VPN) sendIntAliases(conn io.Writer) (err error) {
-	defer func() { err = errors.Wrap(err) }()
-
-	vpn.logger.Debugf("sendIntAlias()")
-
-	knownAliases := IntAliases{vpn.IntAlias.Copy()}
-	vpn.peers.Range(func(_, peerI interface{}) bool {
-		peer := peerI.(*Peer)
-		if peer.IntAlias.PeerID.String() == "" {
-			return true
-		}
-		knownAliases = append(knownAliases, peer.IntAlias.Copy())
-		return true
-	})
-	for _, intAlias := range knownAliases {
-		intAlias.Since = time.Since(intAlias.Timestamp)
-		intAlias.Timestamp = time.Time{}
-	}
-	b, err := knownAliases.Marshal()
-	if err != nil {
-		return
-	}
-
-	n, err := conn.Write(b)
-	vpn.logger.Debugf("sendIntAlias(): stream.Write(): %v %v %v", n, err, string(b))
-	if err != nil {
-		return
-	}
-
-	return
-}
-
-func (vpn *VPN) recvIntAliases(conn io.Reader) (remoteIntAliases IntAliases, err error) {
-	defer func() { err = errors.Wrap(err, fmt.Errorf("%T", err)) }()
-
-	vpn.logger.Debugf("recvIntAlias(): stream.Read()...")
-	vpn.newStreamLocker.Unlock()
-	n, err := conn.Read(vpn.buffer[:])
-	vpn.newStreamLocker.Lock()
-	vpn.logger.Debugf("recvIntAlias(): stream.Read(): %v %v %v", n, err, string(vpn.buffer[:n]))
-
-	if n >= bufferSize {
-		return nil, errors.New("too big message")
-	}
-	if err != nil {
-		return
-	}
-
-	err = remoteIntAliases.Unmarshal(vpn.buffer[:n])
-	if err != nil {
-		err = errors.Wrap(err, string(vpn.buffer[:n]))
-		return
-	}
-
-	if len(remoteIntAliases) == 0 {
-		return nil, errors.New("empty slice")
-	}
-
-	return
-}
-
 func (vpn *VPN) setupIfaceIPAddress(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
@@ -832,8 +869,6 @@ func (vpn *VPN) setupIfaceIPAddress(chType ChannelType) (err error) {
 	}
 
 	wgnet := &vpn.wgnets[chType]
-	wgnet.locker.Lock()
-	defer wgnet.locker.Unlock()
 
 	if wgnet.currentIP.String() == myIP.String() {
 		return
@@ -870,6 +905,9 @@ func (vpn *VPN) SetIntAlias(newValue uint64) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	vpn.logger.Debugf("SetIntAlias: %v->%v", vpn.IntAlias.Value, newValue)
+
+	vpn.locker.Lock()
+	defer vpn.locker.Unlock()
 
 	vpn.IntAlias.Value = newValue
 	vpn.IntAlias.Timestamp = time.Now()
@@ -989,6 +1027,8 @@ func peerIDToWgPubKey(peerID peer.ID) (result wgtypes.Key, err error) {
 }*/
 
 func (vpn *VPN) GetOrCreatePeerByID(peerID peer.ID) *Peer {
+	vpn.logger.Debugf(`GetOrCreatePeerByID: %v`, peerID)
+
 	if peerID == vpn.myID {
 		vpn.logger.Error(errors.New("got a connection to myself, should not happened, ever"))
 		return nil

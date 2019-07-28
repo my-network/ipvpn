@@ -23,7 +23,7 @@ func NewReconnectableStream(logger Logger, newFunc func() (Stream, error)) *Reco
 }
 
 func (stream *ReconnectableStream) Connect() {
-	for {
+	for i := 0; i < 10; i++ {
 		streamRaw, err := stream.newFunc()
 		if err != nil {
 			stream.logger.Debugf(`unable to connect: %v`, errors.Wrap(err))

@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rand"
 	"encoding/binary"
+	e "errors"
 	"golang.org/x/crypto/ed25519"
 	"io"
 
@@ -12,7 +13,7 @@ import (
 )
 
 var (
-	ErrInvalidSignature = errors.New(`invalid signature`)
+	ErrInvalidSignature = e.New(`invalid signature`)
 )
 
 var (
