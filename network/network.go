@@ -1429,3 +1429,12 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 func (mesh *Network) NewStream(peerID peer.ID, protocolID p2pprotocol.ID) (stream Stream, err error) {
 	return mesh.ipfsNode.PeerHost.NewStream(mesh.ipfsContext, peerID, protocolID)
 }
+
+func (mesh *Network) ClosePeer(peerID peer.ID) {
+	for _, conn := range mesh.ipfsNode.PeerHost.Network().ConnsToPeer(peerID) {
+		err := conn.Close()
+		if err != nil {
+			mesh.logger.Error(errors.Wrap(err))
+		}
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -65,6 +66,18 @@ type Peer struct {
 	WgPubKey                    wgtypes.Key
 	channelStatistics           [ChannelType_max]channelStatistics
 
+	onNoForwarderStreamsLeftConcurrency int32
+	context                             context.Context
+	contextCancelFunc                   context.CancelFunc
+	onNoControlStreamsLeftChan          chan struct{}
+	onNoForwarderStreamsLeftChan        chan struct{}
+	startChannelChan                    chan ChannelType
+	setIPFSForwarderStreamChan          chan struct {
+		Stream
+		bool
+	}
+	switchDirectChannelToPathOfChannelChan chan ChannelType
+
 	ingoingForwarderStreamTunnelWriterRunning  bool
 	outgoingForwarderStreamTunnelWriterRunning bool
 	ingoingForwarderStreamTunnelReaderRunning  bool
@@ -75,11 +88,128 @@ type Peer struct {
 
 type Peers []*Peer
 
+func (peer *Peer) LockDo(fn func()) {
+	peer.locker.Lock()
+	defer peer.locker.Unlock()
+
+	fn()
+}
+
+func (peer *Peer) Start() {
+	peer.LockDo(func() {
+		peer.context, peer.contextCancelFunc = context.WithCancel(context.Background())
+		peer.onNoControlStreamsLeftChan = make(chan struct{})
+		peer.onNoForwarderStreamsLeftChan = make(chan struct{})
+		peer.startChannelChan = make(chan ChannelType)
+		peer.setIPFSForwarderStreamChan = make(chan struct {
+			Stream
+			bool
+		})
+		peer.switchDirectChannelToPathOfChannelChan = make(chan ChannelType)
+		peer.startCallChansHandler()
+	})
+}
+
+func (peer *Peer) startCallChansHandler() {
+	go peer.callChansHandlerLoop()
+}
+
+func (peer *Peer) isFinished() bool {
+	select {
+	case <-peer.context.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (peer *Peer) callChansHandlerLoop() {
+	for {
+		var err error
+
+		err = nil
+		select {
+		case <-peer.context.Done():
+			return
+		case <-peer.onNoControlStreamsLeftChan:
+			if peer.isFinished() {
+				return
+			}
+			peer.onNoControlStreamsLeft()
+		case <-peer.onNoForwarderStreamsLeftChan:
+			if peer.isFinished() {
+				return
+			}
+			peer.onNoForwarderStreamsLeft()
+		case chType := <-peer.startChannelChan:
+			if peer.isFinished() {
+				return
+			}
+			err = peer.startChannel(chType)
+		case args := <-peer.setIPFSForwarderStreamChan:
+			if peer.isFinished() {
+				return
+			}
+			err = peer.setIPFSForwarderStream(args.Stream, args.bool)
+		case chType := <-peer.switchDirectChannelToPathOfChannelChan:
+			if peer.isFinished() {
+				return
+			}
+			peer.switchDirectChannelToPathOfChannel(chType)
+		}
+		if err != nil {
+			peer.VPN.logger.Error(err)
+		}
+	}
+}
+
 func (peer *Peer) Close() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	peer.locker.Lock()
-	defer peer.locker.Unlock()
+	peer.VPN.logger.Debugf(`peer<%v>.Close()`, peer.ID)
+
+	select {
+	case <-peer.context.Done():
+		return ErrAlreadyClosed
+	default:
+	}
+	peer.contextCancelFunc()
+
+	peer.LockDo(func() {
+		err = peer.cleanup()
+	})
+	return
+}
+
+func (peer *Peer) cleanup() (err error) {
+	defer func() { err = errors.Wrap(err) }()
+
+	peer.VPN.logger.Debugf(`peer<%v>.cleanup()`, peer.ID)
+
+	if peer.onNoControlStreamsLeftChan != nil {
+		close(peer.onNoControlStreamsLeftChan)
+		peer.onNoControlStreamsLeftChan = nil
+	}
+
+	if peer.onNoForwarderStreamsLeftChan != nil {
+		close(peer.onNoForwarderStreamsLeftChan)
+		peer.onNoForwarderStreamsLeftChan = nil
+	}
+
+	if peer.startChannelChan != nil {
+		close(peer.startChannelChan)
+		peer.startChannelChan = nil
+	}
+
+	if peer.setIPFSForwarderStreamChan != nil {
+		close(peer.setIPFSForwarderStreamChan)
+		peer.setIPFSForwarderStreamChan = nil
+	}
+
+	if peer.switchDirectChannelToPathOfChannelChan != nil {
+		close(peer.switchDirectChannelToPathOfChannelChan)
+		peer.switchDirectChannelToPathOfChannelChan = nil
+	}
 
 	if peer.IPFSControlStreamIngoing != nil {
 		err = peer.IPFSControlStreamIngoing.Close()
@@ -136,14 +266,12 @@ func (peer *Peer) Close() (err error) {
 	peer.VPN.peers.Delete(peer.GetID())
 	peer.VPN.logger.Debugf("peer closed %v %v", peer.IntAlias.Value, peer.GetID())
 
+	peer.VPN.mesh.ClosePeer(peer.GetID())
 	return
 }
 
 func (peer *Peer) configureDevice(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
-
-	peer.locker.Lock()
-	defer peer.locker.Unlock()
 
 	if peer.IPFSTunnelConnToWG == nil {
 		if peer.IPFSTunnelConnToWG, peer.IPFSTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
@@ -180,6 +308,11 @@ func (peer *Peer) onNoControlStreamsLeft() {
 
 	vpn.logger.Debugf("no control streams left, peer.ID == %v", peer.ID)
 
+	if peer.IPFSControlStream() != nil {
+		vpn.logger.Debugf(`peer<%v>.onNoControlStreamsLeft(): false alarm`, peer.ID)
+		return
+	}
+
 	outgoingStream := helpers.NewReconnectableStream(vpn.logger, func() (Stream, error) {
 		return vpn.mesh.NewStream(peer.ID, vpn.ProtocolID()+`/control/`+protocol.ID(vpn.myID.String()))
 	})
@@ -188,7 +321,7 @@ func (peer *Peer) onNoControlStreamsLeft() {
 
 	vpn.logger.Debugf(`New outgoing control stream for peer %v`, peer.ID)
 
-	err := peer.AddControlStream(outgoingStream, AddrInfo{ID: peer.ID})
+	err := peer.addControlStream(outgoingStream, AddrInfo{ID: peer.ID})
 	if err != nil {
 		vpn.logger.Error(errors.Wrap(err))
 		err := outgoingStream.Close()
@@ -197,6 +330,18 @@ func (peer *Peer) onNoControlStreamsLeft() {
 			return
 		}
 	}
+}
+
+func (peer *Peer) IPFSForwarderStream() Stream {
+	peer.VPN.logger.Debugf(`IPFSForwarderStream`)
+
+	peer.locker.RLock()
+	defer peer.locker.RUnlock()
+	if peer.IPFSForwarderStreamIngoing != nil {
+		return peer.IPFSForwarderStreamIngoing
+	}
+
+	return peer.IPFSForwarderStreamOutgoing
 }
 
 func (peer *Peer) onNoForwarderStreamsLeft() {
@@ -204,30 +349,69 @@ func (peer *Peer) onNoForwarderStreamsLeft() {
 
 	vpn.logger.Debugf("no forwarder streams left, peer.ID == %v", peer.ID)
 
-	outgoingStream := helpers.NewReconnectableStream(vpn.logger, func() (Stream, error) {
-		return vpn.mesh.NewStream(peer.ID, vpn.ProtocolID()+`/wg/`+protocol.ID(vpn.myID.String()))
-	})
-
-	outgoingStream.Connect()
-	if outgoingStream.Stream == nil {
-		vpn.logger.Infof(`Lost the IPFS connection to %v`, peer.ID)
+	if peer.IPFSForwarderStream() != nil {
+		vpn.logger.Debugf(`peer<%v>.onNoForwarderStreamsLeft(): false alarm`, peer.ID)
 		return
 	}
 
-	vpn.logger.Debugf(`A new outgoing traffic forward stream for peer %v`, peer.ID)
-
-	err := peer.AddTunnelConnection(outgoingStream, AddrInfo{ID: peer.ID})
-	if err != nil {
-		vpn.logger.Error(errors.Wrap(err))
-		err := outgoingStream.Close()
-		if err != nil {
-			vpn.logger.Error(errors.Wrap(err))
+	go func() {
+		if concurrency := atomic.AddInt32(&peer.onNoForwarderStreamsLeftConcurrency, 1); concurrency > 1 {
+			vpn.logger.Debugf(`peer<%v>.onNoForwarderStreamsLeft(): is already running`, peer.ID)
+			if len(peer.onNoForwarderStreamsLeftChan) == 0 {
+				vpn.logger.Debugf(`peer<%v>.onNoForwarderStreamsLeft(): is already running -> pending`, peer.ID)
+				peer.onNoForwarderStreamsLeftChan <- struct{}{}
+			}
+			atomic.AddInt32(&peer.onNoForwarderStreamsLeftConcurrency, -1)
 			return
 		}
-	}
+		outgoingStream := helpers.NewReconnectableStream(vpn.logger, func() (Stream, error) {
+			return vpn.mesh.NewStream(peer.ID, vpn.ProtocolID()+`/wg/`+protocol.ID(vpn.myID.String()))
+		})
+
+		outgoingStream.Connect()
+		if outgoingStream.Stream == nil {
+			vpn.logger.Infof(`Lost the IPFS connection to %v`, peer.ID)
+			return
+		}
+
+		vpn.logger.Debugf(`A new outgoing traffic forward stream for peer %v`, peer.ID)
+
+		peer.addTunnelConnection(outgoingStream, AddrInfo{ID: peer.ID})
+	}()
 }
 
-func (peer *Peer) AddControlStream(stream Stream, peerAddr AddrInfo) (err error) {
+func (peer *Peer) SwitchDirectChannelToPathOfChannel(chType ChannelType) {
+	go func() {
+		peer.VPN.logger.Debugf(`peer<%v>.SwitchDirectChannelToPathOfChannel(%v)`, peer.ID, chType)
+		peer.switchDirectChannelToPathOfChannelChan <- chType
+	}()
+}
+
+func (peer *Peer) switchDirectChannelToPathOfChannel(chType ChannelType) {
+	vpn := peer.VPN
+	peer.VPN.logger.Debugf(`peer<%v>.switchDirectChannelToPathOfChannel(%v)`, peer.ID, chType)
+
+	newDirectAddr := peer.GetRemoteRealIP(chType)
+	if peer.DirectAddr != nil && peer.DirectAddr.IP.String() == newDirectAddr.String() {
+		return
+	}
+	port := vpn.getPeerPort(peer.ID, ChannelTypeDirect)
+	vpn.logger.Debugf(`vpn.getPeerPort("%v", ChannelTypeDirect) -> %v`, peer.ID, port)
+	if port == 0 {
+		return
+	}
+
+	peer.LockDo(func() {
+		peer.DirectAddr = &net.UDPAddr{
+			IP:   newDirectAddr,
+			Port: int(port),
+		}
+	})
+
+	peer.StartChannel(ChannelTypeDirect)
+}
+
+func (peer *Peer) addControlStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	switch connTyped := stream.(type) {
@@ -239,9 +423,9 @@ func (peer *Peer) AddControlStream(stream Stream, peerAddr AddrInfo) (err error)
 		panic(`should not happened`)
 	}
 
-	peer.VPN.logger.Debugf("calling peer.StartControlStream()")
+	peer.VPN.logger.Debugf("calling peer.startControlStream()")
 
-	err = peer.StartControlStream()
+	err = peer.startControlStream()
 	if err != nil {
 		return
 	}
@@ -255,7 +439,7 @@ func (peer *Peer) sendIntAliases(conn io.Writer) (err error) {
 
 	vpn.logger.Debugf("sendIntAlias()")
 
-	knownAliases := IntAliases{vpn.IntAlias.Copy()}
+	knownAliases := IntAliases{vpn.GetIntAlias().Copy()}
 	vpn.peers.Range(func(_, peerI interface{}) bool {
 		peer := peerI.(*Peer)
 		if peer.IntAlias.PeerID.String() == "" {
@@ -312,25 +496,40 @@ func (peer *Peer) recvIntAliases(conn io.Reader) (remoteIntAliases IntAliases, e
 	return
 }
 
-func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) (err error) {
+func (peer *Peer) NewIncomingStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	vpn := peer.VPN
 
-	vpn.logger.Debugf("new tunnel connection to %v", peer.ID)
-	defer vpn.logger.Debugf("finished to setup of a new tunnel connection to %v", peer.ID)
+	switch {
+	case strings.HasPrefix(string(stream.Protocol()), string(vpn.ProtocolID()+`/wg/`)):
+		vpn.logger.Debugf(`newIncomingStream: wg for %v`, peerAddr.ID)
+		go peer.addTunnelConnection(stream, peerAddr)
+		return
+	case strings.HasPrefix(string(stream.Protocol()), string(vpn.ProtocolID()+`/control/`)):
+		vpn.logger.Debugf(`newIncomingStream: control for %v`, peerAddr.ID)
+		return peer.addControlStream(stream, peerAddr)
+	}
 
-	vpn.newStreamLocker.Lock()
-	defer vpn.newStreamLocker.Unlock()
+	panic(`should not happen`)
+}
+
+func (peer *Peer) negotiate(conn io.ReadWriteCloser) (remoteIntAlias IntAlias, err error) {
+	vpn := peer.VPN
+
+	myIntAlias := vpn.GetIntAlias()
+
+	peer.locker.RLock()
+	defer peer.locker.RUnlock()
 
 	err = peer.sendIntAliases(conn)
 	if err != nil {
 		return
 	}
 
-	vpn.newStreamLocker.Unlock()
+	peer.locker.RUnlock()
 	remoteIntAliases, err := peer.recvIntAliases(conn)
-	vpn.newStreamLocker.Lock()
+	peer.locker.RLock()
 	if err != nil {
 		return
 	}
@@ -341,20 +540,20 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 		return true
 	})
 	for _, remoteIntAlias := range remoteIntAliases {
-		if remoteIntAlias.PeerID == vpn.IntAlias.PeerID {
+		if remoteIntAlias.PeerID == myIntAlias.PeerID {
 			continue
 		}
 		remoteIntAlias.Timestamp = time.Now().Add(-remoteIntAlias.Since)
 		notMyIntAliases[remoteIntAlias.Value] = remoteIntAlias
 	}
-	if remoteIntAliases[0].Value == vpn.IntAlias.Value {
+	if remoteIntAliases[0].Value == myIntAlias.Value {
 		changeOnRemoteSide := false
-		if vpn.IntAlias.MaxNetworkSize > remoteIntAliases[0].MaxNetworkSize {
+		if myIntAlias.MaxNetworkSize > remoteIntAliases[0].MaxNetworkSize {
 			changeOnRemoteSide = true
-		} else if vpn.IntAlias.MaxNetworkSize == remoteIntAliases[0].MaxNetworkSize {
-			if vpn.IntAlias.Timestamp.UnixNano() > remoteIntAliases[0].Timestamp.UnixNano() {
+		} else if myIntAlias.MaxNetworkSize == remoteIntAliases[0].MaxNetworkSize {
+			if myIntAlias.Timestamp.UnixNano() > remoteIntAliases[0].Timestamp.UnixNano() {
 				changeOnRemoteSide = true
-			} else if vpn.IntAlias.Timestamp.UnixNano() == remoteIntAliases[0].Timestamp.UnixNano() {
+			} else if myIntAlias.Timestamp.UnixNano() == remoteIntAliases[0].Timestamp.UnixNano() {
 				if vpn.myID < peer.ID {
 					changeOnRemoteSide = true
 				}
@@ -363,22 +562,23 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 
 		if changeOnRemoteSide {
 			vpn.logger.Debugf("int alias collision, remote side should change it's alias %v <?= %v , %v <?= %v, %v >? %v",
-				vpn.IntAlias.Value, remoteIntAliases[0].Value,
-				vpn.IntAlias.Timestamp, remoteIntAliases[0].Timestamp,
+				myIntAlias.Value, remoteIntAliases[0].Value,
+				myIntAlias.Timestamp, remoteIntAliases[0].Timestamp,
 				vpn.myID, peer.ID)
 
 			err = peer.sendIntAliases(conn)
 			if err != nil {
 				return
 			}
-			vpn.newStreamLocker.Unlock()
+			peer.locker.RUnlock()
 			remoteIntAliases, err = peer.recvIntAliases(conn)
-			vpn.newStreamLocker.Lock()
+			peer.locker.Lock()
 			if err != nil {
 				return
 			}
-			if remoteIntAliases[0].Value == vpn.IntAlias.Value {
-				return errors.New("remote side decided not to change it's int alias, close connection")
+			if remoteIntAliases[0].Value == myIntAlias.Value {
+				err = errors.New("remote side decided not to change it's int alias, close connection")
+				return
 			}
 		} else {
 			vpn.logger.Debugf("int alias collision, changing our int alias")
@@ -389,6 +589,7 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 					if err != nil {
 						return
 					}
+					myIntAlias = vpn.GetIntAlias()
 					break
 				}
 			}
@@ -396,9 +597,9 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 			if err != nil {
 				return
 			}
-			vpn.newStreamLocker.Unlock()
+			peer.locker.RUnlock()
 			_, err = peer.recvIntAliases(conn)
-			vpn.newStreamLocker.Lock()
+			peer.locker.RLock()
 			if err != nil {
 				return
 			}
@@ -410,64 +611,87 @@ func (peer *Peer) AddTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo
 		}
 	}
 
-	vpn.logger.Debugf("negotiations with %v are complete", peerAddr.ID)
+	vpn.logger.Debugf("negotiations with %v are complete", peer.ID)
 
-	remoteIntAliases[0].Timestamp = time.Now().Add(-remoteIntAliases[0].Since)
+	remoteIntAlias = *remoteIntAliases[0]
+	remoteIntAlias.Timestamp = time.Now().Add(-remoteIntAlias.Since)
 
-	peer.IntAlias = *remoteIntAliases[0]
+	return
+}
 
-	var chType ChannelType
+func (peer *Peer) SetIntAlias(newIntAlias IntAlias) {
+	peer.LockDo(func() {
+		peer.IntAlias = newIntAlias
+	})
+}
+
+func (peer *Peer) setupTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo, remoteIntAlias IntAlias) (chType ChannelType) {
+	vpn := peer.VPN
+
+	peer.SetIntAlias(remoteIntAlias)
+
 	switch connTyped := conn.(type) {
 	case *helpers.ReconnectableStream:
 		chType = ChannelTypeIPFS
-		_ = peer.SetIPFSForwarderStream(connTyped, true)
+		peer.SetIPFSForwarderStream(connTyped, true)
 	case Stream:
 		chType = ChannelTypeIPFS
-		_ = peer.SetIPFSForwarderStream(connTyped, false)
+		peer.SetIPFSForwarderStream(connTyped, false)
 	case *udpWriter:
 		vpn.cancelPingSenderLoop(peerAddr.ID)
 		chType = ChannelTypeTunnel
-		_ = peer.SetSimpleTunnelConn(connTyped)
+		peer.SetSimpleTunnelConn(connTyped)
 	case *net.UDPConn:
 		vpn.cancelPingSenderLoop(peerAddr.ID)
 		chType = ChannelTypeTunnel
-		_ = peer.SetSimpleTunnelConn(connTyped)
+		peer.SetSimpleTunnelConn(connTyped)
 	case *udpClientSocket:
 		vpn.cancelPingSenderLoop(peerAddr.ID)
 		chType = ChannelTypeTunnel
-		_ = peer.SetSimpleTunnelConn(connTyped)
-	}
-
-	vpn.logger.Debugf("peer.Start(%v)", chType)
-
-	err = peer.Start(chType)
-	if err != nil {
-		return
-	}
-
-	saveErr := vpn.SaveConfig()
-	if saveErr != nil {
-		vpn.logger.Error(saveErr)
+		peer.SetSimpleTunnelConn(connTyped)
 	}
 
 	return
-
 }
 
-func (peer *Peer) StartControlStream() (err error) {
+func (peer *Peer) addTunnelConnection(conn io.ReadWriteCloser, peerAddr AddrInfo) {
+	vpn := peer.VPN
+	vpn.logger.Debugf("new tunnel connection to %v", peer.ID)
+
+	remoteIntAlias, err := peer.negotiate(conn)
+	if err != nil {
+		return
+	}
+	chType := peer.setupTunnelConnection(conn, peerAddr, remoteIntAlias)
+
+	vpn.logger.Debugf("peer.StartChannel(%v)", chType)
+
+	peer.StartChannel(chType)
+
+	go func() {
+		saveErr := vpn.SaveConfig()
+		if saveErr != nil {
+			vpn.logger.Error(saveErr)
+		}
+	}()
+
+	vpn.logger.Debugf("finished to setup on a new tunnel connection to %v", peer.ID)
+}
+
+func (peer *Peer) startControlStream() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	peer.VPN.logger.Debugf(`peer<%v>.StartControlStream()`, peer.ID)
-	defer peer.VPN.logger.Debugf(`endof peer<%v>.StartControlStream()`, peer.ID)
+	peer.VPN.logger.Debugf(`peer<%v>.startControlStream()`, peer.ID)
+	defer peer.VPN.logger.Debugf(`endof peer<%v>.startControlStream()`, peer.ID)
 
 	peer.locker.Lock()
 	defer peer.locker.Unlock()
 
 	if peer.IPFSControlStreamIngoing != nil && !peer.ingoingControlStreamTunnelReaderRunning {
-		peer.VPN.logger.Debugf(`peer<%v>.StartControlStream(): starting ingoing stream reader`, peer.ID)
+		peer.VPN.logger.Debugf(`peer<%v>.startControlStream(): starting ingoing stream reader`, peer.ID)
 		peer.ingoingControlStreamTunnelReaderRunning = true
 		go func(stream Stream) {
-			peer.controlStreamReaderLoop(peer.IPFSControlStreamIngoing)
+			peer.controlStreamReaderLoop(stream)
 			peer.VPN.logger.Debugf(`endof peer<%v>.controlStreamReaderLoop(peer.IPFSControlStreamIngoing)`, peer.ID)
 			peer.locker.Lock()
 			peer.ingoingControlStreamTunnelReaderRunning = false
@@ -478,7 +702,7 @@ func (peer *Peer) StartControlStream() (err error) {
 			}
 			if peer.IPFSControlStreamOutgoing == nil {
 				peer.VPN.logger.Debugf(`peer<%v>.IPFSControlStreamOutgoing == nil`, peer.ID)
-				go peer.onNoControlStreamsLeft()
+				peer.onNoControlStreamsLeftChan <- struct{}{}
 			}
 			peer.locker.Unlock()
 
@@ -486,10 +710,10 @@ func (peer *Peer) StartControlStream() (err error) {
 	}
 
 	if peer.IPFSControlStreamOutgoing != nil && !peer.outgoingControlStreamTunnelReaderRunning {
-		peer.VPN.logger.Debugf(`peer<%v>.StartControlStream(): starting outgoing stream reader`, peer.ID)
+		peer.VPN.logger.Debugf(`peer<%v>.startControlStream(): starting outgoing stream reader`, peer.ID)
 		peer.outgoingControlStreamTunnelReaderRunning = true
 		go func(stream Stream) {
-			peer.controlStreamReaderLoop(peer.IPFSControlStreamOutgoing)
+			peer.controlStreamReaderLoop(stream)
 			peer.VPN.logger.Debugf(`endof peer<%v>.controlStreamReaderLoop(peer.IPFSControlStreamOutgoing)`, peer.ID)
 			peer.locker.Lock()
 			peer.outgoingControlStreamTunnelReaderRunning = false
@@ -500,7 +724,7 @@ func (peer *Peer) StartControlStream() (err error) {
 			}
 			if peer.IPFSControlStreamIngoing == nil {
 				peer.VPN.logger.Debugf(`peer<%v>.IPFSControlStreamIngoing == nil`, peer.ID)
-				go peer.onNoControlStreamsLeft()
+				peer.onNoControlStreamsLeftChan <- struct{}{}
 			}
 			peer.locker.Unlock()
 		}(peer.IPFSControlStreamOutgoing)
@@ -509,7 +733,13 @@ func (peer *Peer) StartControlStream() (err error) {
 	return
 }
 
-func (peer *Peer) Start(chType ChannelType) (err error) {
+func (peer *Peer) StartChannel(chType ChannelType) {
+	go func() {
+		peer.startChannelChan <- chType
+	}()
+}
+
+func (peer *Peer) startChannel(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	err = peer.configureDevice(chType)
@@ -517,14 +747,16 @@ func (peer *Peer) Start(chType ChannelType) (err error) {
 		return
 	}
 
-	err = peer.startTunnelWriter(chType)
-	if err != nil {
-		return
-	}
+	if chType != ChannelTypeDirect {
+		err = peer.startTunnelWriter(chType)
+		if err != nil {
+			return
+		}
 
-	err = peer.startTunnelReader(chType)
-	if err != nil {
-		return
+		err = peer.startTunnelReader(chType)
+		if err != nil {
+			return
+		}
 	}
 
 	go func() {
@@ -605,6 +837,8 @@ func (peer *Peer) GetPublicKey() ed25519.PublicKey {
 func (peer *Peer) replyWithPong(pingBytes []byte, writer io.Writer) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	defer func() { peer.VPN.logger.Debugf(`peer<%v>.replyWithPong -> %v`, peer.ID, err) }()
+
 	recvTS := time.Now()
 
 	var pong MessagePong
@@ -612,14 +846,16 @@ func (peer *Peer) replyWithPong(pingBytes []byte, writer io.Writer) (err error) 
 		return
 	}
 
-	if signErr := pong.VerifySender(peer.GetPublicKey()); signErr != nil {
-		peer.VPN.logger.Infof("invalid sender signature of an incoming ping message from peer %v: %v", peer.GetID(), signErr)
+	if signErr := pong.MessagePing.VerifySender(peer.GetPublicKey()); signErr != nil {
+		peer.VPN.logger.Infof("invalid sender signature of an incoming ping message from peer %v (%v): %v %v: %v", peer.GetID(), peer.GetPublicKey(), pong.MessagePingData.Bytes(), pong.SenderSignature, signErr)
 		return
 	}
 
 	pong.ReceiveTS = recvTS.UnixNano()
+	privKey := peer.VPN.PrivKey()
+
 	pong.SendTS = time.Now().UnixNano()
-	if err = pong.SignRecipient(peer.VPN.privKey); err != nil {
+	if err = pong.SignRecipient(privKey); err != nil {
 		return
 	}
 
@@ -627,7 +863,7 @@ func (peer *Peer) replyWithPong(pingBytes []byte, writer io.Writer) (err error) 
 	if err = binary.Write(&buf, binary.LittleEndian, MessageTypePong); err != nil {
 		return
 	}
-	if err = binary.Write(&buf, binary.LittleEndian, pong.Bytes()); err != nil {
+	if err = pong.WriteTo(&buf); err != nil {
 		return
 	}
 
@@ -640,6 +876,8 @@ func (peer *Peer) replyWithPong(pingBytes []byte, writer io.Writer) (err error) 
 
 func (peer *Peer) considerRTT(chType ChannelType, rtt time.Duration) (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	defer func() { peer.VPN.logger.Debugf(`peer<%v>.considerRTT(%v %v) -> %v`, peer.ID, chType, rtt, err) }()
 
 	if rtt.Nanoseconds() < 0 {
 		return errors.Wrap(ErrNegativeRTT, rtt.Nanoseconds())
@@ -668,6 +906,8 @@ func (peer *Peer) considerRTT(chType ChannelType, rtt time.Duration) (err error)
 func (peer *Peer) considerPong(chType ChannelType, pong *MessagePong) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	defer func() { peer.VPN.logger.Debugf(`peer<%v>.considerPong -> %v`, peer.ID, err) }()
+
 	recvTS := time.Now()
 
 	if signErr := pong.VerifySender(peer.VPN.GetPublicKey()); signErr != nil {
@@ -689,6 +929,8 @@ func (peer *Peer) considerPong(chType ChannelType, pong *MessagePong) (err error
 
 func (peer *Peer) considerPongBytes(pongBytes []byte) (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	peer.VPN.logger.Debugf(`peer<%v>.considerPongBytes: %v`, peer.ID, len(pongBytes))
 
 	var pong MessagePong
 	if err = pong.Read(pongBytes); err != nil {
@@ -725,15 +967,11 @@ func (peer *Peer) controlStreamReaderLoop(conn io.ReadWriteCloser) {
 	buffer := [peerBufferSize]byte{}
 
 	for {
-		size, err := conn.Read(buffer[:])
+		size, err := conn.Read(buffer[:2])
 		if err != nil {
 			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
 				peer.VPN.logger.Infof("[control] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
-				peer.VPN.logger.Error(errors.Wrap(err))
-			}
-			err := peer.Close()
-			if err != nil {
 				peer.VPN.logger.Error(errors.Wrap(err))
 			}
 			return
@@ -741,6 +979,23 @@ func (peer *Peer) controlStreamReaderLoop(conn io.ReadWriteCloser) {
 
 		if size < 2 {
 			peer.VPN.logger.Error(errors.Wrap(ErrMessageTooShort))
+			return
+		}
+
+		msg := buffer[:2]
+		msgType := MessageType(binary.LittleEndian.Uint16(msg))
+
+		var expectedSize int
+		switch msgType {
+		case MessageTypePing:
+			expectedSize = sizeOfMessagePing
+		case MessageTypePong:
+			expectedSize = sizeOfMessagePong
+		default:
+			err = errors.Wrap(ErrUnknownMessageType, msgType)
+		}
+		if err != nil {
+			peer.VPN.logger.Error(errors.Wrap(err))
 			err := peer.Close()
 			if err != nil {
 				peer.VPN.logger.Error(errors.Wrap(err))
@@ -748,12 +1003,27 @@ func (peer *Peer) controlStreamReaderLoop(conn io.ReadWriteCloser) {
 			return
 		}
 
-		msg := buffer[:size]
-		msgType := MessageType(binary.LittleEndian.Uint16(msg))
-		payload := msg[2:]
+		payload := buffer[:expectedSize]
 
+		size, err = conn.Read(payload)
+		if err != nil {
+			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
+				peer.VPN.logger.Infof("[control] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
+			} else {
+				peer.VPN.logger.Error(errors.Wrap(err))
+			}
+			return
+		}
+
+		if size < expectedSize {
+			peer.VPN.logger.Error(errors.Wrap(ErrMessageTooShort))
+			return
+		}
+
+		peer.VPN.logger.Debugf(`peer<%v>.controlStreamReaderLoop(): received a message (len: %v): %v %v`, peer.ID, size, msgType, payload)
 		switch msgType {
 		case MessageTypePing:
+			size = sizeOfMessagePing
 			err = peer.replyWithPong(payload, conn)
 		case MessageTypePong:
 			err = peer.considerPongBytes(payload)
@@ -764,10 +1034,6 @@ func (peer *Peer) controlStreamReaderLoop(conn io.ReadWriteCloser) {
 		}
 		if err != nil {
 			peer.VPN.logger.Error(errors.Wrap(err))
-			err := peer.Close()
-			if err != nil {
-				peer.VPN.logger.Error(errors.Wrap(err))
-			}
 			return
 		}
 	}
@@ -782,10 +1048,6 @@ func (peer *Peer) tunnelToWgForwarderLoop(conn io.ReadWriteCloser) {
 			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
 				peer.VPN.logger.Infof("[tunnel] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
-				peer.VPN.logger.Error(errors.Wrap(err))
-			}
-			err := peer.Close()
-			if err != nil {
 				peer.VPN.logger.Error(errors.Wrap(err))
 			}
 			return
@@ -826,7 +1088,7 @@ func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 				}
 				if peer.IPFSForwarderStreamOutgoing == nil {
 					peer.VPN.logger.Debugf(`peer<%v>.IPFSForwarderStreamOutgoing == nil`, peer.ID)
-					go peer.onNoForwarderStreamsLeft()
+					peer.VPN.OnPeerConnect(peer.ID)
 				}
 				peer.locker.Unlock()
 			}(peer.IPFSForwarderStreamIngoing)
@@ -847,7 +1109,7 @@ func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 				}
 				if peer.IPFSForwarderStreamIngoing == nil {
 					peer.VPN.logger.Debugf(`peer<%v>.IPFSForwarderStreamIngoing == nil`, peer.ID)
-					go peer.onNoForwarderStreamsLeft()
+					peer.VPN.OnPeerConnect(peer.ID)
 				}
 				peer.locker.Unlock()
 			}(peer.IPFSForwarderStreamOutgoing)
@@ -865,6 +1127,8 @@ func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 func (peer *Peer) SendPing(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	peer.VPN.logger.Debugf(`peer<%v>.SendPing(%v)...`, peer.ID, chType)
+
 	switch chType {
 	case ChannelTypeDirect, ChannelTypeTunnel:
 		if peer.IntAlias.Value == 0 {
@@ -872,7 +1136,7 @@ func (peer *Peer) SendPing(chType ChannelType) (err error) {
 			return
 		}
 		var remoteVPNIP net.IP
-		if remoteVPNIP, err = peer.VPN.GetIP(peer.IntAlias.Value, ChannelTypeDirect); err != nil {
+		if remoteVPNIP, err = peer.VPN.GetIP(peer.IntAlias.Value, chType); err != nil {
 			return
 		}
 		go func() {
@@ -894,18 +1158,25 @@ func (peer *Peer) SendPing(chType ChannelType) (err error) {
 		var ping MessagePing
 		ping.SequenceID = 0
 		ping.SendTS = time.Now().UnixNano()
-		if err = ping.SignSender(peer.VPN.privKey); err != nil {
+
+		privKey := peer.VPN.PrivKey()
+		if err = ping.SignSender(privKey); err != nil {
 			return
 		}
+		peer.VPN.logger.Debugf(`peer<%v>.SendPing(%v): signature: %v %v %v`, peer.ID, chType, privKey.Public(), ping.MessagePingData.Bytes(), ping.SenderSignature)
 		var buf bytes.Buffer
 		if err = binary.Write(&buf, binary.LittleEndian, MessageTypePing); err != nil {
 			return
 		}
-		buf.Write(ping.Bytes())
-
-		if _, err = writer.Write(buf.Bytes()); err != nil {
+		if err = ping.WriteTo(&buf); err != nil {
 			return
 		}
+
+		msg := buf.Bytes()
+		if _, err = writer.Write(msg); err != nil {
+			return
+		}
+		peer.VPN.logger.Debugf(`peer<%v>.SendPing(%v): sent: %v`, peer.ID, chType, msg)
 	default:
 		panic(fmt.Errorf(`shouldn't happened: %v`, chType))
 	}
@@ -1030,10 +1301,7 @@ func (peer *Peer) wgToTunnelForwarderLoop(wgConn io.Reader, tunnelConn io.Writer
 			if netErr, ok := err.(*net.OpError); ok {
 				if netErr.Err == io.EOF || netErr.Err.Error() == "use of closed network connection" {
 					peer.VPN.logger.Infof("tunnel connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
-					err := peer.Close()
-					if err != nil {
-						peer.VPN.logger.Error(errors.Wrap(err))
-					}
+					_ = peer.Close()
 					return
 				}
 			}
@@ -1048,10 +1316,6 @@ func (peer *Peer) wgToTunnelForwarderLoop(wgConn io.Reader, tunnelConn io.Writer
 		wSize, err := tunnelConn.Write(buffer[:size])
 		if size != wSize {
 			peer.VPN.logger.Error(errors.Wrap(ErrInvalidSize, size, wSize))
-			err = peer.Close()
-			if err != nil {
-				peer.VPN.logger.Error(errors.Wrap(err))
-			}
 			return
 		}
 
@@ -1120,6 +1384,8 @@ func (peer *Peer) stopIPFSControlStream(isOutgoing bool) (err error) {
 }
 
 func (peer *Peer) IPFSControlStream() Stream {
+	peer.VPN.logger.Debugf(`IPFSControlStream`)
+
 	peer.locker.RLock()
 	defer peer.locker.RUnlock()
 	if peer.IPFSControlStreamIngoing != nil {
@@ -1135,34 +1401,44 @@ func (peer *Peer) SetIPFSControlStream(stream Stream, isOutgoing bool) (err erro
 	peer.VPN.logger.Debugf(`peer<%v>.SetIPFSControlStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
 	defer peer.VPN.logger.Debugf(`endof peer<%v>.SetIPFSControlStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
 
-	peer.locker.Lock()
-	defer peer.locker.Unlock()
-	_ = peer.stopIPFSControlStream(isOutgoing)
+	peer.LockDo(func() {
+		_ = peer.stopIPFSControlStream(isOutgoing)
 
-	if isOutgoing {
-		peer.IPFSControlStreamOutgoing = stream
-	} else {
-		peer.IPFSControlStreamIngoing = stream
-	}
+		if isOutgoing {
+			peer.IPFSControlStreamOutgoing = stream
+		} else {
+			peer.IPFSControlStreamIngoing = stream
+		}
+	})
 
 	return
 }
 
-func (peer *Peer) SetIPFSForwarderStream(stream Stream, isOutgoing bool) (err error) {
+func (peer *Peer) SetIPFSForwarderStream(stream Stream, isOutgoing bool) {
+	go func() {
+		peer.VPN.logger.Debugf(`peer<%v>.SetIPFSForwarderStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
+		peer.setIPFSForwarderStreamChan <- struct {
+			Stream
+			bool
+		}{stream, isOutgoing}
+	}()
+}
+
+func (peer *Peer) setIPFSForwarderStream(stream Stream, isOutgoing bool) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	peer.VPN.logger.Debugf(`peer<%v>.SetIPFSForwarderStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
-	defer peer.VPN.logger.Debugf(`endof peer<%v>.SetIPFSForwarderStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
+	peer.VPN.logger.Debugf(`peer<%v>.setIPFSForwarderStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
+	defer peer.VPN.logger.Debugf(`endof peer<%v>.setIPFSForwarderStream("%v", %v)`, peer.ID, stream.Conn().RemotePeer(), isOutgoing)
 
-	peer.locker.Lock()
-	defer peer.locker.Unlock()
-	_ = peer.stopIPFSForwarderStream(isOutgoing)
+	peer.LockDo(func() {
+		_ = peer.stopIPFSForwarderStream(isOutgoing)
 
-	if isOutgoing {
-		peer.IPFSForwarderStreamOutgoing = stream
-	} else {
-		peer.IPFSForwarderStreamIngoing = stream
-	}
+		if isOutgoing {
+			peer.IPFSForwarderStreamOutgoing = stream
+		} else {
+			peer.IPFSForwarderStreamIngoing = stream
+		}
+	})
 
 	return
 }
@@ -1180,8 +1456,7 @@ func (peer *Peer) stopSimpleTunnelConn() (err error) {
 	return nil
 }
 
-func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) (err error) {
-	defer func() { err = errors.Wrap(err) }()
+func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) {
 
 	peer.locker.Lock()
 	defer peer.locker.Unlock()

@@ -158,14 +158,11 @@ func (r *simpleTunnelReader) processMessage(msg *simpleTunnelReaderQueueItem) {
 
 	if r.mySideIsReady && r.remoteSideIsReady {
 		conn := msg.conn
-		addrLocal := conn.LocalAddr()
 		addrRemote := msg.addrRemote
 
 		r.connectionInitContextStopFunc()
 		peer := r.vpn.GetOrCreatePeerByID(r.peerAddrRemote.ID)
-		if err := peer.AddTunnelConnection(newUDPWriter(conn, r, addrRemote), r.peerAddrRemote); err != nil {
-			r.vpn.logger.Error(errors.Wrap(err, `unable to open a tunnel connection`, addrLocal, addrRemote))
-		}
+		go peer.addTunnelConnection(newUDPWriter(conn, r, addrRemote), r.peerAddrRemote)
 	}
 
 	msg.Release()

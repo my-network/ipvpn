@@ -2,8 +2,6 @@ package vpn
 
 import (
 	"bytes"
-	"crypto"
-	"crypto/rand"
 	"encoding/binary"
 	e "errors"
 	"golang.org/x/crypto/ed25519"
@@ -31,12 +29,12 @@ type MessagePing struct {
 }
 
 func (pingData *MessagePingData) Bytes() []byte {
-	result := make([]byte, binary.Size(pingData))
-	err := pingData.Write(result)
+	buf := bytes.NewBuffer(make([]byte, binary.Size(pingData)))
+	err := pingData.WriteTo(buf)
 	if err != nil {
 		panic(err)
 	}
-	return result
+	return buf.Bytes()
 }
 
 func (pingData *MessagePingData) Write(b []byte) error {
@@ -50,10 +48,11 @@ func (pingData *MessagePingData) WriteTo(writer io.Writer) error {
 func (ping *MessagePing) SignSender(privKey ed25519.PrivateKey) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	signature, err := privKey.Sign(rand.Reader, ping.MessagePingData.Bytes(), crypto.Hash(0))
+	/*signature, err := privKey.Sign(rand.Reader, ping.MessagePingData.Bytes(), crypto.Hash(0))
 	if err != nil {
 		return
-	}
+	}*/
+	signature := ed25519.Sign(privKey, ping.MessagePingData.Bytes())
 	copy(ping.SenderSignature[:], signature)
 	return
 }
@@ -61,7 +60,7 @@ func (ping *MessagePing) SignSender(privKey ed25519.PrivateKey) (err error) {
 func (ping *MessagePing) VerifySender(pubKey ed25519.PublicKey) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	isValidSignature := ed25519.Verify(pubKey, ping.SenderSignature[:], ping.MessagePingData.Bytes())
+	isValidSignature := ed25519.Verify(pubKey, ping.MessagePingData.Bytes(), ping.SenderSignature[:])
 	if !isValidSignature {
 		return ErrInvalidSignature
 	}
@@ -69,12 +68,12 @@ func (ping *MessagePing) VerifySender(pubKey ed25519.PublicKey) (err error) {
 }
 
 func (ping *MessagePing) Bytes() []byte {
-	result := make([]byte, binary.Size(ping))
-	err := ping.Write(result)
+	buf := bytes.NewBuffer(make([]byte, binary.Size(ping)))
+	err := ping.WriteTo(buf)
 	if err != nil {
 		panic(err)
 	}
-	return result
+	return buf.Bytes()
 }
 
 func (ping *MessagePing) Read(b []byte) error {
