@@ -807,8 +807,8 @@ github.com/xaionaro-go/netlink v1.0.1-0.20190707164520-8aa940644b2a h1:Qyq+F6Yum
 github.com/xaionaro-go/netlink v1.0.1-0.20190707164520-8aa940644b2a/go.mod h1:ErDjZnokiyhMejICbEHk/ExuO43x002Spr91PGK7xVs=
 github.com/xaionaro-go/netlink v1.0.1-0.20190707164837-d98354129d81 h1:iEm6/oWpXR7i8pzz+lsjcGoY005nJ/qYLJCEEZFC2kU=
 github.com/xaionaro-go/netlink v1.0.1-0.20190707164837-d98354129d81/go.mod h1:F1qX8mf7GOEFZCXvGT3otjGyVmsrGC/yBbeAvnuZlMY=
-github.com/xaionaro-go/pinentry v0.0.0-20190317135045-959eecdd5c53 h1:df/lIFeXkEVhSXQmGTXjXd9eAeTi9pEBO+2LyHV1UhI=
-github.com/xaionaro-go/pinentry v0.0.0-20190317135045-959eecdd5c53/go.mod h1:VjrkUE3LlbZtxA9g/yL9pgVL+GyE+68N9owBMnR678U=
+github.com/xaionaro-go/pinentry v0.0.0-20190817122727-387561e90903 h1:11mHAKQ3NxRTkbarSNNKR4gw7MTXRrPSBoVrrcozpW8=
+github.com/xaionaro-go/pinentry v0.0.0-20190817122727-387561e90903/go.mod h1:VjrkUE3LlbZtxA9g/yL9pgVL+GyE+68N9owBMnR678U=
 github.com/xaionaro-go/spinlock v0.0.0-20190309154744-55278e21e817 h1:0ikx4JlTx9uNiHGGC4o0k93GhcWOtONYdhk2H8RUnZU=
 github.com/xaionaro-go/spinlock v0.0.0-20190309154744-55278e21e817/go.mod h1:Nb/15eS0BMty6TMuWgRQM8WCDIUlyPZagcpchHT6c9Y=
 github.com/xordataexchange/crypt v0.0.3-0.20170626215501-b2862e3d0a77/go.mod h1:aYKd//L2LvnjZzWKhF00oedf4jCCReLcmhLdhm1A27Q=

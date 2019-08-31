@@ -22,7 +22,7 @@ require (
 	github.com/stretchr/testify v1.3.0
 	github.com/xaionaro-go/atomicmap v0.0.0-20190707161005-2e6f4aeaa450
 	github.com/xaionaro-go/errors v0.0.0-20190618051035-77224f41226e
-	github.com/xaionaro-go/pinentry v0.0.0-20190317135045-959eecdd5c53
+	github.com/xaionaro-go/pinentry v0.0.0-20190817122727-387561e90903
 	github.com/xaionaro-go/spinlock v0.0.0-20190309154744-55278e21e817 // indirect
 	golang.org/x/crypto v0.0.0-20190701094942-4def268fd1a4
 	golang.org/x/sys v0.0.0-20190626221950-04f50cda93cb

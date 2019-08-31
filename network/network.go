@@ -1366,8 +1366,11 @@ findSitSpot:
 
 func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() {
+		mesh.logger.Debugf(`/addStream %v %v -> %v`, stream.Conn().RemotePeer(), stream.Conn().RemoteMultiaddr(), err)
 		maddr := stream.Conn().RemoteMultiaddr()
 		if err != nil {
+			err = errors.Wrap(err)
+
 			oldBadConnectionCount, ok := mesh.badConnectionCount.Load(maddr.String())
 			var newBadConnectionCount uint64
 			if !ok {

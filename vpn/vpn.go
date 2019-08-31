@@ -391,6 +391,7 @@ func (vpn *VPN) startCallChanHandler() error {
 
 func (vpn *VPN) callChanHandlerLoop() {
 	for vpn.IsStarted() {
+		vpn.logger.Debugf(`callChanHandlerLoop(): waiting...`)
 		var err error
 		select {
 		case args := <-vpn.newIncomingStreamChan:
@@ -599,7 +600,12 @@ func (vpn *VPN) requestPortInfo(peerID peer.ID, chType ChannelType) {
 	}
 	err := vpn.mesh.SendMessage(peerID, topic, nil)
 	if err != nil {
-		vpn.logger.Error(errors.Wrap(err, peerID, topic))
+		switch err.(errors.SmartError).OriginalError() {
+		case network.ErrPeerNotFound:
+			vpn.logger.Debugf(`peer %v not found (requestPortInfo: %v)`, peerID, chType)
+		default:
+			vpn.logger.Error(errors.Wrap(err, peerID, topic))
+		}
 	}
 }
 
@@ -1079,7 +1085,7 @@ func peerIDToWgPubKey(peerID peer.ID) (result wgtypes.Key, err error) {
 }*/
 
 func (vpn *VPN) GetOrCreatePeerByID(peerID peer.ID) (result *Peer) {
-	vpn.logger.Debugf(`getOrCreatePeerByID: %v`, peerID)
+	vpn.logger.Debugf(`GetOrCreatePeerByID: %v`, peerID)
 
 	if peerID == vpn.myID {
 		vpn.logger.Error(errors.New("got a connection to myself, should not happened, ever"))
@@ -1150,7 +1156,7 @@ func (vpn *VPN) onPeerConnect(peerID peer.ID) error {
 
 	go func() {
 		peer.RLockDo(func() {
-			if peer.IsFinished() {
+			if peer.isFinished() {
 				return
 			}
 			peer.onNoControlStreamsLeftChan <- struct{}{}
