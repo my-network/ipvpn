@@ -33,3 +33,5 @@ require (
 replace github.com/go-critic/go-critic => github.com/go-critic/go-critic v0.3.4
 
 replace github.com/golangci/ineffassign => github.com/golangci/ineffassign v0.0.0-20180808204949-2ee8f2867dde
+
+replace github.com/libp2p/go-libp2p-quic-transport => github.com/my-network/go-libp2p-quic-transport v0.1.2-0.20190702052731-897c7bdaec45

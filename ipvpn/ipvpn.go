@@ -218,6 +218,11 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 	if config.Get().DumpConfiguration {
 		logrus.Debugf("Configuration == %v", config.Get())
 	}
+
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
+		logrus.Error(errors.Wrap(err))
+	}
+
 	networkID, err := readStringFromFileTrim(dataDir, "network_id.txt")
 	if err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()) {
 		var pinentryClient pinentry.PinentryClient

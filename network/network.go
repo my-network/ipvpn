@@ -19,8 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/ipfs/go-cid"
 	ipfsConfig "github.com/ipfs/go-ipfs-config"
 	"github.com/ipfs/go-ipfs/core"
@@ -33,11 +31,12 @@ import (
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	p2pprotocol "github.com/libp2p/go-libp2p-core/protocol"
-	"github.com/libp2p/go-libp2p-kbucket"
+	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	"github.com/libp2p/go-libp2p/p2p/discovery"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 	"github.com/xaionaro-go/errors"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -243,6 +242,10 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 	logger.Debugf(`loading IPFS plugins`)
 
 	pluginLoader, err := loader.NewPluginLoader(``)
+	if err != nil {
+		return
+	}
+	err = pluginLoader.Initialize()
 	if err != nil {
 		return
 	}
@@ -1366,8 +1369,11 @@ findSitSpot:
 
 func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 	defer func() {
+		mesh.logger.Debugf(`/addStream %v %v -> %v`, stream.Conn().RemotePeer(), stream.Conn().RemoteMultiaddr(), err)
 		maddr := stream.Conn().RemoteMultiaddr()
 		if err != nil {
+			err = errors.Wrap(err)
+
 			oldBadConnectionCount, ok := mesh.badConnectionCount.Load(maddr.String())
 			var newBadConnectionCount uint64
 			if !ok {
