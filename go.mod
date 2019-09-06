@@ -34,4 +34,16 @@ replace github.com/go-critic/go-critic => github.com/go-critic/go-critic v0.3.4
 
 replace github.com/golangci/ineffassign => github.com/golangci/ineffassign v0.0.0-20180808204949-2ee8f2867dde
 
+replace github.com/golangci/errcheck => github.com/golangci/errcheck v0.0.0-20181223084120-ef45e06d44b6
+
+replace github.com/golangci/go-tools => github.com/golangci/go-tools v0.0.0-20190124090046-35a9f45a5db0
+
+replace github.com/golangci/gofmt => github.com/golangci/gofmt v0.0.0-20181222123516-0b8337e80d98
+
+replace github.com/golangci/gosec => github.com/golangci/gosec v0.0.0-20180901114220-8afd9cbb6cfb
+
+replace github.com/golangci/lint-1 => github.com/golangci/lint-1 v0.0.0-20181222135242-d2cdd8c08219
+
+replace mvdan.cc/unparam => mvdan.cc/unparam v0.0.0-20190720180237-d51796306d8f
+
 replace github.com/libp2p/go-libp2p-quic-transport => github.com/my-network/go-libp2p-quic-transport v0.1.2-0.20190702052731-897c7bdaec45

@@ -39,7 +39,7 @@ Used techniques:
 Just run on *all* your nodes (the sample commands):
 ```sh
 # install
-GO111MODULE=on go get github.com/my-network/ipvpn/cmd/ipvpnd
+GO111MODULE=on go get github.com/my-network/ipvpn/cmd/ipvpnd@latest
 sudo mkdir /var/run/wireguard
 sudo chown $UID /var/run/wireguard
 sudo setcap cap_net_raw,cap_net_admin+ep `go env GOPATH`/bin/ipvpnd
