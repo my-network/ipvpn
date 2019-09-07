@@ -1,7 +1,6 @@
 package vpn
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/binary"
@@ -24,6 +23,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/xaionaro-go/atomicmap"
+	"github.com/xaionaro-go/bytesextra"
 	"github.com/xaionaro-go/errors"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl"
@@ -59,6 +59,7 @@ type VPN struct {
 	logger                       Logger
 	mesh                         *network.Network
 	myID                         peer.ID
+	myIPFSAddrs                  []multiaddr.Multiaddr
 	ifaceNamePrefix              string
 	dirPath                      string
 	peers                        sync.Map
@@ -183,15 +184,17 @@ func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
 		return
 	}
 
-	peerID := stream.Conn().RemotePeer().String()
-	peerConfig := vpn.Peers[peerID]
-	peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
-	vpn.Peers[peerID] = peerConfig
+	go vpn.LockDo(func() {
+		peerID := stream.Conn().RemotePeer().String()
+		peerConfig := vpn.Peers[peerID]
+		peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
+		vpn.Peers[peerID] = peerConfig
 
-	warnErr := vpn.SaveConfig()
-	if warnErr != nil {
-		vpn.logger.Error(errors.Wrap(warnErr))
-	}
+		warnErr := vpn.SaveConfig()
+		if warnErr != nil {
+			vpn.logger.Error(errors.Wrap(warnErr))
+		}
+	})
 }
 
 func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
@@ -202,15 +205,17 @@ func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
 		return
 	}
 
-	peerID := stream.Conn().RemotePeer().String()
-	peerConfig := vpn.Peers[peerID]
-	peerConfig.SimpleTunnelPort = binary.LittleEndian.Uint16(payload)
-	vpn.Peers[peerID] = peerConfig
+	go vpn.LockDo(func() {
+		peerID := stream.Conn().RemotePeer().String()
+		peerConfig := vpn.Peers[peerID]
+		peerConfig.SimpleTunnelPort = binary.LittleEndian.Uint16(payload)
+		vpn.Peers[peerID] = peerConfig
 
-	warnErr := vpn.SaveConfig()
-	if warnErr != nil {
-		vpn.logger.Error(errors.Wrap(warnErr))
-	}
+		warnErr := vpn.SaveConfig()
+		if warnErr != nil {
+			vpn.logger.Error(errors.Wrap(warnErr))
+		}
+	})
 }
 
 func (vpn *VPN) ProtocolID() protocol.ID {
@@ -511,18 +516,23 @@ func (vpn *VPN) notifyPeersAboutMyPort(chType ChannelType, port uint16) {
 }
 
 func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
+	vpn.LockDo(func() {
+		vpn.myIPFSAddrs = addrs
+	})
 }
 
-func (vpn *VPN) getPeerPort(peerID peer.ID, chType ChannelType) uint16 {
-	switch chType {
-	case ChannelTypeDirect:
-		return vpn.Peers[peerID.String()].DirectWGPort
-	case ChannelTypeTunnel:
-		return vpn.Peers[peerID.String()].SimpleTunnelPort
-	default:
-		panic(fmt.Errorf(`unknown channel type: %v`, chType))
-	}
-	return 0
+func (vpn *VPN) getPeerPort(peerID peer.ID, chType ChannelType) (result uint16) {
+	vpn.RLockDo(func() {
+		switch chType {
+		case ChannelTypeDirect:
+			result = vpn.Peers[peerID.String()].DirectWGPort
+		case ChannelTypeTunnel:
+			result = vpn.Peers[peerID.String()].SimpleTunnelPort
+		default:
+			panic(fmt.Errorf(`unknown channel type: %v`, chType))
+		}
+	})
+	return
 }
 
 const simpleTunnelListenerReaderCacheSize = 0
@@ -547,7 +557,7 @@ func (vpn *VPN) simpleTunnelListenerReader(conn *net.UDPConn) {
 			return
 		}
 
-		vpn.logger.Debugf("conn<%v>.ReadFromUDP(buf) -> %v (%v)", conn.LocalAddr(), err, addr)
+		vpn.logger.Debugf("conn<%v>.ReadFromUDP(buf[:%v]) -> %v (%v)", conn.LocalAddr(), n, err, addr)
 		if err != nil {
 			if err == syscall.ECONNREFUSED { // TODO: consider IP_RECVERR
 				vpn.logger.Debugf("%v> ECONNREFUSED (%v), try again (to connect using for a hole punching)", conn.LocalAddr().String(), addr)
@@ -1178,6 +1188,7 @@ func (vpn *VPN) onPeerConnect(peerID peer.ID) error {
 	peer := vpn.GetOrCreatePeerByID(peerID)
 
 	go func() {
+		defer peer.recover()
 		if peer.isFinished() {
 			return
 		}
@@ -1222,8 +1233,14 @@ func getPublicKeyFromPeerID(id peer.ID) (pubKey ed25519.PublicKey, err error) {
 }
 
 func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs []*net.UDPAddr) {
+	startTS := time.Now()
+
+	vpn.logger.Debugf(`pingSenderLoop %v %v %v`, peerAddr, remoteUsualPort, startTS)
+	defer vpn.logger.Debugf(`/pingSenderLoop %v %v %v`, peerAddr, remoteUsualPort, startTS)
+
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	if prevCancelFunc, _ := vpn.pingSenderLoopCancelFunc.Swap(peerAddr.ID, &cancelFunc); prevCancelFunc != nil {
+		vpn.logger.Debugf(`cancelling the previous ping loop`)
 		(*prevCancelFunc.(*context.CancelFunc))()
 	}
 
@@ -1237,7 +1254,7 @@ func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs 
 	}()
 
 	sendBuf := make([]byte, sizeOfMessageType+sizeOfMessagePing)
-	if err := binary.Write(bytes.NewBuffer(sendBuf), binary.LittleEndian, MessageTypePing); err != nil {
+	if err := binary.Write(bytesextra.NewWriter(sendBuf), binary.LittleEndian, MessageTypePing); err != nil {
 		vpn.logger.Error(errors.Wrap(err))
 		return
 	}
@@ -1250,7 +1267,12 @@ func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs 
 			vpn.logger.Error(errors.Wrap(err, "unable to sign a message"))
 			return
 		}
-		_ = messagePing.Write(sendBuf[sizeOfMessageType:])
+		err = messagePing.Write(sendBuf[sizeOfMessageType:])
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, "unable to write a message"))
+			return
+		}
+		vpn.logger.Debugf(`ping message to be sent: %v`, sendBuf)
 		for _, addr := range addrs {
 			var conn *net.UDPConn
 			if remoteUsualPort != 0 && addr.Port != int(remoteUsualPort) {
@@ -1262,6 +1284,8 @@ func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs 
 				vpn.logger.Error(errors.Wrap(fmt.Errorf(`conn == nil: %v %v`, addr.Port, remoteUsualPort)))
 				continue
 			}
+
+			vpn.logger.Debugf(`pingSenderLoop sending a ping to %v from %v`, addr, conn.LocalAddr())
 			_, err := conn.WriteToUDP(sendBuf, addr)
 			if err != nil {
 				vpn.logger.Debugf(`%v> unable to send message: %v (%v)`, conn.LocalAddr(), err, addr)
@@ -1272,6 +1296,7 @@ func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs 
 		select {
 		case <-ctx.Done():
 			wakeuper.Stop()
+			vpn.logger.Debugf(`context has finished`)
 			return
 		case <-wakeuper.C:
 			wakeuper.Stop()
@@ -1293,9 +1318,11 @@ func (vpn *VPN) createSimpleTunnelReaders(peerAddr AddrInfo, addrs []*net.UDPAdd
 	reader, err = newSimpleTunnelReader(vpn, peerAddr, addrs, func() error { /* Close() func */
 		for _, addr := range addrs {
 			key := addrToKey(addr)
-			_ = vpn.simpleTunnelReaderMap.UnsetIf(key, func(value interface{}) bool {
+			if vpn.simpleTunnelReaderMap.UnsetIf(key, func(value interface{}) bool {
 				return value.(*simpleTunnelReader) == reader
-			})
+			}) == nil {
+				vpn.logger.Debugf(`vpn.simpleTunnelReaderMap.Unset(%v)`, addr)
+			}
 		}
 		return nil
 	})
@@ -1307,13 +1334,49 @@ func (vpn *VPN) createSimpleTunnelReaders(peerAddr AddrInfo, addrs []*net.UDPAdd
 	for _, addr := range addrs {
 		key := addrToKey(addr)
 		// TODO: we should limit number of possible readers, otherwise it could be used for DoS attacks (to get the node run out of memory)
+		vpn.logger.Debugf(`vpn.simpleTunnelReaderMap.Set(%v, reader)`, addr)
 		_ = vpn.simpleTunnelReaderMap.Set(key, reader)
 	}
 }
 
 func (vpn *VPN) startSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, addrs []*net.UDPAddr) {
-	vpn.createSimpleTunnelReaders(peerAddr, addrs)
-	go vpn.pingSenderLoop(peerAddr, remoteUsualPort, addrs)
+	var myAddresses []multiaddr.Multiaddr
+	vpn.RLockDo(func() {
+		myAddresses = vpn.myIPFSAddrs
+	})
+	m := map[string]struct{}{}
+	for _, addr := range myAddresses {
+		ip, err := addr.ValueForProtocol(multiaddr.P_IP4)
+		if err != nil {
+			continue
+		}
+		m[ip] = struct{}{}
+	}
+
+	var pingAddrs []*net.UDPAddr
+	for _, addr := range addrs {
+		if _, ok := m[addr.IP.String()]; ok {
+			continue
+		}
+		m[addr.IP.String()] = struct{}{}
+
+		pingAddr := &net.UDPAddr{
+			IP:   addr.IP,
+			Port: ipvpnTunnelPortSimpleTunnel,
+		}
+
+		pingAddrs = append(pingAddrs, pingAddr)
+
+		if remoteUsualPort != 0 && addr.Port != int(remoteUsualPort) {
+			additionalPingAddr := &net.UDPAddr{
+				IP:   pingAddr.IP,
+				Port: int(vpn.getPeerPort(peerAddr.ID, ChannelTypeTunnel)),
+			}
+			pingAddrs = append(pingAddrs, additionalPingAddr)
+		}
+	}
+	vpn.createSimpleTunnelReaders(peerAddr, pingAddrs)
+	go vpn.pingSenderLoop(peerAddr, remoteUsualPort, pingAddrs)
 }
 
 func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {

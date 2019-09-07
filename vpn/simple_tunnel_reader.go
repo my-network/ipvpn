@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"golang.org/x/crypto/ed25519"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/xaionaro-go/errors"
+	"golang.org/x/crypto/ed25519"
 )
 
 const (
@@ -18,6 +18,7 @@ const (
 )
 
 type simpleTunnelReaderQueueItem struct {
+	isBusy     bool
 	conn       *net.UDPConn
 	addrRemote *net.UDPAddr
 	msg        []byte
@@ -33,6 +34,10 @@ var (
 
 func acquireSimpleTunnelReaderQueueItem(msgSize uint) *simpleTunnelReaderQueueItem {
 	item := simpleTunnelReaderQueueItemPool.Get().(*simpleTunnelReaderQueueItem)
+	if item.isBusy {
+		panic(`should not happened`)
+	}
+	item.isBusy = true
 	if cap(item.msg) < int(msgSize) {
 		item.msg = make([]byte, msgSize)
 	} else {
@@ -42,6 +47,10 @@ func acquireSimpleTunnelReaderQueueItem(msgSize uint) *simpleTunnelReaderQueueIt
 }
 
 func (item *simpleTunnelReaderQueueItem) Release() {
+	if !item.isBusy {
+		panic(`should not happened`)
+	}
+	item.isBusy = false
 	simpleTunnelReaderQueueItemPool.Put(item)
 }
 
@@ -49,7 +58,6 @@ type simpleTunnelReader struct {
 	vpn                           *VPN
 	peerAddrRemote                AddrInfo
 	publicKeyRemote               ed25519.PublicKey
-	logger                        Logger
 	gcFunc                        func() error
 	addrs                         []*net.UDPAddr
 	lastUseTS                     uint32
@@ -123,6 +131,7 @@ func (r *simpleTunnelReader) selfGC() {
 }
 
 func (r *simpleTunnelReader) destroy() {
+	r.vpn.logger.Debugf(`[simpleTunnelReader] %v destroy`, r.peerAddrRemote.ID)
 	r.stop()
 	err := r.Close()
 	if err != nil {
@@ -135,6 +144,7 @@ func (r *simpleTunnelReader) stop() {
 }
 
 func (r *simpleTunnelReader) enqueue(conn *net.UDPConn, addrRemote *net.UDPAddr, msg []byte) {
+	r.vpn.logger.Debugf(`[simpleTunnelReader] enqueue %v %v %v`, conn, addrRemote, msg)
 	item := acquireSimpleTunnelReaderQueueItem(uint(len(msg)))
 	copy(item.msg, msg)
 	item.conn = conn
@@ -143,12 +153,16 @@ func (r *simpleTunnelReader) enqueue(conn *net.UDPConn, addrRemote *net.UDPAddr,
 }
 
 func (r *simpleTunnelReader) queueScheduler() {
+	r.vpn.logger.Debugf(`[simpleTunnelReader] queueScheduler: %v`, r.peerAddrRemote)
+	defer r.vpn.logger.Debugf(`[simpleTunnelReader] /queueScheduler: %v`, r.peerAddrRemote)
+
 	for {
 		select {
 		case <-r.connectionInitContext.Done():
 			return
 		case msg := <-r.queue:
 			r.processMessage(msg)
+			msg.Release()
 		}
 	}
 }
@@ -156,19 +170,25 @@ func (r *simpleTunnelReader) queueScheduler() {
 func (r *simpleTunnelReader) processMessage(msg *simpleTunnelReaderQueueItem) {
 	r.doProcessMessage(msg)
 
+	r.vpn.logger.Debugf("[simpleTunnelReader] processMessage %v %v: %v",
+		r.mySideIsReady, r.remoteSideIsReady, msg,
+	)
+
 	if r.mySideIsReady && r.remoteSideIsReady {
 		conn := msg.conn
 		addrRemote := msg.addrRemote
+		r.vpn.logger.Debugf(`r.mySideIsReady && r.remoteSideIsReady: %v -> %v`, conn.LocalAddr(), addrRemote)
 
 		r.connectionInitContextStopFunc()
 		peer := r.vpn.GetOrCreatePeerByID(r.peerAddrRemote.ID)
 		go peer.addTunnelConnection(newUDPWriter(conn, r, addrRemote), r.peerAddrRemote)
 	}
-
-	msg.Release()
 }
 
 func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) {
+	r.vpn.logger.Debugf(`[simpleTunnelReader] doProcessMessage %v`, msg)
+	defer r.vpn.logger.Debugf(`[simpleTunnelReader] /doProcessMessage %v`, msg)
+
 	conn := msg.conn
 	addrLocal := conn.LocalAddr()
 	addrRemote := msg.addrRemote
@@ -187,7 +207,27 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 			return
 		}
 
-		if r.messagePong.SequenceID == 11 {
+		switch r.messagePong.MessagePing.SequenceID {
+		case 0:
+			r.vpn.logger.Debugf("%v> remote side started to check us, let's check them too: %v", addrLocal, addrRemote)
+			myPing := MessagePing{}
+			myPing.SequenceID = 1
+			myPing.SendTS = time.Now().UnixNano()
+			if err := myPing.SignSender(r.vpn.privKey); err != nil {
+				r.vpn.logger.Error(errors.Wrap(err, `unable to sign a message`, addrLocal))
+				return
+			}
+			pingResponse := make([]byte, sizeOfMessageType+sizeOfMessagePing)
+			MessageTypePing.Write(pingResponse)
+			myPing.Write(pingResponse[sizeOfMessageType:])
+			r.vpn.logger.Debugf(`%v> sending my-ping to %v: %v`, addrLocal, addrRemote, myPing)
+			_, err := conn.WriteToUDP(pingResponse, addrRemote)
+			if err != nil {
+				r.vpn.logger.Debugf(`%v> unable to send a message: %v (%v)`, addrLocal, err, addrRemote)
+				return
+			}
+		case 10:
+			r.vpn.logger.Debugf("%v> remote side is ready: %v", addrLocal, addrRemote)
 			r.remoteSideIsReady = true
 		}
 
@@ -195,13 +235,15 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 		r.messagePong.SendTS = time.Now().UnixNano()
 		if err := r.messagePong.SignRecipient(r.vpn.privKey); err != nil {
 			r.vpn.logger.Error(errors.Wrap(err, `unable to sign a message`, addrLocal))
-			_ = r.Close()
 			return
 		}
-		_, err := conn.WriteToUDP(r.messagePong.Bytes(), addrRemote)
+		pongResponse := make([]byte, sizeOfMessageType+sizeOfMessagePong)
+		MessageTypePong.Write(pongResponse)
+		r.messagePong.Write(pongResponse[sizeOfMessageType:])
+		r.vpn.logger.Debugf(`%v> sending pong to %v: %v`, addrLocal, addrRemote, r.messagePong)
+		_, err := conn.WriteToUDP(pongResponse, addrRemote)
 		if err != nil {
 			r.vpn.logger.Debugf(`%v> unable to send a message: %v (%v)`, addrLocal, err, addrRemote)
-			_ = conn.Close()
 			return
 		}
 		return
@@ -221,21 +263,25 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 		}
 
 		switch {
+		case r.messagePong.SequenceID == 10:
+			r.vpn.logger.Debugf("%v> my side is ready: %v", addrLocal, addrRemote)
+			r.mySideIsReady = true
+			return
 		case r.messagePong.SequenceID <= 10:
-			if r.messagePong.SequenceID == 10 {
-				r.mySideIsReady = true
-			}
 			messagePing := &r.messagePong.MessagePing
 			messagePing.SequenceID++
+			messagePing.SendTS = time.Now().UnixNano()
 			if err := messagePing.SignSender(r.vpn.privKey); err != nil {
 				r.vpn.logger.Error(errors.Wrap(err, `unable to sign a message`, addrLocal))
-				_ = r.Close()
 				return
 			}
-			_, err := conn.Write(messagePing.Bytes())
+			pingResponse := make([]byte, sizeOfMessageType+sizeOfMessagePing)
+			MessageTypePing.Write(pingResponse)
+			messagePing.Write(pingResponse[sizeOfMessageType:])
+			r.vpn.logger.Debugf(`%v> sending ping to %v: %v`, addrLocal, addrRemote, messagePing)
+			_, err := conn.WriteToUDP(pingResponse, addrRemote)
 			if err != nil {
 				r.vpn.logger.Debugf(`%v> unable to send a message: %v (%v)`, addrLocal, err, addrRemote)
-				_ = conn.Close()
 				return
 			}
 			return
@@ -255,7 +301,9 @@ func (r *simpleTunnelReader) Read(b []byte) (size int, err error) {
 }
 
 func (r *simpleTunnelReader) ReadFromUDP(b []byte) (size int, addr *net.UDPAddr, err error) {
+	r.vpn.logger.Debugf(`[simpleTunnelReader] ReadFromUDP(): wait...`)
 	item := <-r.queue
+	r.vpn.logger.Debugf(`[simpleTunnelReader] ReadFromUDP(): %v`, item)
 	addr = item.addrRemote
 	copy(b, item.msg)
 	size = len(b)

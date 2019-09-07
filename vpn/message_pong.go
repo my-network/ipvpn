@@ -3,9 +3,11 @@ package vpn
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
+
+	"github.com/xaionaro-go/bytesextra"
 	"github.com/xaionaro-go/errors"
 	"golang.org/x/crypto/ed25519"
-	"io"
 )
 
 var (
@@ -55,7 +57,7 @@ func (pong *MessagePong) VerifyRecipient(pubKey ed25519.PublicKey) (err error) {
 }
 
 func (pong *MessagePong) Bytes() []byte {
-	buf := bytes.NewBuffer(make([]byte, binary.Size(pong)))
+	buf := bytes.NewBuffer(make([]byte, sizeOfMessagePong))
 	err := pong.WriteTo(buf)
 	if err != nil {
 		panic(err)
@@ -64,15 +66,15 @@ func (pong *MessagePong) Bytes() []byte {
 }
 
 func (pong *MessagePong) Read(b []byte) error {
-	if len(b) != binary.Size(pong) {
-		return errors.Wrap(ErrInvalidSize, len(b), binary.Size(pong))
+	if len(b) != sizeOfMessagePong {
+		return errors.Wrap(ErrInvalidSize, len(b), sizeOfMessagePong)
 	}
 
 	return errors.Wrap(binary.Read(bytes.NewReader(b), binary.LittleEndian, pong))
 }
 
 func (pong *MessagePong) Write(b []byte) error {
-	return pong.WriteTo(bytes.NewBuffer(b))
+	return pong.WriteTo(bytesextra.NewWriter(b))
 }
 
 func (pong *MessagePong) WriteTo(writer io.Writer) error {

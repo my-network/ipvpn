@@ -480,11 +480,6 @@ func (data *addrInfoWithLatencies) Swap(i, j int) {
 }
 
 func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, isIncoming bool) Stream {
-	isIncomingStream := mesh.IsIncomingStream(addrInfo.ID)
-	if isIncomingStream != nil && *isIncomingStream {
-		mesh.logger.Debugf(`tryConnectByOptimalPath(): connected from remote side (%v), return as is.`, addrInfo.ID)
-		return stream
-	}
 
 	// Removing bad addresses
 	{
@@ -684,32 +679,35 @@ func (mesh *Network) considerPeerAddr(peerAddr AddrInfo) {
 			return
 		}
 		//mesh.logger.Debugf("my ID, notifing stream handlers about my addrInfo: %v", peerAddr.Addrs)
-		for _, streamHandler := range mesh.streamHandlers {
-			streamHandler.SetMyAddrs(peerAddr.Addrs)
-		}
 		return
 	}
 
 	mesh.logger.Debugf("found peer: %v: %v", peerID, peerAddr.Addrs)
 
 	// Removing addresses of myself from peer's addresses
-
-	listenAddresses, err := mesh.ipfsNode.PeerHost.Network().InterfaceListenAddresses()
-	if err != nil {
-		mesh.logger.Error(errors.Wrap(err))
-	}
-	m := map[string]struct{}{}
-	for _, addr := range listenAddresses {
-		m[addr.String()] = struct{}{}
-	}
-	var cleanAddrs []multiaddr.Multiaddr
-	for _, addr := range peerAddr.Addrs {
-		if _, ok := m[addr.String()]; ok {
-			continue
+	{
+		listenAddresses, err := mesh.ipfsNode.PeerHost.Network().InterfaceListenAddresses()
+		if err != nil {
+			mesh.logger.Error(errors.Wrap(err))
 		}
-		cleanAddrs = append(cleanAddrs, addr)
+		m := map[string]struct{}{}
+		for _, addr := range listenAddresses {
+			m[addr.String()] = struct{}{}
+		}
+		/*myAddresses := mesh.ipfsNode.PeerHost.Addrs()
+		for _, addr := range myAddresses {
+			m[addr.String()] = struct{}{}
+		}*/
+
+		var cleanAddrs []multiaddr.Multiaddr
+		for _, addr := range peerAddr.Addrs {
+			if _, ok := m[addr.String()]; ok {
+				continue
+			}
+			cleanAddrs = append(cleanAddrs, addr)
+		}
+		peerAddr.Addrs = cleanAddrs
 	}
-	peerAddr.Addrs = cleanAddrs
 
 	// if no addresses provided then try to find them via DHT
 
@@ -771,6 +769,13 @@ func (mesh *Network) dhtBasedConnector(ipfsCid cid.Cid) {
 				time.Sleep(time.Hour * time.Duration(hours))
 				provChan = mesh.ipfsNode.DHT.FindProvidersAsync(mesh.ipfsContext, ipfsCid, 1<<16)
 				count++
+				continue
+			}
+
+			if peerAddr.ID == mesh.ipfsNode.Identity {
+				for _, streamHandler := range mesh.streamHandlers {
+					streamHandler.SetMyAddrs(peerAddr.Addrs)
+				}
 				continue
 			}
 
@@ -927,6 +932,7 @@ streamHandlerLoop:
 
 	mesh.logger.Debugf(`stream.Close()`)
 	_ = stream.Close()
+	_ = stream.Conn().Close()
 
 	mesh.streamsLocker.Lock()
 	streamI, _ := mesh.streams.Load(stream.Conn().RemotePeer())

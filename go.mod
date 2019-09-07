@@ -19,7 +19,9 @@ require (
 	github.com/my-network/wgcreate v0.0.0-20190707165004-31e33f68f780
 	github.com/sirupsen/logrus v1.4.2
 	github.com/sparrc/go-ping v0.0.0-20190613174326-4e5b6552494c
+	github.com/stretchr/testify v1.4.0
 	github.com/xaionaro-go/atomicmap v0.0.0-20190720091258-77e7f2aaf663
+	github.com/xaionaro-go/bytesextra v0.0.0-20190907152746-ba64ca28a137
 	github.com/xaionaro-go/errors v0.0.0-20190618051035-77224f41226e
 	github.com/xaionaro-go/pinentry v0.0.0-20190817122727-387561e90903
 	github.com/xaionaro-go/spinlock v0.0.0-20190309154744-55278e21e817 // indirect

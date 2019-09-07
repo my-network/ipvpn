@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	e "errors"
-	"golang.org/x/crypto/ed25519"
 	"io"
 
+	"github.com/xaionaro-go/bytesextra"
 	"github.com/xaionaro-go/errors"
+	"golang.org/x/crypto/ed25519"
 )
 
 var (
@@ -38,7 +39,7 @@ func (pingData *MessagePingData) Bytes() []byte {
 }
 
 func (pingData *MessagePingData) Write(b []byte) error {
-	return pingData.WriteTo(bytes.NewBuffer(b))
+	return pingData.WriteTo(bytesextra.NewWriter(b))
 }
 
 func (pingData *MessagePingData) WriteTo(writer io.Writer) error {
@@ -81,11 +82,15 @@ func (ping *MessagePing) Read(b []byte) error {
 		return errors.Wrap(ErrInvalidSize, len(b), binary.Size(ping))
 	}
 
-	return errors.Wrap(binary.Read(bytes.NewReader(b), binary.LittleEndian, ping))
+	return ping.ReadFrom(bytes.NewReader(b))
+}
+
+func (ping *MessagePing) ReadFrom(reader io.Reader) error {
+	return errors.Wrap(binary.Read(reader, binary.LittleEndian, ping))
 }
 
 func (ping *MessagePing) Write(b []byte) error {
-	return ping.WriteTo(bytes.NewBuffer(b))
+	return ping.WriteTo(bytesextra.NewWriter(b))
 }
 
 func (ping *MessagePing) WriteTo(writer io.Writer) error {

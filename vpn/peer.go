@@ -30,7 +30,8 @@ import (
 )
 
 const (
-	peerBufferSize = 1 << 16
+	peerBufferSize           = 1 << 16
+	receiveIntAliasesTimeout = time.Second * 30
 )
 
 var (
@@ -40,6 +41,7 @@ var (
 	ErrInvalidSize        = e.New(`invalid size`)
 	ErrNegativeRTT        = e.New(`negative RTT`)
 	ErrWriterIsNil        = e.New(`writer is nil`)
+	ErrUnexpectedCount    = e.New(`unexpected count`)
 )
 
 type TrustConfig struct {
@@ -179,14 +181,19 @@ func (peer *Peer) pingerLoop() {
 		case <-peer.context.Done():
 			return
 		case <-ticker.C:
+			prevLastSuccessfulPingTS := peer.LastSuccessfulPingTS.Load().(time.Time)
+
 			for i := 0; i < 5; i++ {
 				if err := peer.SendPing(ChannelTypeIPFS); err != nil {
 					peer.VPN.logger.Error(errors.Wrap(err))
 				}
 				time.Sleep(time.Second)
 			}
-			peer.VPN.logger.Error(`peer `, peer.ID, ` timed-out`)
-			_ = peer.Close()
+
+			if peer.LastSuccessfulPingTS.Load().(time.Time) == prevLastSuccessfulPingTS {
+				peer.VPN.logger.Error(`peer `, peer.ID, ` timed-out`)
+				_ = peer.Close()
+			}
 		}
 	}
 }
@@ -308,7 +315,12 @@ func (peer *Peer) configureDevice(chType ChannelType) (err error) {
 		},
 	}
 
-	peer.VPN.logger.Debugf(`configuring device %v for peer %v`, peer.VPN.wgnets[chType].IfaceName, peer.ID)
+	peer.VPN.logger.Debugf(`configuring device %v for channel %v of peer %v with config %v`,
+		peer.VPN.wgnets[chType].IfaceName,
+		chType,
+		peer.ID,
+		wgCfg,
+	)
 	err = peer.VPN.wgctl.ConfigureDevice(peer.VPN.wgnets[chType].IfaceName, wgCfg)
 	if err != nil {
 		return
@@ -330,7 +342,7 @@ func (peer *Peer) onNoControlStreamsLeft() {
 
 	isIncoming := peer.VPN.mesh.IsIncomingStream(peer.ID)
 	if isIncoming == nil {
-		vpn.logger.Error(`peer<%v>.onNoControlStreamsLeft(): the stream does not exist.`, peer.ID)
+		vpn.logger.Error(`peer<`, peer.ID, `>.onNoControlStreamsLeft(): the stream does not exist.`)
 		_ = peer.Close()
 		return
 	}
@@ -395,17 +407,17 @@ func (peer *Peer) onNoForwarderStreamsLeft() {
 	}
 
 	go func() {
-		if concurrency := atomic.AddInt32(&peer.onNoForwarderStreamsLeftConcurrency, 1); concurrency > 1 {
-			if randIntn(10) == 0 {
-				peer.VPN.mesh.ClosePeer(peer.ID)
-			}
-
+		concurrency := atomic.AddInt32(&peer.onNoForwarderStreamsLeftConcurrency, 1)
+		defer atomic.AddInt32(&peer.onNoForwarderStreamsLeftConcurrency, -1)
+		if concurrency > 1 {
 			vpn.logger.Debugf(`peer<%v>.onNoForwarderStreamsLeft(): is already running`, peer.ID)
 			if len(peer.onNoForwarderStreamsLeftChan) == 0 && concurrency == 2 {
 				vpn.logger.Debugf(`peer<%v>.onNoForwarderStreamsLeft(): is already running -> pending`, peer.ID)
-				peer.onNoForwarderStreamsLeftChan <- struct{}{}
+				go func() {
+					defer peer.recover()
+					peer.onNoForwarderStreamsLeftChan <- struct{}{}
+				}()
 			}
-			atomic.AddInt32(&peer.onNoForwarderStreamsLeftConcurrency, -1)
 			return
 		}
 		outgoingStream := helpers.NewReconnectableStream(vpn.logger, func() (Stream, error) {
@@ -459,7 +471,8 @@ func (peer *Peer) sendIntAliases(conn io.Writer) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 	vpn := peer.VPN
 
-	vpn.logger.Debugf("sendIntAlias()")
+	vpn.logger.Debugf("sendIntAliases()")
+	defer vpn.logger.Debugf("/sendIntAliases()")
 
 	knownAliases := IntAliases{vpn.GetIntAlias().Copy()}
 	vpn.peers.Range(func(_, peerI interface{}) bool {
@@ -474,42 +487,117 @@ func (peer *Peer) sendIntAliases(conn io.Writer) (err error) {
 		intAlias.Since = time.Since(intAlias.Timestamp)
 		intAlias.Timestamp = time.Time{}
 	}
-	b, err := knownAliases.Marshal()
-	if err != nil {
-		return
-	}
 
-	n, err := conn.Write(b)
-	vpn.logger.Debugf("sendIntAlias(): stream.Write(): %v %v %v", n, err, string(b))
-	if err != nil {
-		return
+	b := make([]byte, sizeOfMessageType+sizeOfMessageIntAlias)
+	vpn.logger.Debugf(`len(b) == %v (expected %v + %v)`, len(b), sizeOfMessageType, sizeOfMessageIntAlias)
+	MessageTypeIntAlias.Write(b)
+	for idx, intAlias := range knownAliases {
+		msg := MessageIntAlias{
+			Index: int32(idx),
+			Count: int32(len(knownAliases)),
+		}
+		msg.FillFrom(intAlias)
+		msg.Write(b[sizeOfMessageType:])
+
+		var n int
+		n, err = conn.Write(b)
+		vpn.logger.Debugf("sendIntAlias(): stream.Write(): %v %v %v", n, err, string(b))
+		if err != nil {
+			return
+		}
+		if n != len(b) {
+			err = ErrMessageFragmented
+			return
+		}
 	}
 
 	return
 }
 
-func (peer *Peer) recvIntAliases(conn io.Reader) (remoteIntAliases IntAliases, err error) {
+func (peer *Peer) recvIntAliases(conn io.ReadCloser) (remoteIntAliases IntAliases, err error) {
 	defer func() { err = errors.Wrap(err, fmt.Errorf("%T", err)) }()
 	vpn := peer.VPN
 
-	buf := make([]byte, bufferSize)
+	vpn.logger.Debugf("recvIntAlias(): peer ID %v", peer.ID)
+	defer vpn.logger.Debugf("/recvIntAlias(): peer ID %v", peer.ID)
 
-	vpn.logger.Debugf("recvIntAlias(): stream.Read()...")
-	n, err := conn.Read(buf)
-	vpn.logger.Debugf("recvIntAlias(): stream.Read(): %v %v %v", n, err, string(vpn.buffer[:n]))
+	buf := make([]byte, sizeOfMessageType+sizeOfMessageIntAlias)
 
-	if n >= bufferSize {
-		return nil, errors.New("too big message")
-	}
-	if err != nil {
-		return
+	var intAliasMessage MessageIntAlias
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	go func() {
+		timer := time.NewTimer(receiveIntAliasesTimeout)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			peer.VPN.logger.Error(`recvIntAlias(): timed-out while waiting for int aliases from the remote side`)
+			conn.Close()
+		}
+	}()
+
+	var count, expectedCount int
+	for expectedCount == 0 || count < expectedCount {
+		var n int
+		vpn.logger.Debugf("recvIntAlias(): stream.Read()... %v/%v", count, expectedCount)
+		n, err = conn.Read(buf)
+		vpn.logger.Debugf("recvIntAlias(): stream.Read(): %v %v %v", n, err, string(buf[:n]))
+		if n >= bufferSize {
+			return nil, errors.New("too big message")
+		}
+		if err != nil {
+			return
+		}
+
+		if n != sizeOfMessageType+sizeOfMessageIntAlias {
+			err = errors.Wrap(ErrWrongMessageLength, n)
+			return
+		}
+
+		msgType := ReadMessageType(buf)
+		vpn.logger.Debugf(`recvIntAlias(): msgType == %v`, msgType)
+		if msgType != MessageTypeIntAlias {
+			continue
+		}
+
+		err = intAliasMessage.Read(buf[sizeOfMessageType:n])
+		vpn.logger.Debugf(`recvIntAlias(): intAliasMessage: %v %v`, err, intAliasMessage)
+		if err != nil {
+			return
+		}
+
+		if expectedCount == 0 {
+			expectedCount = int(intAliasMessage.Count)
+			remoteIntAliases = make(IntAliases, expectedCount)
+		}
+		if expectedCount != int(intAliasMessage.Count) {
+			err = errors.Wrap(ErrUnexpectedCount, expectedCount, intAliasMessage.Count)
+			return
+		}
+
+		if remoteIntAliases[intAliasMessage.Index] != nil {
+			continue
+		}
+
+		var intAlias *IntAlias
+		{
+			intAlias = &IntAlias{}
+			remoteIntAliases[intAliasMessage.Index] = intAlias
+		}
+
+		err = intAliasMessage.FillTo(intAlias)
+		if err != nil {
+			return
+		}
+
+		count++
 	}
 
-	err = remoteIntAliases.Unmarshal(buf[:n])
-	if err != nil {
-		err = errors.Wrap(err, string(buf[:n]))
-		return
-	}
+	cancelFunc()
 
 	if len(remoteIntAliases) == 0 {
 		return nil, errors.New("empty slice")
@@ -726,6 +814,7 @@ func (peer *Peer) startControlStream() (err error) {
 				_ = peer.IPFSControlStream.Close()
 				peer.IPFSControlStream = nil
 				go func() {
+					defer peer.recover()
 					peer.onNoControlStreamsLeftChan <- struct{}{}
 				}()
 			})
@@ -754,11 +843,6 @@ func (peer *Peer) StartChannel(chType ChannelType) {
 func (peer *Peer) startChannel(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	err = peer.configureDevice(chType)
-	if err != nil {
-		return
-	}
-
 	if chType != ChannelTypeDirect {
 		err = peer.startTunnelWriter(chType)
 		if err != nil {
@@ -769,6 +853,11 @@ func (peer *Peer) startChannel(chType ChannelType) (err error) {
 		if err != nil {
 			return
 		}
+	}
+
+	err = peer.configureDevice(chType)
+	if err != nil {
+		return
 	}
 
 	go func() {
@@ -1462,8 +1551,12 @@ func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) {
 
 func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 	defer func() { err = errors.Wrap(err) }()
+	peer.VPN.logger.Debugf(`peer<%v>.startTunnelWriter(%v)`, peer.ID, chType)
 
 	go peer.LockDo(func() {
+		peer.VPN.logger.Debugf(`peer<%v>.startTunnelWriter(%v): locked`, peer.ID, chType)
+		defer peer.VPN.logger.Debugf(`/peer<%v>.startTunnelWriter(%v)`, peer.ID, chType)
+
 		switch chType {
 		case ChannelTypeIPFS:
 			if peer.IPFSTunnelConnToWG == nil {
