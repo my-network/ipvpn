@@ -1,8 +1,9 @@
 package main
 
 import (
-	"github.com/my-network/ipvpn/ipvpn"
 	"github.com/sirupsen/logrus"
+
+	"github.com/my-network/ipvpn/ipvpn"
 )
 
 func fatalIfError(err error) {

@@ -37,6 +37,8 @@ import (
 	"github.com/multiformats/go-multihash"
 	"github.com/xaionaro-go/errors"
 	"golang.org/x/sys/unix"
+
+	"github.com/my-network/ipvpn/helpers"
 )
 
 const (
@@ -46,7 +48,9 @@ const (
 )
 
 const (
+	enableQuic           = false
 	sitSpotsPerPeerLimit = 16
+	discoveryInterval    = time.Second * 10
 )
 
 var (
@@ -82,6 +86,7 @@ type Network struct {
 	knownPeers                 KnownPeers
 	knownPeersLocker           sync.RWMutex
 	tryConnectChannel          chan AddrInfo
+	discoveredPeerAddrs        *discoveredPeerAddrs
 }
 
 type Stream = p2pcore.Stream
@@ -134,12 +139,11 @@ func checkCacheDir(cacheDir string) (err error) {
 }
 
 func addressesConfig() ipfsConfig.Addresses {
-	return ipfsConfig.Addresses{
+	result := ipfsConfig.Addresses{
 		Swarm: []string{
 			"/ip4/0.0.0.0/tcp/" + ipfsPortString,
-			"/ip4/0.0.0.0/udp/" + ipfsPortString + "/quic",
 			"/ip6/::/tcp/" + ipfsPortString,
-			"/ip6/::/udp/" + ipfsPortString + "/quic",
+			//
 			// Also we need ICMP :(
 		},
 		Announce:   []string{},
@@ -147,6 +151,13 @@ func addressesConfig() ipfsConfig.Addresses {
 		API:        ipfsConfig.Strings{"/ip4/127.0.0.1/tcp/25001"},
 		Gateway:    ipfsConfig.Strings{"/ip4/127.0.0.1/tcp/28080"},
 	}
+	if enableQuic {
+		result.Swarm = append(result.Swarm,
+			"/ip4/0.0.0.0/udp/"+ipfsPortString+"/quic",
+			"/ip6/::/udp/"+ipfsPortString+"/quic",
+		)
+	}
+	return result
 }
 
 func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
@@ -221,7 +232,7 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 			// https://github.com/ipfs/go-ipfs/blob/master/docs/experimental-features.md
 
 			FilestoreEnabled: true,
-			QUIC:             true,
+			QUIC:             enableQuic,
 		},
 	})
 	if err != nil {
@@ -409,6 +420,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 	var ipfsNode *core.IpfsNode
 	ipfsNode, err = core.NewNode(ctx, ipfsCfg)
 	if err != nil {
+		cancelFunc()
 		return
 	}
 
@@ -426,6 +438,7 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 		knownPeers:            knownPeers,
 		tryConnectChannel:     make(chan AddrInfo),
 	}
+	mesh.discoveredPeerAddrs = newDiscoveredPeerAddrs(mesh)
 
 	err = mesh.start()
 	if err != nil {
@@ -467,6 +480,12 @@ func (data *addrInfoWithLatencies) Swap(i, j int) {
 }
 
 func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, isIncoming bool) Stream {
+	isIncomingStream := mesh.IsIncomingStream(addrInfo.ID)
+	if isIncomingStream != nil && *isIncomingStream {
+		mesh.logger.Debugf(`tryConnectByOptimalPath(): connected from remote side (%v), return as is.`, addrInfo.ID)
+		return stream
+	}
+
 	// Removing bad addresses
 	{
 		var maddrs []multiaddr.Multiaddr
@@ -523,7 +542,8 @@ func (mesh *Network) tryConnectByOptimalPath(stream Stream, addrInfo *AddrInfo, 
 	}
 
 	// Measure latencies
-	measureLatencyContext, _ := context.WithTimeout(context.Background(), time.Second)
+	measureLatencyContext, cancelFunc := context.WithTimeout(context.Background(), time.Second)
+	defer cancelFunc()
 	for idx, addr := range addrInfo.Addrs {
 		data.Latencies[idx] = math.MaxInt64
 
@@ -672,6 +692,27 @@ func (mesh *Network) considerPeerAddr(peerAddr AddrInfo) {
 
 	mesh.logger.Debugf("found peer: %v: %v", peerID, peerAddr.Addrs)
 
+	// Removing addresses of myself from peer's addresses
+
+	listenAddresses, err := mesh.ipfsNode.PeerHost.Network().InterfaceListenAddresses()
+	if err != nil {
+		mesh.logger.Error(errors.Wrap(err))
+	}
+	m := map[string]struct{}{}
+	for _, addr := range listenAddresses {
+		m[addr.String()] = struct{}{}
+	}
+	var cleanAddrs []multiaddr.Multiaddr
+	for _, addr := range peerAddr.Addrs {
+		if _, ok := m[addr.String()]; ok {
+			continue
+		}
+		cleanAddrs = append(cleanAddrs, addr)
+	}
+	peerAddr.Addrs = cleanAddrs
+
+	// if no addresses provided then try to find them via DHT
+
 	if len(peerAddr.Addrs) == 0 {
 		mesh.logger.Debugf(`mesh.ipfsNode.Routing.FindPeer(mesh.ipfsContext, "%v")...`, peerID)
 		var err error
@@ -683,7 +724,9 @@ func (mesh *Network) considerPeerAddr(peerAddr AddrInfo) {
 		mesh.logger.Debugf("peer's addresses: %v", peerAddr.Addrs)
 	}
 
-	mesh.tryConnectChannel <- peerAddr
+	go func(addrInfo *AddrInfo) {
+		mesh.tryConnectChannel <- *addrInfo
+	}(helpers.CopyAddrInfo(peerAddr))
 }
 
 func (mesh *Network) pubSubBasedConnector(ipfsCid cid.Cid) {
@@ -894,6 +937,7 @@ streamHandlerLoop:
 }
 
 func (mesh *Network) tryConnectChannelHandler() {
+	var tryConnectMutex sync.Mutex
 	isAlreadyTrying := map[peer.ID]bool{}
 	pendingTries := map[peer.ID]*AddrInfo{}
 
@@ -904,15 +948,19 @@ func (mesh *Network) tryConnectChannelHandler() {
 		case addrInfo := <-mesh.tryConnectChannel:
 			mesh.logger.Debugf(`got an addrInfo from tryConnectChannel: %v`, addrInfo)
 
+			tryConnectMutex.Lock()
 			if isAlreadyTrying[addrInfo.ID] {
 				mesh.logger.Debugf(`already trying to connect to %v, pending`, addrInfo.ID)
 				pendingTries[addrInfo.ID] = &addrInfo
+				tryConnectMutex.Unlock()
 				continue
 			}
+			tryConnectMutex.Unlock()
+
 			oldStreamI, _ := mesh.streams.Load(addrInfo.ID)
 			if oldStreamI != nil {
 				if mesh.ipfsNode.PeerHost.Network().Connectedness(addrInfo.ID) == network.Connected {
-					mesh.logger.Debugf(`already connected to %v, skipping`, addrInfo.ID)
+					mesh.logger.Debugf(`tryConnectChannelHandler(): already connected to %v, skipping`, addrInfo.ID)
 					continue
 				}
 				mesh.logger.Debugf(`strange, we have a stream, but not connected to %v. Reconnecting`, addrInfo.ID)
@@ -923,13 +971,18 @@ func (mesh *Network) tryConnectChannelHandler() {
 			isAlreadyTrying[addrInfo.ID] = true
 			go func(addrInfo AddrInfo) {
 				mesh.tryConnect(addrInfo)
-				delete(isAlreadyTrying, addrInfo.ID)
 
+				tryConnectMutex.Lock()
+				defer tryConnectMutex.Unlock()
+
+				delete(isAlreadyTrying, addrInfo.ID)
 				pendingAddrInfo := pendingTries[addrInfo.ID]
 				if pendingAddrInfo != nil {
 					delete(pendingTries, addrInfo.ID)
 					mesh.logger.Debugf(`resending to tryConnectChannel a pending try to connect to: %v`, addrInfo)
-					mesh.tryConnectChannel <- *pendingAddrInfo
+					go func(addrInfo *AddrInfo) {
+						mesh.tryConnectChannel <- *addrInfo
+					}(helpers.CopyAddrInfo(*pendingAddrInfo))
 				}
 			}(addrInfo)
 		}
@@ -970,16 +1023,34 @@ func (mesh *Network) start() (err error) {
 		}
 	}
 
-	mesh.logger.Debugf(`registering local discovery handler`)
+	listenAddresses, err := mesh.ipfsNode.PeerHost.Network().InterfaceListenAddresses()
+	if err != nil {
+		mesh.logger.Error(errors.Wrap(err))
+	}
+	mesh.logger.Debugf(`registering local discovery handler. listenAddresses == %v`, listenAddresses)
 
 	if mesh.ipfsNode.Discovery != nil {
 		panic("mesh.ipfsNode.Discovery != nil")
 	}
-	mesh.ipfsNode.Discovery, err = discovery.NewMdnsService(mesh.ipfsContext, mesh.ipfsNode.PeerHost, time.Second*10, "_ipfs-ipvpn-discovery._udp")
+	mesh.ipfsNode.Discovery, err = discovery.NewMdnsService(mesh.ipfsContext, mesh.ipfsNode.PeerHost, discoveryInterval, "_ipfs-ipvpn-discovery._udp")
 	if err != nil {
 		mesh.logger.Error(errors.Wrap(err))
 	}
 	mesh.ipfsNode.Discovery.RegisterNotifee(mesh)
+
+	// mesh.discoveredPeerAddrs.GC
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-mesh.ipfsContext.Done():
+				return
+			case <-ticker.C:
+				mesh.discoveredPeerAddrs.GC()
+			}
+		}
+	}()
 
 	mesh.logger.Debugf(`starting to listen for the input streams handler`)
 
@@ -1175,26 +1246,29 @@ func (mesh *Network) handlePeerFound(addrInfo peer.AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 	mesh.logger.Debugf("handlerPeerFound: %v", addrInfo.ID)
 
-	// MDNS discovery doesn't propose any connection using QUIC, so we add it manually:
-	if len(addrInfo.Addrs) == 1 {
-		maddr := addrInfo.Addrs[0]
-		if tcpPort, tcpErr := maddr.ValueForProtocol(multiaddr.P_TCP); tcpErr == nil {
-			ipString, ipErr := maddr.ValueForProtocol(multiaddr.P_IP4)
-			if ipErr == nil {
-				newMaddr, err := multiaddr.NewMultiaddr(`/ip4/` + ipString + `/udp/` + tcpPort + `/quic`)
-				if err != nil {
-					mesh.logger.Error(errors.Wrap(err))
-				} else {
-					addrInfo.Addrs = append(addrInfo.Addrs, newMaddr)
+	if enableQuic {
+		// MDNS discovery doesn't propose any connection using QUIC, so we add it manually:
+		if len(addrInfo.Addrs) == 1 {
+			maddr := addrInfo.Addrs[0]
+			if tcpPort, tcpErr := maddr.ValueForProtocol(multiaddr.P_TCP); tcpErr == nil {
+				ipString, ipErr := maddr.ValueForProtocol(multiaddr.P_IP4)
+				if ipErr == nil {
+					newMaddr, err := multiaddr.NewMultiaddr(`/ip4/` + ipString + `/udp/` + tcpPort + `/quic`)
+					if err != nil {
+						mesh.logger.Error(errors.Wrap(err))
+					} else {
+						addrInfo.Addrs = append(addrInfo.Addrs, newMaddr)
+					}
 				}
 			}
 		}
 	}
 
-	mesh.considerPeerAddr(addrInfo)
+	mesh.discoveredPeerAddrs.OfPeer(addrInfo.ID).AccumulateAddrs(addrInfo.Addrs)
 	return
 }
 
+// this method is called by the IPFS Discovery service directly.
 func (mesh *Network) HandlePeerFound(addrInfo peer.AddrInfo) {
 	if err := mesh.handlePeerFound(addrInfo); err != nil {
 		mesh.logger.Error(errors.Wrap(err))
@@ -1332,7 +1406,7 @@ func (mesh *Network) addToKnownPeers(peerAddr AddrInfo) (err error) {
 	var sitSpot *KnownPeerSitSpot
 findSitSpot:
 	for _, oneSitSpot := range knownPeer.SitSpots {
-		for maddrOld, _ := range oneSitSpot.Addresses {
+		for maddrOld := range oneSitSpot.Addresses {
 			for _, maddrNew := range peerAddr.Addrs {
 				if maddrOld == maddrNew.String() {
 					sitSpot = oneSitSpot
@@ -1388,7 +1462,7 @@ func (mesh *Network) addStream(stream Stream, peerAddr AddrInfo) (err error) {
 		mesh.badConnectionCount.Store(maddr.String(), uint64(0))
 	}()
 
-	mesh.logger.Debugf("addStream %v %v", stream.Conn().RemotePeer(), stream.Conn().RemoteMultiaddr())
+	mesh.logger.Debugf("addStream %v %v %v", stream.Protocol(), stream.Conn().RemotePeer(), stream.Conn().RemoteMultiaddr())
 	if stream.Conn().RemotePeer() == mesh.ipfsNode.PeerHost.ID() {
 		mesh.logger.Debugf("it's my ID, skip")
 	}
@@ -1447,4 +1521,15 @@ func (mesh *Network) ClosePeer(peerID peer.ID) {
 
 func (mesh *Network) ConnectPeer(peerID peer.ID) {
 	mesh.considerPeerAddr(AddrInfo{ID: peerID})
+}
+
+func (mesh *Network) IsIncomingStream(peerID peer.ID) *bool {
+	for _, conn := range mesh.ipfsNode.PeerHost.Network().ConnsToPeer(peerID) {
+		for _, stream := range conn.GetStreams() {
+			if stream.Protocol() == p2pProtocolID {
+				return &[]bool{stream.Stat().Direction == network.DirInbound}[0]
+			}
+		}
+	}
+	return nil
 }

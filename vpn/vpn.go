@@ -23,13 +23,14 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/multiformats/go-multiaddr"
-	"github.com/my-network/ipvpn/network"
-	"github.com/my-network/wgcreate"
 	"github.com/xaionaro-go/atomicmap"
 	"github.com/xaionaro-go/errors"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/my-network/ipvpn/network"
+	"github.com/my-network/wgcreate"
 )
 
 const (
@@ -306,7 +307,26 @@ func (vpn *VPN) subnetContainsMultiaddr(maddr multiaddr.Multiaddr, chType Channe
 }
 
 func (vpn *VPN) IsBadAddress(maddr multiaddr.Multiaddr) bool {
-	return vpn.subnetContainsMultiaddr(maddr, ChannelTypeIPFS)
+	if vpn.subnetContainsMultiaddr(maddr, ChannelTypeIPFS) {
+		return true
+	}
+
+	ip, err := maddr.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil {
+		return false
+	}
+
+	for chType := ChannelType_undefined + 1; chType < ChannelType_max; chType++ {
+		myIP, err := vpn.GetMyIP(chType)
+		if err != nil {
+			vpn.logger.Error(err)
+		}
+		if myIP.String() == ip {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (vpn *VPN) GetMyIP(chType ChannelType) (net.IP, error) {
@@ -390,21 +410,24 @@ func (vpn *VPN) startCallChanHandler() error {
 }
 
 func (vpn *VPN) callChanHandlerLoop() {
+	defer vpn.logger.Debugf(`/callChanHandlerLoop()`)
 	for vpn.IsStarted() {
 		vpn.logger.Debugf(`callChanHandlerLoop(): waiting...`)
-		var err error
+		var fn func() error
 		select {
 		case args := <-vpn.newIncomingStreamChan:
-			err = vpn.newIncomingStream(args.Stream, args.AddrInfo)
+			fn = func() error { return vpn.newIncomingStream(args.Stream, args.AddrInfo) }
 		case peerID := <-vpn.onPeerConnectChan:
-			err = vpn.onPeerConnect(peerID)
+			fn = func() error { return vpn.onPeerConnect(peerID) }
 		case peerAddr := <-vpn.considerKnownPeerChan:
-			err = vpn.considerKnownPeer(peerAddr)
+			fn = func() error { return vpn.considerKnownPeer(peerAddr) }
 		case <-vpn.updateWireGuardConfigurationChan:
-			err = vpn.updateWireGuardConfiguration()
+			fn = func() error { return vpn.updateWireGuardConfiguration() }
 		case <-vpn.setupIfaceIPAddressesChan:
-			err = vpn.setupIfaceIPAddresses()
+			fn = func() error { return vpn.setupIfaceIPAddresses() }
 		}
+		vpn.logger.Debugf(`callChanHandlerLoop(): received an event, fn == %v`, fn)
+		err := fn()
 		if err != nil {
 			vpn.logger.Error(errors.Wrap(err))
 		}
@@ -1155,13 +1178,14 @@ func (vpn *VPN) onPeerConnect(peerID peer.ID) error {
 	peer := vpn.GetOrCreatePeerByID(peerID)
 
 	go func() {
-		peer.RLockDo(func() {
-			if peer.isFinished() {
-				return
-			}
-			peer.onNoControlStreamsLeftChan <- struct{}{}
-			peer.onNoForwarderStreamsLeftChan <- struct{}{}
-		})
+		if peer.isFinished() {
+			return
+		}
+		peer.onNoControlStreamsLeftChan <- struct{}{}
+		if peer.isFinished() {
+			return
+		}
+		peer.onNoForwarderStreamsLeftChan <- struct{}{}
 	}()
 	return nil
 }
