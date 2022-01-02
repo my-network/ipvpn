@@ -1074,7 +1074,7 @@ func (peer *Peer) controlStreamReaderLoop(conn io.ReadWriteCloser) {
 	for {
 		size, err := conn.Read(buffer[:2])
 		if err != nil {
-			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
+			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrClosed || err.Error() == "service conn reset" {
 				peer.VPN.logger.Infof("[control] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
 				peer.VPN.logger.Error(errors.Wrap(err))
@@ -1112,7 +1112,7 @@ func (peer *Peer) controlStreamReaderLoop(conn io.ReadWriteCloser) {
 
 		size, err = conn.Read(payload)
 		if err != nil {
-			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
+			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrClosed || err.Error() == "service conn reset" {
 				peer.VPN.logger.Infof("[control] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
 				peer.VPN.logger.Error(errors.Wrap(err))
@@ -1150,7 +1150,7 @@ func (peer *Peer) tunnelToWgForwarderLoop(conn io.ReadWriteCloser) {
 	for {
 		size, err := conn.Read(buffer[:])
 		if err != nil {
-			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrReset || err.Error() == "service conn reset" {
+			if err == mux.ErrReset || err == io.EOF || err == mocknet.ErrClosed || err.Error() == "service conn reset" {
 				peer.VPN.logger.Infof("[tunnel] IPFS connection closed (peer ID %v:%v)", peer.IntAlias.Value, peer.GetID())
 			} else {
 				peer.VPN.logger.Error(errors.Wrap(err))

@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/sparrc/go-ping"
+	"github.com/go-ping/ping"
 	"github.com/xaionaro-go/errors"
 )
 

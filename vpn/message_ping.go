@@ -39,7 +39,7 @@ func (pingData *MessagePingData) Bytes() []byte {
 }
 
 func (pingData *MessagePingData) Write(b []byte) error {
-	return pingData.WriteTo(bytesextra.NewWriter(b))
+	return pingData.WriteTo(bytesextra.NewReadWriteSeeker(b))
 }
 
 func (pingData *MessagePingData) WriteTo(writer io.Writer) error {
@@ -90,7 +90,7 @@ func (ping *MessagePing) ReadFrom(reader io.Reader) error {
 }
 
 func (ping *MessagePing) Write(b []byte) error {
-	return ping.WriteTo(bytesextra.NewWriter(b))
+	return ping.WriteTo(bytesextra.NewReadWriteSeeker(b))
 }
 
 func (ping *MessagePing) WriteTo(writer io.Writer) error {

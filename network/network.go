@@ -32,7 +32,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	p2pprotocol "github.com/libp2p/go-libp2p-core/protocol"
 	kbucket "github.com/libp2p/go-libp2p-kbucket"
-	"github.com/libp2p/go-libp2p/p2p/discovery"
+	discovery "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multihash"
 	"github.com/xaionaro-go/errors"
@@ -170,7 +170,7 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 		return
 	}
 
-	privKeyBytes, err := privKey.Bytes()
+	privKeyBytes, err := privKey.Raw()
 	if err != nil {
 		return
 	}
@@ -192,8 +192,13 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 		return
 	}
 
-	err = fsrepo.Init(repoPath, &ipfsConfig.Config{
-		Identity:  identity,
+	cfg := &ipfsConfig.Config{
+		// see https://github.com/ipfs/go-ipfs/blob/master/docs/config.md
+
+		Identity: identity,
+		AutoNAT: ipfsConfig.AutoNATConfig{
+			ServiceMode: ipfsConfig.AutoNATServiceEnabled,
+		},
 		Addresses: addressesConfig(),
 		Bootstrap: ipfsConfig.BootstrapPeerStrings(bootstrapPeers),
 		Mounts: ipfsConfig.Mounts{
@@ -224,17 +229,17 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 				GracePeriod: ipfsConfig.DefaultConnMgrGracePeriod.String(),
 				Type:        "basic",
 			},
-			EnableAutoNATService: true,
-			EnableAutoRelay:      true, // see https://github.com/ipfs/go-ipfs/blob/master/docs/config.md
-			EnableRelayHop:       agreeToBeRelay,
+			EnableAutoRelay: true,
+			EnableRelayHop:  agreeToBeRelay,
 		},
 		Experimental: ipfsConfig.Experiments{
 			// https://github.com/ipfs/go-ipfs/blob/master/docs/experimental-features.md
 
 			FilestoreEnabled: true,
-			QUIC:             enableQuic,
 		},
-	})
+	}
+	cfg.Swarm.Transports.Network.QUIC = ipfsConfig.True
+	err = fsrepo.Init(repoPath, cfg)
 	if err != nil {
 		return
 	}
@@ -1038,11 +1043,19 @@ func (mesh *Network) start() (err error) {
 	if mesh.ipfsNode.Discovery != nil {
 		panic("mesh.ipfsNode.Discovery != nil")
 	}
-	mesh.ipfsNode.Discovery, err = discovery.NewMdnsService(mesh.ipfsContext, mesh.ipfsNode.PeerHost, discoveryInterval, "_ipfs-ipvpn-discovery._udp")
-	if err != nil {
+	discovery := discovery.NewMdnsService(mesh.ipfsNode.PeerHost, "_ipfs-ipvpn-discovery._udp", mesh)
+	err = discovery.Start()
+	if err == nil {
+		mesh.ipfsNode.Discovery = discovery
+		go func() {
+			<-mesh.ipfsContext.Done()
+			mesh.logger.Debugf(`mesh.ipfsContext is closed, closing the discovery services`)
+			mesh.ipfsNode.Discovery.Close()
+			mesh.ipfsNode.Discovery = nil
+		}()
+	} else {
 		mesh.logger.Error(errors.Wrap(err))
 	}
-	mesh.ipfsNode.Discovery.RegisterNotifee(mesh)
 
 	// mesh.discoveredPeerAddrs.GC
 	go func() {

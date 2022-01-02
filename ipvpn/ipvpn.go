@@ -224,7 +224,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 	}
 
 	networkID, err := readStringFromFileTrim(dataDir, "network_id.txt")
-	if err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()) {
+	if err != nil && os.IsNotExist(err.(*errors.Error).Deepest()) {
 		var pinentryClient pinentry.PinentryClient
 		pinentryClient, err = pinentry.NewPinentryClient()
 		if err != nil {
@@ -259,7 +259,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 	passwordSourceFile := "password_new.txt"
 	passwordString, err := readStringFromFileTrim(dataDir, "password_new.txt")
 	password := []byte(passwordString)
-	if err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()) {
+	if err != nil && os.IsNotExist(err.(*errors.Error).Deepest()) {
 		passwordSourceFile = "password_new.hex"
 		password, err = readFromFileUnhex(dataDir, "password_new.hex")
 	}
@@ -271,7 +271,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 		}
 
 		_ = os.Remove(filepath.Join(dataDir, passwordSourceFile))
-	case err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()):
+	case err != nil && os.IsNotExist(err.(*errors.Error).Deepest()):
 		var passwordEncryptedHex string
 		passwordEncryptedHex, err = readStringFromFileTrim(dataDir, "password.encrypted-hex")
 		switch {
@@ -281,7 +281,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 				err = errors.Wrap(err, "unable to decode&decrypt the password")
 				return
 			}
-		case err != nil && os.IsNotExist(err.(errors.SmartError).OriginalError()):
+		case err != nil && os.IsNotExist(err.(*errors.Error).Deepest()):
 			var pinentryClient pinentry.PinentryClient
 			pinentryClient, err = pinentry.NewPinentryClient()
 			if err != nil {

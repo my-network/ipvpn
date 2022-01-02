@@ -74,7 +74,7 @@ func (pong *MessagePong) Read(b []byte) error {
 }
 
 func (pong *MessagePong) Write(b []byte) error {
-	return pong.WriteTo(bytesextra.NewWriter(b))
+	return pong.WriteTo(bytesextra.NewReadWriteSeeker(b))
 }
 
 func (pong *MessagePong) WriteTo(writer io.Writer) error {

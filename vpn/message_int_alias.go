@@ -67,7 +67,7 @@ func (msg *MessageIntAlias) Read(b []byte) error {
 }
 
 func (msg *MessageIntAlias) Write(b []byte) error {
-	return msg.WriteTo(bytesextra.NewWriter(b))
+	return msg.WriteTo(bytesextra.NewReadWriteSeeker(b))
 }
 
 func (msg *MessageIntAlias) WriteTo(writer io.Writer) error {

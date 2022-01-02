@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/agl/ed25519/extra25519"
+	"github.com/katzenpost/core/crypto/extra25519"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/multiformats/go-multiaddr"
@@ -364,9 +364,8 @@ func (vpn *VPN) Start() (err error) {
 
 	for _, chType := range ChannelTypes {
 		vpn.wgnets[chType].IfaceName, err = wgcreate.Create(vpn.ifaceNamePrefix+chType.String(), defaultMTU, true, &device.Logger{
-			Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard-"+chType.String()+"] ", 0),
-			Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard-"+chType.String()+"] ", 0),
-			Error: log.New(vpn.logger.GetErrorWriter(), "[wireguard-"+chType.String()+"] ", 0),
+			Verbosef: log.New(vpn.logger.GetDebugWriter(), "[wireguard-"+chType.String()+"] ", 0).Printf,
+			Errorf:   log.New(vpn.logger.GetErrorWriter(), "[wireguard-"+chType.String()+"] ", 0).Printf,
 		})
 		if err != nil {
 			return
@@ -633,7 +632,7 @@ func (vpn *VPN) requestPortInfo(peerID peer.ID, chType ChannelType) {
 	}
 	err := vpn.mesh.SendMessage(peerID, topic, nil)
 	if err != nil {
-		switch err.(errors.SmartError).OriginalError() {
+		switch err.(*errors.Error).Deepest() {
 		case network.ErrPeerNotFound:
 			vpn.logger.Debugf(`peer %v not found (requestPortInfo: %v)`, peerID, chType)
 		default:
@@ -652,8 +651,8 @@ func (vpn *VPN) directConnectorLoop() {
 		for _, peer := range vpn.getPeers() {
 			for _, chType := range ChannelTypes {
 				if pingErrI := peer.SendPing(chType); pingErrI != nil {
-					pingErr := pingErrI.(errors.SmartError)
-					if pingErr.OriginalError() != ErrWriterIsNil {
+					pingErr := pingErrI.(*errors.Error)
+					if pingErr.Deepest() != ErrWriterIsNil {
 						vpn.logger.Error(errors.Wrap(pingErr))
 					}
 				}
@@ -844,9 +843,8 @@ func (vpn *VPN) updateWireGuardConfiguration() (err error) {
 				case <-waitTimer.C:
 					vpn.logger.Error(`timed-out`)
 					vpn.wgnets[chType].IfaceName, err = wgcreate.Create(vpn.ifaceNamePrefix+chType.String(), defaultMTU, true, &device.Logger{
-						Debug: log.New(vpn.logger.GetDebugWriter(), "[wireguard-"+chType.String()+"] ", 0),
-						Info:  log.New(vpn.logger.GetInfoWriter(), "[wireguard-"+chType.String()+"] ", 0),
-						Error: log.New(vpn.logger.GetErrorWriter(), "[wireguard-"+chType.String()+"] ", 0),
+						Verbosef: log.New(vpn.logger.GetDebugWriter(), "[wireguard-"+chType.String()+"] ", 0).Printf,
+						Errorf:   log.New(vpn.logger.GetErrorWriter(), "[wireguard-"+chType.String()+"] ", 0).Printf,
 					})
 				}
 			}
@@ -1254,7 +1252,7 @@ func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs 
 	}()
 
 	sendBuf := make([]byte, sizeOfMessageType+sizeOfMessagePing)
-	if err := binary.Write(bytesextra.NewWriter(sendBuf), binary.LittleEndian, MessageTypePing); err != nil {
+	if err := binary.Write(bytesextra.NewReadWriteSeeker(sendBuf), binary.LittleEndian, MessageTypePing); err != nil {
 		vpn.logger.Error(errors.Wrap(err))
 		return
 	}
