@@ -18,7 +18,7 @@ require (
 	github.com/multiformats/go-multiaddr v0.4.1
 	github.com/multiformats/go-multihash v0.1.0
 	github.com/my-network/routewrapper v0.0.0-20220102165819-17ccb6c1ef8b
-	github.com/my-network/wgcreate v0.0.0-20220102165531-889d39ff5713
+	github.com/my-network/wgcreate v0.0.0-20220102200710-356daa9605d1
 	github.com/sirupsen/logrus v1.6.0
 	github.com/stretchr/testify v1.7.0
 	github.com/xaionaro-go/atomicmap v0.0.0-20210620215405-96a7f1f95a70
