@@ -632,7 +632,7 @@ func (vpn *VPN) requestPortInfo(peerID peer.ID, chType ChannelType) {
 	}
 	err := vpn.mesh.SendMessage(peerID, topic, nil)
 	if err != nil {
-		switch err.(*errors.Error).Deepest() {
+		switch err.(*errors.Error).Deepest().Err {
 		case network.ErrPeerNotFound:
 			vpn.logger.Debugf(`peer %v not found (requestPortInfo: %v)`, peerID, chType)
 		default:
@@ -652,7 +652,7 @@ func (vpn *VPN) directConnectorLoop() {
 			for _, chType := range ChannelTypes {
 				if pingErrI := peer.SendPing(chType); pingErrI != nil {
 					pingErr := pingErrI.(*errors.Error)
-					if pingErr.Deepest() != ErrWriterIsNil {
+					if pingErr.Deepest().Err != ErrWriterIsNil {
 						vpn.logger.Error(errors.Wrap(pingErr))
 					}
 				}

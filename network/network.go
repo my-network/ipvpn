@@ -170,7 +170,7 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 		return
 	}
 
-	privKeyBytes, err := privKey.Raw()
+	privKeyBytes, err := crypto.MarshalPrivateKey(privKey)
 	if err != nil {
 		return
 	}
@@ -229,8 +229,10 @@ func initRepo(logger Logger, repoPath string, agreeToBeRelay bool) (err error) {
 				GracePeriod: ipfsConfig.DefaultConnMgrGracePeriod.String(),
 				Type:        "basic",
 			},
-			EnableAutoRelay: true,
-			EnableRelayHop:  agreeToBeRelay,
+			RelayClient: ipfsConfig.RelayClient{
+				Enabled: ipfsConfig.True,
+			},
+			EnableRelayHop: agreeToBeRelay,
 		},
 		Experimental: ipfsConfig.Experiments{
 			// https://github.com/ipfs/go-ipfs/blob/master/docs/experimental-features.md
@@ -326,16 +328,6 @@ func New(networkName string, psk []byte, cacheDir string, agreeToBeRelay bool, l
 	ipfsRepoConfig, err := ipfsRepo.Config()
 	if err != nil {
 		return
-	}
-
-	if ipfsRepoConfig.Swarm.EnableRelayHop != agreeToBeRelay {
-		logger.Debugf(`fixing and saving the repository's config: agreeToBeRelay`)
-
-		ipfsRepoConfig.Swarm.EnableRelayHop = agreeToBeRelay
-		err = ipfsRepo.SetConfig(ipfsRepoConfig)
-		if err != nil {
-			logger.Error("unable to save new repo config: %v", err)
-		}
 	}
 
 	if len(knownPeers) > 0 {

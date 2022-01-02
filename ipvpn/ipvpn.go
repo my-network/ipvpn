@@ -224,7 +224,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 	}
 
 	networkID, err := readStringFromFileTrim(dataDir, "network_id.txt")
-	if err != nil && os.IsNotExist(err.(*errors.Error).Deepest()) {
+	if err != nil && os.IsNotExist(err.(*errors.Error).Deepest().Err) {
 		var pinentryClient pinentry.PinentryClient
 		pinentryClient, err = pinentry.NewPinentryClient()
 		if err != nil {
@@ -259,7 +259,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 	passwordSourceFile := "password_new.txt"
 	passwordString, err := readStringFromFileTrim(dataDir, "password_new.txt")
 	password := []byte(passwordString)
-	if err != nil && os.IsNotExist(err.(*errors.Error).Deepest()) {
+	if err != nil && os.IsNotExist(err.(*errors.Error).Deepest().Err) {
 		passwordSourceFile = "password_new.hex"
 		password, err = readFromFileUnhex(dataDir, "password_new.hex")
 	}
@@ -271,7 +271,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 		}
 
 		_ = os.Remove(filepath.Join(dataDir, passwordSourceFile))
-	case err != nil && os.IsNotExist(err.(*errors.Error).Deepest()):
+	case err != nil && os.IsNotExist(err.(*errors.Error).Deepest().Err):
 		var passwordEncryptedHex string
 		passwordEncryptedHex, err = readStringFromFileTrim(dataDir, "password.encrypted-hex")
 		switch {
@@ -281,7 +281,7 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 				err = errors.Wrap(err, "unable to decode&decrypt the password")
 				return
 			}
-		case err != nil && os.IsNotExist(err.(*errors.Error).Deepest()):
+		case err != nil && os.IsNotExist(err.(*errors.Error).Deepest().Err):
 			var pinentryClient pinentry.PinentryClient
 			pinentryClient, err = pinentry.NewPinentryClient()
 			if err != nil {
@@ -334,6 +334,11 @@ func NewIPVPN() (ipvpn *IPVPN, err error) {
 
 	routerLogger := &logger{"[router]", true, config.Get().DumpNetworkCommunications}
 	ipvpn.Router = router.New(routerLogger)
+
+	err = network.FixOSSettings()
+	if err != nil {
+		return
+	}
 
 	ipvpn.Network, err = network.New(networkID, passwordHash, filepath.Join(dataDir, "network"), agreeToBeRelay, netLogger, ipvpn.VPN, ipvpn.Router)
 	if err != nil {
