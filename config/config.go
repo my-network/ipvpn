@@ -17,6 +17,9 @@ type config struct {
 	DumpVPNCommunications     bool   `env:"IPVPN_NETWORK_DUMP_VPN"`
 	DumpNetworkCommunications bool   `env:"IPVPN_NETWORK_DUMP_MESH"`
 	DumpConfiguration         bool   `env:"IPVPN_DUMP_CONFIG"`
+	DisableWGThroughIPFS      bool   `env:"IPVPN_DISABLE_WG_THROUGH_IPFS"`
+	DisableWGThroughTunnel    bool   `env:"IPVPN_DISABLE_WG_THROUGH_TUNNEL"`
+	DisableWGThroughDirect    bool   `env:"IPVPN_DISABLE_WG_THROUGH_DIRECT"`
 	PprofNetAddress           string `env:"IPVPN_PPROF_NET_ADDRESS"`
 }
 

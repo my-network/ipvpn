@@ -22,7 +22,7 @@ require (
 	github.com/sirupsen/logrus v1.6.0
 	github.com/stretchr/testify v1.7.0
 	github.com/xaionaro-go/atomicmap v0.0.0-20210620215405-96a7f1f95a70
-	github.com/xaionaro-go/bytesextra v0.0.0-20211223175106-39c484416083
+	github.com/xaionaro-go/bytesextra v0.0.0-20220103144954-846e454ddea9
 	github.com/xaionaro-go/errors v0.0.0-20200223133802-5f1bdcd2dd3e
 	github.com/xaionaro-go/pinentry v0.0.0-20190817122727-387561e90903
 	golang.org/x/crypto v0.0.0-20211202192323-5770296d904e

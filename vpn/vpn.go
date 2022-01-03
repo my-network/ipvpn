@@ -29,6 +29,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	"github.com/my-network/ipvpn/config"
 	"github.com/my-network/ipvpn/network"
 	"github.com/my-network/wgcreate"
 )
@@ -363,6 +364,9 @@ func (vpn *VPN) Start() (err error) {
 	}
 
 	for _, chType := range ChannelTypes {
+		if IsDisabledChannel(chType) {
+			continue
+		}
 		vpn.wgnets[chType].IfaceName, err = wgcreate.Create(vpn.ifaceNamePrefix+chType.String(), defaultMTU, true, &device.Logger{
 			Verbosef: log.New(vpn.logger.GetDebugWriter(), "[wireguard-"+chType.String()+"] ", 0).Printf,
 			Errorf:   log.New(vpn.logger.GetErrorWriter(), "[wireguard-"+chType.String()+"] ", 0).Printf,
@@ -378,26 +382,28 @@ func (vpn *VPN) Start() (err error) {
 		return
 	}
 
-	err = vpn.startDirectConnector()
+	err = vpn.startAutoRouter()
 	if err != nil {
 		_ = vpn.deleteLinks()
 		return
 	}
 
-	simpleTunnelListener, warnErr := net.ListenUDP("udp", &net.UDPAddr{
-		Port: ipvpnTunnelPortSimpleTunnel,
-	})
-	if warnErr != nil {
-		vpn.logger.Error(errors.Wrap(warnErr, `unable to start listening the default simple tunnel port`))
-		return
-	} else {
-		vpn.simpleTunnelListener = simpleTunnelListener
-		go vpn.simpleTunnelListenerReader(simpleTunnelListener)
-	}
+	if !IsDisabledChannel(ChannelTypeTunnel) {
+		simpleTunnelListener, warnErr := net.ListenUDP("udp", &net.UDPAddr{
+			Port: ipvpnTunnelPortSimpleTunnel,
+		})
+		if warnErr != nil {
+			vpn.logger.Error(errors.Wrap(warnErr, `unable to start listening the default simple tunnel port`))
+			return
+		} else {
+			vpn.simpleTunnelListener = simpleTunnelListener
+			go vpn.simpleTunnelListenerReader(simpleTunnelListener)
+		}
 
-	err = vpn.restartSimpleTunnelExternalListener(vpn.SimpleTunnelPort)
-	if err != nil {
-		return
+		err = vpn.restartSimpleTunnelExternalListener(vpn.SimpleTunnelPort)
+		if err != nil {
+			return
+		}
 	}
 
 	err = vpn.startCallChanHandler()
@@ -477,6 +483,7 @@ func (vpn *VPN) restartSimpleTunnelExternalListener(port uint16) (err error) {
 }
 
 func (vpn *VPN) notifyPeerAboutMyPort(peerID peer.ID, chType ChannelType, port uint16) {
+	vpn.logger.Debugf("notifyPeerAboutMyPort: %v, %v, %v", peerID, chType, port)
 	var topic string
 	switch chType {
 	case ChannelTypeDirect:
@@ -496,6 +503,8 @@ func (vpn *VPN) notifyPeerAboutMyPort(peerID peer.ID, chType ChannelType, port u
 }
 
 func (vpn *VPN) notifyPeersAboutMyPort(chType ChannelType, port uint16) {
+	vpn.logger.Debugf("notifyPeersAboutMyPort: %v, %v, %v", chType, port)
+
 	var topic string
 	switch chType {
 	case ChannelTypeDirect:
@@ -641,7 +650,20 @@ func (vpn *VPN) requestPortInfo(peerID peer.ID, chType ChannelType) {
 	}
 }
 
-func (vpn *VPN) directConnectorLoop() {
+func IsDisabledChannel(chType ChannelType) bool {
+	cfg := config.Get()
+	switch chType {
+	case ChannelTypeIPFS:
+		return cfg.DisableWGThroughIPFS
+	case ChannelTypeTunnel:
+		return cfg.DisableWGThroughTunnel
+	case ChannelTypeDirect:
+		return cfg.DisableWGThroughDirect
+	}
+	return false
+}
+
+func (vpn *VPN) autoRouterLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	for vpn.IsStarted() {
 
@@ -650,16 +672,22 @@ func (vpn *VPN) directConnectorLoop() {
 		vpn.logger.Debugf(`directConnectorLoop(): starting a measuring of latencies to peers`)
 		for _, peer := range vpn.getPeers() {
 			for _, chType := range ChannelTypes {
-				if pingErrI := peer.SendPing(chType); pingErrI != nil {
-					pingErr := pingErrI.(*errors.Error)
-					if pingErr.Deepest().Err != ErrWriterIsNil {
-						vpn.logger.Error(errors.Wrap(pingErr))
+				if !IsDisabledChannel(chType) {
+					if pingErrI := peer.SendPing(chType); pingErrI != nil {
+						pingErr := pingErrI.(*errors.Error)
+						if pingErr.Deepest().Err != ErrWriterIsNil {
+							vpn.logger.Error(errors.Wrap(pingErr))
+						}
 					}
 				}
 
 				// TODO: reduce traffic consumption
-				vpn.requestPortInfo(peer.ID, ChannelTypeDirect)
-				vpn.requestPortInfo(peer.ID, ChannelTypeTunnel)
+				if !IsDisabledChannel(ChannelTypeDirect) {
+					vpn.requestPortInfo(peer.ID, ChannelTypeDirect)
+				}
+				if !IsDisabledChannel(ChannelTypeTunnel) {
+					vpn.requestPortInfo(peer.ID, ChannelTypeTunnel)
+				}
 			}
 		}
 
@@ -685,15 +713,17 @@ func (vpn *VPN) directConnectorLoop() {
 
 		// Setup direct connections
 
-		vpn.logger.Debugf(`directConnectorLoop(): trying to setup direct connections`)
-		for _, peer := range vpn.getPeers() {
-			chType := peer.GetOptimalChannel(ChannelTypeTunnel, ChannelTypeIPFS)
-			vpn.logger.Debugf(`directConnectorLoop(): trying to setup a direct connection to %v. Optimal channel: %v`, peer.ID, chType)
-			if chType == ChannelType_undefined {
-				continue
-			}
+		if !IsDisabledChannel(ChannelTypeDirect) {
+			vpn.logger.Debugf(`directConnectorLoop(): trying to setup direct connections`)
+			for _, peer := range vpn.getPeers() {
+				chType := peer.GetOptimalChannel(ChannelTypeTunnel, ChannelTypeIPFS)
+				vpn.logger.Debugf(`directConnectorLoop(): trying to setup a direct connection to %v. Optimal channel: %v`, peer.ID, chType)
+				if chType == ChannelType_undefined {
+					continue
+				}
 
-			peer.SwitchDirectChannelToPathOfChannel(chType)
+				peer.SwitchDirectChannelToPathOfChannel(chType)
+			}
 		}
 
 		// Auto-routing (use the best channel for auto-routed addresses)
@@ -716,10 +746,10 @@ func (vpn *VPN) GetPublicKey() ed25519.PublicKey {
 	return vpn.PrivKey().Public().(ed25519.PublicKey)
 }
 
-func (vpn *VPN) startDirectConnector() (err error) {
+func (vpn *VPN) startAutoRouter() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	go vpn.directConnectorLoop()
+	go vpn.autoRouterLoop()
 
 	return
 }
@@ -795,6 +825,9 @@ func (vpn *VPN) updateWireGuardConfiguration() (err error) {
 	}
 
 	for _, chType := range ChannelTypes {
+		if IsDisabledChannel(chType) {
+			continue
+		}
 		var peersCfg []wgtypes.PeerConfig
 		peersCfg, err = vpn.getPeers().ToWireGuardConfigs(chType)
 		if err != nil {
@@ -959,6 +992,9 @@ func (vpn *VPN) setupIfaceIPAddresses() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
 	for _, chType := range ChannelTypes {
+		if IsDisabledChannel(chType) {
+			continue
+		}
 		if err = vpn.setupIfaceIPAddress(chType); err != nil {
 			return
 		}
@@ -1009,7 +1045,7 @@ func (vpn *VPN) LoadConfig() (err error) {
 			if err != nil {
 				return
 			}
-			if vpn.IntAlias.Timestamp.UnixNano() < time.Date(2019, 06, 23, 19, 47, 29, 0, time.UTC).UnixNano() { // if the computer has a broken battery and the clock shows wrong value
+			if vpn.IntAlias.Timestamp.UnixNano() < time.Date(2022, 1, 3, 14, 58, 9, 0, time.UTC).UnixNano() { // if the computer has a broken battery and the clock shows wrong value
 				vpn.IntAlias.Timestamp = time.Now()
 			}
 		})
@@ -1294,7 +1330,7 @@ func (vpn *VPN) pingSenderLoop(peerAddr AddrInfo, remoteUsualPort uint16, addrs 
 		select {
 		case <-ctx.Done():
 			wakeuper.Stop()
-			vpn.logger.Debugf(`context has finished`)
+			vpn.logger.Debugf(`pingSenderLoop: context has finished`)
 			return
 		case <-wakeuper.C:
 			wakeuper.Stop()
@@ -1337,7 +1373,7 @@ func (vpn *VPN) createSimpleTunnelReaders(peerAddr AddrInfo, addrs []*net.UDPAdd
 	}
 }
 
-func (vpn *VPN) startSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, addrs []*net.UDPAddr) {
+func (vpn *VPN) doStartSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, addrs []*net.UDPAddr) {
 	var myAddresses []multiaddr.Multiaddr
 	vpn.RLockDo(func() {
 		myAddresses = vpn.myIPFSAddrs
@@ -1380,9 +1416,25 @@ func (vpn *VPN) startSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, add
 func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	vpn.requestPortInfo(peerAddr.ID, ChannelTypeDirect)
-	vpn.requestPortInfo(peerAddr.ID, ChannelTypeTunnel)
+	if !IsDisabledChannel(ChannelTypeDirect) {
+		vpn.requestPortInfo(peerAddr.ID, ChannelTypeDirect)
+	}
+	if !IsDisabledChannel(ChannelTypeTunnel) {
+		vpn.requestPortInfo(peerAddr.ID, ChannelTypeTunnel)
+	}
 
+	if !IsDisabledChannel(ChannelTypeTunnel) {
+		err = vpn.startSendingPings(peerAddr)
+		if err != nil {
+			return
+		}
+	}
+
+	return
+}
+
+func (vpn *VPN) startSendingPings(peerAddr AddrInfo) (err error) {
+	defer func() { err = errors.Wrap(err) }()
 	var remoteUsualPort uint16
 	var addrs []*net.UDPAddr
 	for _, maddr := range peerAddr.Addrs {
@@ -1450,7 +1502,7 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 		addrs = newAddrs
 	}
 
-	vpn.startSendingPings(peerAddr, remoteUsualPort, addrs)
+	vpn.doStartSendingPings(peerAddr, remoteUsualPort, addrs)
 	return
 }
 

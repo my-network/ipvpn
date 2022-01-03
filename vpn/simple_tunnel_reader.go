@@ -1,7 +1,6 @@
 package vpn
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"net"
@@ -60,7 +59,7 @@ type simpleTunnelReader struct {
 	publicKeyRemote               ed25519.PublicKey
 	gcFunc                        func() error
 	addrs                         []*net.UDPAddr
-	lastUseTS                     uint32
+	lastUseTS                     int64
 	connectionInitContext         context.Context
 	connectionInitContextStopFunc context.CancelFunc
 	createTS                      time.Time
@@ -93,7 +92,7 @@ func newSimpleTunnelReader(vpn *VPN, peerAddrRemote AddrInfo, addrs []*net.UDPAd
 
 func (r *simpleTunnelReader) HasAddress(addr *net.UDPAddr) bool {
 	for _, cmpAddr := range r.addrs {
-		if cmpAddr.Port == addr.Port && bytes.Compare(cmpAddr.IP, addr.IP) == 0 {
+		if cmpAddr.Port == addr.Port && cmpAddr.IP.Equal(addr.IP) {
 			return true
 		}
 	}
@@ -103,7 +102,7 @@ func (r *simpleTunnelReader) HasAddress(addr *net.UDPAddr) bool {
 func (r *simpleTunnelReader) Close() error {
 	err := r.gcFunc()
 	r.stop()
-	go close(r.queue)
+	close(r.queue)
 	return err
 }
 
@@ -120,7 +119,8 @@ func (r *simpleTunnelReader) selfGC() {
 		case <-r.connectionInitContext.Done():
 			return
 		case <-ticker.C:
-			lastUseTS := time.Unix(int64(atomic.LoadUint32(&r.lastUseTS)), 0)
+			_lastUseTS := int64(atomic.LoadInt64(&r.lastUseTS))
+			lastUseTS := time.Unix(_lastUseTS/1000000000, _lastUseTS%1000000000)
 			if time.Since(lastUseTS) < time.Hour {
 				continue
 			}
@@ -145,6 +145,8 @@ func (r *simpleTunnelReader) stop() {
 
 func (r *simpleTunnelReader) enqueue(conn *net.UDPConn, addrRemote *net.UDPAddr, msg []byte) {
 	r.vpn.logger.Debugf(`[simpleTunnelReader] enqueue %v %v %v`, conn, addrRemote, msg)
+	defer r.vpn.logger.Debugf(`[simpleTunnelReader] /enqueue %v %v %v`, conn, addrRemote, msg)
+	atomic.StoreInt64(&r.lastUseTS, time.Now().UnixNano())
 	item := acquireSimpleTunnelReaderQueueItem(uint(len(msg)))
 	copy(item.msg, msg)
 	item.conn = conn
@@ -254,7 +256,7 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 		}
 
 		if err := r.messagePong.VerifyRecipient(r.publicKeyRemote); err != nil {
-			r.vpn.logger.Debugf("%v> remove signature is invalid in pong from peer %v: %v (%v)", addrLocal, r.peerAddrRemote.ID, err, addrRemote)
+			r.vpn.logger.Debugf("%v> remote signature is invalid in pong from peer %v: %v (%v)", addrLocal, r.peerAddrRemote.ID, err, addrRemote)
 			return
 		}
 		if err := r.messagePong.VerifySender(r.vpn.GetPublicKey()); err != nil {
@@ -302,8 +304,11 @@ func (r *simpleTunnelReader) Read(b []byte) (size int, err error) {
 
 func (r *simpleTunnelReader) ReadFromUDP(b []byte) (size int, addr *net.UDPAddr, err error) {
 	r.vpn.logger.Debugf(`[simpleTunnelReader] ReadFromUDP(): wait...`)
-	item := <-r.queue
-	r.vpn.logger.Debugf(`[simpleTunnelReader] ReadFromUDP(): %v`, item)
+	item, ok := <-r.queue
+	r.vpn.logger.Debugf(`[simpleTunnelReader] ReadFromUDP(): %v, %v`, item, ok)
+	if !ok {
+		return 0, nil, errors.Wrap(net.ErrClosed)
+	}
 	addr = item.addrRemote
 	copy(b, item.msg)
 	size = len(b)

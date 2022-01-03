@@ -850,7 +850,7 @@ func (mesh *Network) onReceiveMessageCustom(stream Stream, topic string, payload
 }
 
 func (mesh *Network) streamHandler(stream Stream) {
-	defer mesh.logger.Debugf(`endof streamHandler for %v`, stream.Conn().RemotePeer())
+	defer mesh.logger.Debugf(`endof streamHandler for %v, stream.ID:%v`, stream.Conn().RemotePeer(), stream.ID())
 
 	buf := make([]byte, bufferSize)
 
@@ -858,7 +858,7 @@ streamHandlerLoop:
 	for {
 		n, err := stream.Read(buf[:1])
 		if err != nil {
-			mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+			mesh.logger.Infof(`a control stream (%v) to peer %v closed while reading message type: %v (%T)`, stream.ID(), stream.Conn().RemotePeer(), err, err)
 			break
 		}
 
@@ -872,7 +872,7 @@ streamHandlerLoop:
 		case MessageTypeCustom:
 			n, err := stream.Read(buf[:2])
 			if err != nil {
-				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				mesh.logger.Infof(`a control stream (%v) to peer %v closed while reading topic name length: %v (%T)`, stream.ID(), stream.Conn().RemotePeer(), err, err)
 				break streamHandlerLoop
 			}
 			payload := buf[0:n]
@@ -886,7 +886,7 @@ streamHandlerLoop:
 
 			n, err = stream.Read(buf[:topicLength])
 			if err != nil {
-				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				mesh.logger.Infof(`a control stream (%v) to peer %v closed while reading topic name: %v (%T)`, stream.ID(), stream.Conn().RemotePeer(), err, err)
 				break streamHandlerLoop
 			}
 			payload = buf[0:n]
@@ -900,7 +900,7 @@ streamHandlerLoop:
 
 			n, err = stream.Read(buf[:2])
 			if err != nil {
-				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				mesh.logger.Infof(`a control stream (%v) to peer %v closed while reading payload length: %v (%T)`, stream.ID(), stream.Conn().RemotePeer(), err, err)
 				break streamHandlerLoop
 			}
 			payload = buf[0:n]
@@ -909,7 +909,7 @@ streamHandlerLoop:
 
 			n, err = stream.Read(buf[:payloadLength])
 			if err != nil {
-				mesh.logger.Infof(`a control stream to peer %v closed: %v (%T)`, stream.Conn().RemotePeer(), err, err)
+				mesh.logger.Infof(`a control stream (%v) to peer %v closed while reading payload: %v (%T)`, stream.ID(), stream.Conn().RemotePeer(), err, err)
 				break streamHandlerLoop
 			}
 			payload = buf[0:payloadLength]
@@ -927,7 +927,7 @@ streamHandlerLoop:
 		}
 	}
 
-	mesh.logger.Debugf(`stream.Close()`)
+	mesh.logger.Debugf(`stream.Close(): stream.ID:%v`, stream.ID())
 	_ = stream.Close()
 	_ = stream.Conn().Close()
 
@@ -1381,8 +1381,8 @@ func (mesh *Network) recvAndCheckAuthData(stream Stream) (err error) {
 		return
 	}
 
-	if bytes.Compare(expectedAuthData, receivedAuthData) != 0 {
-		return errors.New("invalid signature")
+	if !bytes.Equal(expectedAuthData, receivedAuthData) {
+		return errors.Errorf("invalid signature, expected:%X, received:%X", expectedAuthData, receivedAuthData)
 	}
 	return
 }

@@ -63,7 +63,7 @@ func (ping *MessagePing) VerifySender(pubKey ed25519.PublicKey) (err error) {
 
 	isValidSignature := ed25519.Verify(pubKey, ping.MessagePingData.Bytes(), ping.SenderSignature[:])
 	if !isValidSignature {
-		return ErrInvalidSignature
+		return errors.Errorf("%w: signature %X does not currespond to pubkey %X for messaged %X", ErrInvalidSignature, ping.SenderSignature[:], pubKey, ping.MessagePingData.Bytes())
 	}
 	return
 }

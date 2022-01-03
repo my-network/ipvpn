@@ -1432,8 +1432,8 @@ github.com/x-cray/logrus-prefixed-formatter v0.5.2/go.mod h1:2duySbKsL6M18s5GU7V
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
 github.com/xaionaro-go/atomicmap v0.0.0-20210620215405-96a7f1f95a70 h1:z/+V+ai0R41aym9Hz6flJ90LuuuaHv2EfI7pNaYSPuw=
 github.com/xaionaro-go/atomicmap v0.0.0-20210620215405-96a7f1f95a70/go.mod h1:WgfDl7x9++CVnKSu63ThFhBF3nvgj60Ft1nCgrOSgWM=
-github.com/xaionaro-go/bytesextra v0.0.0-20211223175106-39c484416083 h1:YULI4giEt1KfbPqdOR0GRYbOD2PspdieuJdZTVTxshI=
-github.com/xaionaro-go/bytesextra v0.0.0-20211223175106-39c484416083/go.mod h1:op5hoGu7YbHB+PlxrR0jAhl5OaCpYCEqtdCfusfZCYk=
+github.com/xaionaro-go/bytesextra v0.0.0-20220103144954-846e454ddea9 h1:LZsotURuIwV1yjhoaTpbdZHf0/7QtWtvXH8VZ4zs/ug=
+github.com/xaionaro-go/bytesextra v0.0.0-20220103144954-846e454ddea9/go.mod h1:op5hoGu7YbHB+PlxrR0jAhl5OaCpYCEqtdCfusfZCYk=
 github.com/xaionaro-go/errors v0.0.0-20200223133802-5f1bdcd2dd3e h1:xPlvDQvKD3ZebBBhBn1p+mT7Kjeo1dGsXVEwLBdDmhc=
 github.com/xaionaro-go/errors v0.0.0-20200223133802-5f1bdcd2dd3e/go.mod h1:kbL3cDyZdqjEhQR1+LVHz0/ZYbFpH62e6t3zCDKmbLA=
 github.com/xaionaro-go/netlink v1.0.1-0.20200209193433-105c3d8d5e5b h1:VWyVaqVFH/qIQvYwHRXjmk7C2IHhTG55RTp7tIVt0QI=

@@ -6,13 +6,12 @@ import (
 	"io"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/xaionaro-go/bytesextra"
 	"github.com/xaionaro-go/errors"
 )
 
 const (
-	PeerIDSize = 52
+	PeerIDSize = 38
 )
 
 var (
@@ -33,11 +32,16 @@ type MessageIntAlias struct {
 func (msg *MessageIntAlias) FillFrom(intAlias *IntAlias) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	if len(intAlias.PeerID) != PeerIDSize {
-		return errors.Wrap(ErrInvalidPeerID, len(intAlias.PeerID))
+	var peerIDBytes []byte
+	peerIDBytes, err = intAlias.PeerID.MarshalBinary()
+	if err != nil {
+		return
+	}
+	if len(peerIDBytes) != len(msg.PeerID[:]) {
+		return errors.Wrap(ErrInvalidPeerID, len(peerIDBytes))
 	}
 
-	copy(msg.PeerID[:], []byte(intAlias.PeerID))
+	copy(msg.PeerID[:], peerIDBytes)
 	msg.Value = intAlias.Value
 	msg.MaxNetworkSize = intAlias.MaxNetworkSize
 	msg.Timestamp = intAlias.Timestamp.UnixNano()
@@ -49,7 +53,10 @@ func (msg *MessageIntAlias) FillFrom(intAlias *IntAlias) (err error) {
 func (msg *MessageIntAlias) FillTo(intAlias *IntAlias) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	intAlias.PeerID = peer.ID(string(msg.PeerID[:]))
+	err = intAlias.PeerID.UnmarshalBinary(msg.PeerID[:])
+	if err != nil {
+		return
+	}
 	intAlias.Value = msg.Value
 	intAlias.MaxNetworkSize = msg.MaxNetworkSize
 	intAlias.Timestamp = time.Unix(0, msg.Timestamp)

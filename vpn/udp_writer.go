@@ -14,6 +14,9 @@ type udpWriter struct {
 }
 
 func newUDPWriter(conn *net.UDPConn, readCloser io.ReadCloser, addr *net.UDPAddr) *udpWriter {
+	if conn == nil {
+		panic("conn is nil")
+	}
 	return &udpWriter{
 		UDPConn:    conn,
 		addr:       addr,
