@@ -1212,6 +1212,10 @@ func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 	go peer.LockDo(func() {
 		switch chType {
 		case ChannelTypeIPFS:
+			err = peer.lazyInitTunnerConnToWG()
+			if err != nil {
+				return
+			}
 			if peer.IPFSForwarderStream == nil || peer.forwarderStreamTunnelReaderRunning {
 				return
 			}
@@ -1416,6 +1420,10 @@ func (peer *Peer) toWireGuardConfig(chType ChannelType) (peerCfg wgtypes.PeerCon
 }
 
 func (peer *Peer) wgToTunnelForwarderLoop(wgConn io.Reader, tunnelConn io.Writer) {
+	peer.VPN.logger.Debugf(`peer<%v>.wgToTunnelForwarderLoop(%T, %T)`, peer.ID, wgConn, tunnelConn)
+	defer func() {
+		peer.VPN.logger.Debugf(`/peer<%v>.wgToTunnelForwarderLoop(%T, %T)`, peer.ID, wgConn, tunnelConn)
+	}()
 	buffer := [peerBufferSize]byte{}
 
 	for {
@@ -1582,23 +1590,47 @@ func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) {
 	})
 }
 
-func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
+// should be already locked
+func (peer *Peer) lazyInitTunnerConnToWG() (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	if peer.IPFSTunnelConnToWG != nil {
+		return
+	}
+
+	peer.VPN.logger.Debugf(`peer<%v>.lazyInitTunnerConnToWG`, peer.ID)
+	defer func() { peer.VPN.logger.Debugf(`/peer<%v>.lazyInitTunnerConnToWG -> %v`, peer.ID, err) }()
+
+	peer.IPFSTunnelConnToWG, peer.IPFSTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
+		IP:   net.ParseIP(`127.0.0.1`),
+		Port: 0, // automatically assign a free port
+	})
+
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 	peer.VPN.logger.Debugf(`peer<%v>.startTunnelWriter(%v)`, peer.ID, chType)
+	defer func() { peer.VPN.logger.Debugf(`/peer<%v>.startTunnelWriter(%v) -> %v`, peer.ID, chType, err) }()
+
+	defer func() { err = errors.Wrap(err) }()
 
 	go peer.LockDo(func() {
-		peer.VPN.logger.Debugf(`peer<%v>.startTunnelWriter(%v): locked`, peer.ID, chType)
-		defer peer.VPN.logger.Debugf(`/peer<%v>.startTunnelWriter(%v)`, peer.ID, chType)
+		var err error
+		peer.VPN.logger.Debugf(`peer<%v>.startTunnelWriter(%v): go: locked`, peer.ID, chType)
+		defer func() {
+			peer.VPN.logger.Debugf(`/peer<%v>.startTunnelWriter(%v): go: unlocked -> %v`, peer.ID, chType, err)
+		}()
 
 		switch chType {
 		case ChannelTypeIPFS:
-			if peer.IPFSTunnelConnToWG == nil {
-				if peer.IPFSTunnelConnToWG, peer.IPFSTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
-					IP:   net.ParseIP(`127.0.0.1`),
-					Port: 0, // automatically assign a free port
-				}); err != nil {
-					return
-				}
+			err = peer.lazyInitTunnerConnToWG()
+			if err != nil {
+				return
 			}
 
 			if peer.IPFSForwarderStream == nil || peer.forwarderStreamTunnelWriterRunning {
@@ -1607,10 +1639,10 @@ func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 			peer.forwarderStreamTunnelWriterRunning = true
 			go func(connToWG net.Conn, stream Stream) {
 				peer.wgToTunnelForwarderLoop(connToWG, stream)
-				peer.VPN.logger.Debugf(`endof peer<%v>.wgToTunnelForwarderLoop(peer.IPFSTunnelConnToWG, peer.IPFSForwarderStreamIngoing)`, peer.ID)
 				peer.LockDo(func() {
 					peer.forwarderStreamTunnelWriterRunning = false
 					if peer.IPFSForwarderStream != stream {
+						peer.VPN.logger.Debugf("peer<%v>.IPFSForwarderStream != stream", peer.ID)
 						return
 					}
 					peer.VPN.logger.Debugf(`peer<%v>.IPFSForwarderStream = nil`, peer.ID)
