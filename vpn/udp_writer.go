@@ -24,6 +24,10 @@ func newUDPWriter(conn *net.UDPConn, readCloser io.ReadCloser, addr *net.UDPAddr
 	}
 }
 
+func (w *udpWriter) RemoteAddr() net.Addr {
+	return w.addr
+}
+
 func (w *udpWriter) Write(b []byte) (size int, err error) {
 	size, err = w.UDPConn.WriteToUDP(b, w.addr)
 	if err != nil {

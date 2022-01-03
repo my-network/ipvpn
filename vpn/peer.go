@@ -1455,7 +1455,13 @@ func (peer *Peer) getRemoteRealIP(chType ChannelType) (result net.IP) {
 		if peer.SimpleTunnelConn == nil {
 			return nil
 		}
-		return net.ParseIP(strings.Split(peer.SimpleTunnelConn.RemoteAddr().String(), `:`)[0])
+		remoteAddr := peer.SimpleTunnelConn.RemoteAddr()
+		if remoteAddr == nil {
+			if remoteAddr == nil {
+				panic("remoteAddr == nil")
+			}
+		}
+		return net.ParseIP(strings.Split(remoteAddr.String(), `:`)[0])
 	}
 
 	panic(fmt.Errorf(`shouldn't happened: %v'`, chType))
