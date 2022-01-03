@@ -187,17 +187,18 @@ func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
 		return
 	}
 
-	go vpn.LockDo(func() {
-		peerID := stream.Conn().RemotePeer().String()
-		peerConfig := vpn.Peers[peerID]
-		peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
-		vpn.Peers[peerID] = peerConfig
-
+	go func() {
+		vpn.LockDo(func() {
+			peerID := stream.Conn().RemotePeer().String()
+			peerConfig := vpn.Peers[peerID]
+			peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
+			vpn.Peers[peerID] = peerConfig
+		})
 		warnErr := vpn.SaveConfig()
 		if warnErr != nil {
 			vpn.logger.Error(errors.Wrap(warnErr))
 		}
-	})
+	}()
 }
 
 func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
@@ -208,17 +209,19 @@ func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
 		return
 	}
 
-	go vpn.LockDo(func() {
-		peerID := stream.Conn().RemotePeer().String()
-		peerConfig := vpn.Peers[peerID]
-		peerConfig.SimpleTunnelPort = binary.LittleEndian.Uint16(payload)
-		vpn.Peers[peerID] = peerConfig
-
+	go func() {
+		vpn.LockDo(func() {
+			peerID := stream.Conn().RemotePeer().String()
+			peerConfig := vpn.Peers[peerID]
+			peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
+			vpn.Peers[peerID] = peerConfig
+		})
 		warnErr := vpn.SaveConfig()
 		if warnErr != nil {
 			vpn.logger.Error(errors.Wrap(warnErr))
 		}
-	})
+	}()
+
 }
 
 func (vpn *VPN) ProtocolID() protocol.ID {
