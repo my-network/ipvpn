@@ -532,6 +532,11 @@ func (vpn *VPN) SetMyAddrs(addrs []multiaddr.Multiaddr) {
 }
 
 func (vpn *VPN) getPeerPort(peerID peer.ID, chType ChannelType) (result uint16) {
+	vpn.logger.Debugf("getPeerPort(%v, %v)", peerID, chType)
+	defer func() {
+		vpn.logger.Debugf("/getPeerPort(%v, %v) -> %d", peerID, chType, result)
+	}()
+
 	vpn.RLockDo(func() {
 		switch chType {
 		case ChannelTypeDirect:

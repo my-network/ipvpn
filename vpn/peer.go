@@ -494,32 +494,39 @@ func (peer *Peer) onNoForwarderStreamsLeft() {
 
 func (peer *Peer) SwitchDirectChannelToPathOfChannel(chType ChannelType) {
 	go func() {
+		peer.VPN.logger.Debugf(`peer<%v>.SwitchDirectChannelToPathOfChannel(%v)`, peer.ID, chType)
+
+		var ch chan ChannelType
 		peer.RLockDo(func() {
-			peer.VPN.logger.Debugf(`peer<%v>.SwitchDirectChannelToPathOfChannel(%v)`, peer.ID, chType)
-			peer.switchDirectChannelToPathOfChannelChan <- chType
+			ch = peer.switchDirectChannelToPathOfChannelChan
 		})
+		ch <- chType
 	}()
 }
 
 func (peer *Peer) switchDirectChannelToPathOfChannel(chType ChannelType) {
 	vpn := peer.VPN
 	peer.VPN.logger.Debugf(`peer<%v>.switchDirectChannelToPathOfChannel(%v)`, peer.ID, chType)
+	defer peer.VPN.logger.Debugf(`/peer<%v>.switchDirectChannelToPathOfChannel(%v)`, peer.ID, chType)
 
-	newDirectAddr := peer.GetRemoteRealIP(chType)
-	if peer.DirectAddr != nil && peer.DirectAddr.IP.String() == newDirectAddr.String() {
+	newDirectIP := peer.GetRemoteRealIP(chType)
+	peer.VPN.logger.Debugf(`peer<%v>.switchDirectChannelToPathOfChannel(%v): %v %v`, peer.ID, chType, peer.DirectAddr, newDirectIP)
+	if peer.DirectAddr != nil && peer.DirectAddr.IP.String() == newDirectIP.String() {
 		return
 	}
+
 	port := vpn.getPeerPort(peer.ID, ChannelTypeDirect)
-	vpn.logger.Debugf(`vpn.getPeerPort("%v", ChannelTypeDirect) -> %v`, peer.ID, port)
+	vpn.logger.Debugf(`peer<%v>.switchDirectChannelToPathOfChannel(%v): vpn.getPeerPort("%v", ChannelTypeDirect) -> %v`, peer.ID, chType, peer.ID, port)
 	if port == 0 {
 		return
 	}
 
+	newDirectAddr := &net.UDPAddr{
+		IP:   newDirectIP,
+		Port: int(port),
+	}
 	peer.LockDo(func() {
-		peer.DirectAddr = &net.UDPAddr{
-			IP:   newDirectAddr,
-			Port: int(port),
-		}
+		peer.DirectAddr = newDirectAddr
 	})
 
 	peer.StartChannel(ChannelTypeDirect)
