@@ -503,7 +503,7 @@ func (vpn *VPN) notifyPeerAboutMyPort(peerID peer.ID, chType ChannelType, port u
 }
 
 func (vpn *VPN) notifyPeersAboutMyPort(chType ChannelType, port uint16) {
-	vpn.logger.Debugf("notifyPeersAboutMyPort: %v, %v, %v", chType, port)
+	vpn.logger.Debugf("notifyPeersAboutMyPort: %v, %v", chType, port)
 
 	var topic string
 	switch chType {

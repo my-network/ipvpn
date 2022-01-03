@@ -64,9 +64,11 @@ type simpleTunnelReader struct {
 	connectionInitContextStopFunc context.CancelFunc
 	createTS                      time.Time
 	queue                         chan *simpleTunnelReaderQueueItem
+	queueSchedulerWG              sync.WaitGroup
 	messagePong                   MessagePong
 	mySideIsReady                 bool
 	remoteSideIsReady             bool
+	initCompleted                 bool
 }
 
 func newSimpleTunnelReader(vpn *VPN, peerAddrRemote AddrInfo, addrs []*net.UDPAddr, gcFunc func() error) (reader *simpleTunnelReader, err error) {
@@ -80,6 +82,8 @@ func newSimpleTunnelReader(vpn *VPN, peerAddrRemote AddrInfo, addrs []*net.UDPAd
 		gcFunc:         gcFunc,
 		queue:          make(chan *simpleTunnelReaderQueueItem, simpleTunnelReaderQueueLength),
 	}
+
+	reader.vpn.logger.Debugf("newSimpleTunnelReader: %v", reader.peerAddrRemote.ID)
 
 	reader.publicKeyRemote, err = getPublicKeyFromPeerID(peerAddrRemote.ID)
 	if err != nil {
@@ -100,6 +104,8 @@ func (r *simpleTunnelReader) HasAddress(addr *net.UDPAddr) bool {
 }
 
 func (r *simpleTunnelReader) Close() error {
+	r.vpn.logger.Debugf("simpleTunnelReader<%v>.Close()", r.peerAddrRemote.ID)
+
 	err := r.gcFunc()
 	r.stop()
 	close(r.queue)
@@ -109,7 +115,12 @@ func (r *simpleTunnelReader) Close() error {
 func (r *simpleTunnelReader) start() {
 	r.connectionInitContext, r.connectionInitContextStopFunc = context.WithCancel(context.Background())
 	// go r.selfGC()
-	go r.queueScheduler()
+
+	r.queueSchedulerWG.Add(1)
+	go func() {
+		defer r.queueSchedulerWG.Done()
+		r.queueScheduler()
+	}()
 }
 
 func (r *simpleTunnelReader) selfGC() {
@@ -144,8 +155,8 @@ func (r *simpleTunnelReader) stop() {
 }
 
 func (r *simpleTunnelReader) enqueue(conn *net.UDPConn, addrRemote *net.UDPAddr, msg []byte) {
-	r.vpn.logger.Debugf(`[simpleTunnelReader] enqueue %v %v %v`, conn, addrRemote, msg)
-	defer r.vpn.logger.Debugf(`[simpleTunnelReader] /enqueue %v %v %v`, conn, addrRemote, msg)
+	r.vpn.logger.Debugf(`[simpleTunnelReader] enqueue %v %v %v`, conn.LocalAddr(), addrRemote, msg)
+	defer r.vpn.logger.Debugf(`[simpleTunnelReader] /enqueue %v %v %v`, conn.LocalAddr(), addrRemote, msg)
 	atomic.StoreInt64(&r.lastUseTS, time.Now().UnixNano())
 	item := acquireSimpleTunnelReaderQueueItem(uint(len(msg)))
 	copy(item.msg, msg)
@@ -155,8 +166,8 @@ func (r *simpleTunnelReader) enqueue(conn *net.UDPConn, addrRemote *net.UDPAddr,
 }
 
 func (r *simpleTunnelReader) queueScheduler() {
-	r.vpn.logger.Debugf(`[simpleTunnelReader] queueScheduler: %v`, r.peerAddrRemote)
-	defer r.vpn.logger.Debugf(`[simpleTunnelReader] /queueScheduler: %v`, r.peerAddrRemote)
+	r.vpn.logger.Debugf(`[simpleTunnelReader] queueScheduler: %v->%v`, r.addrs, r.peerAddrRemote.ID)
+	defer r.vpn.logger.Debugf(`[simpleTunnelReader] /queueScheduler: %v->%v`, r.addrs, r.peerAddrRemote.ID)
 
 	for {
 		select {
@@ -172,16 +183,18 @@ func (r *simpleTunnelReader) queueScheduler() {
 func (r *simpleTunnelReader) processMessage(msg *simpleTunnelReaderQueueItem) {
 	r.doProcessMessage(msg)
 
-	r.vpn.logger.Debugf("[simpleTunnelReader] processMessage %v %v: %v",
-		r.mySideIsReady, r.remoteSideIsReady, msg,
+	r.vpn.logger.Debugf("[simpleTunnelReader] processMessage %v %v %v: %v",
+		r.mySideIsReady, r.remoteSideIsReady, r.initCompleted, msg,
 	)
 
-	if r.mySideIsReady && r.remoteSideIsReady {
+	if r.mySideIsReady && r.remoteSideIsReady && !r.initCompleted {
+		r.initCompleted = true
 		conn := msg.conn
 		addrRemote := msg.addrRemote
 		r.vpn.logger.Debugf(`r.mySideIsReady && r.remoteSideIsReady: %v -> %v`, conn.LocalAddr(), addrRemote)
 
 		r.connectionInitContextStopFunc()
+		r.queueSchedulerWG.Wait()
 		peer := r.vpn.GetOrCreatePeerByID(r.peerAddrRemote.ID)
 		go peer.addTunnelConnection(newUDPWriter(conn, r, addrRemote), r.peerAddrRemote)
 	}
@@ -291,6 +304,8 @@ func (r *simpleTunnelReader) doProcessMessage(msg *simpleTunnelReaderQueueItem) 
 			r.vpn.logger.Debugf(`%v> unexpected sequence ID: %v (%v)`, addrLocal, r.messagePong.SequenceID, addrRemote)
 			return
 		}
+	case MessageTypeIntAlias:
+		r.vpn.logger.Debugf(`%v> a late int-alias message, ignoring (%v)`, addrLocal, addrRemote)
 	default:
 		r.vpn.logger.Debugf("%v> unknown message type: %v (%v)", addrLocal, msgType, addrRemote)
 		return
@@ -303,11 +318,11 @@ func (r *simpleTunnelReader) Read(b []byte) (size int, err error) {
 }
 
 func (r *simpleTunnelReader) ReadFromUDP(b []byte) (size int, addr *net.UDPAddr, err error) {
-	r.vpn.logger.Debugf(`[simpleTunnelReader] ReadFromUDP(): wait...`)
+	r.vpn.logger.Debugf(`simpleTunnelReader<%v->%v>.ReadFromUDP(): wait...`, r.addrs, r.peerAddrRemote.Addrs)
 	item, ok := <-r.queue
-	r.vpn.logger.Debugf(`[simpleTunnelReader] ReadFromUDP(): %v, %v`, item, ok)
+	r.vpn.logger.Debugf(`simpleTunnelReader<%v->%v>.ReadFromUDP(): %v, %v`, r.addrs, r.peerAddrRemote.Addrs, item, ok)
 	if !ok {
-		return 0, nil, errors.Wrap(net.ErrClosed)
+		return 0, nil, errors.Wrap(net.ErrClosed, "r.queue is closed")
 	}
 	addr = item.addrRemote
 	copy(b, item.msg)
