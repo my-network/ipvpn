@@ -73,7 +73,8 @@ type VPN struct {
 	directConnectorTrigger       chan struct{}
 	simpleTunnelListener         *net.UDPConn
 	simpleTunnelExternalListener *net.UDPConn
-	simpleTunnelReaderMap        atomicmap.Map
+	simpleTunnelReaderPeerMap    atomicmap.Map // peerID -> reader
+	simpleTunnelReaderAddrMap    atomicmap.Map // addr -> reader
 	upperHandlers                []UpperHandler
 
 	newIncomingStreamChan chan struct {
@@ -110,8 +111,9 @@ func New(dirPath string, subnet net.IPNet, logger Logger) (vpn *VPN, err error) 
 		updateWireGuardConfigurationChan: make(chan struct{}),
 		setupIfaceIPAddressesChan:        make(chan struct{}),
 
-		simpleTunnelReaderMap:    atomicmap.New(),
-		pingSenderLoopCancelFunc: atomicmap.New(),
+		simpleTunnelReaderPeerMap: atomicmap.New(),
+		simpleTunnelReaderAddrMap: atomicmap.New(),
+		pingSenderLoopCancelFunc:  atomicmap.New(),
 	}
 
 	// Splitting "subnet" to 4 subnets: direct, ipfs, simpleTunnel, autoRouted
@@ -597,7 +599,7 @@ func (vpn *VPN) simpleTunnelListenerReader(conn *net.UDPConn) {
 			binary.LittleEndian.PutUint16(addrBuf[len(addr.IP):], uint16(addr.Port))
 			fullAddr := addrBuf[:2+len(addr.IP)]
 
-			readerI, err := vpn.simpleTunnelReaderMap.GetByBytes(fullAddr)
+			readerI, err := vpn.simpleTunnelReaderAddrMap.GetByBytes(fullAddr)
 			if err != nil {
 				vpn.logger.Debugf(`%v> there's no reader for %v: %v`, conn.LocalAddr(), addr, err)
 				continue
@@ -1347,30 +1349,48 @@ func addrToKey(addr *net.UDPAddr) []byte {
 }
 
 func (vpn *VPN) createSimpleTunnelReaders(peerAddr AddrInfo, addrs []*net.UDPAddr) {
+	vpn.logger.Debugf("vpn.createSimpleTunnelReaders: %v:%v->%v", peerAddr.ID, peerAddr.Addrs, addrs)
+	defer vpn.logger.Debugf("/vpn.createSimpleTunnelReaders: %v:%v->%v", peerAddr.ID, peerAddr.Addrs, addrs)
+
 	var reader *simpleTunnelReader
-	var err error
-	reader, err = newSimpleTunnelReader(vpn, peerAddr, addrs, func() error { /* Close() func */
-		for _, addr := range addrs {
-			key := addrToKey(addr)
-			if vpn.simpleTunnelReaderMap.UnsetIf(key, func(value interface{}) bool {
+
+	oldReaderI, _ := vpn.simpleTunnelReaderPeerMap.Get(peerAddr.ID)
+	if oldReaderI != nil {
+		reader = oldReaderI.(*simpleTunnelReader)
+		reader.ExtendAddrs(addrs)
+	} else {
+		var err error
+		reader, err = newSimpleTunnelReader(vpn, peerAddr, addrs, func(reader *simpleTunnelReader) error { /* Close() func */
+			for _, addr := range reader.addrs {
+				key := addrToKey(addr)
+				if vpn.simpleTunnelReaderAddrMap.UnsetIf(key, func(value interface{}) bool {
+					return value.(*simpleTunnelReader) == reader
+				}) == nil {
+					vpn.logger.Debugf(`vpn.simpleTunnelReaderAddrMap.Unset(%v)`, addr)
+				}
+			}
+			if vpn.simpleTunnelReaderPeerMap.UnsetIf(peerAddr.ID, func(value interface{}) bool {
 				return value.(*simpleTunnelReader) == reader
 			}) == nil {
-				vpn.logger.Debugf(`vpn.simpleTunnelReaderMap.Unset(%v)`, addr)
+				vpn.logger.Debugf(`vpn.simpleTunnelReaderPeerMap.Unset(%v)`, peerAddr.ID)
 			}
+			return nil
+		})
+		if err != nil {
+			vpn.logger.Error(errors.Wrap(err, `unable to create a tunnel reader`))
+			return
 		}
-		return nil
-	})
-	if err != nil {
-		vpn.logger.Error(errors.Wrap(err, `unable to create a tunnel reader`))
-		return
 	}
 
 	for _, addr := range addrs {
 		key := addrToKey(addr)
 		// TODO: we should limit number of possible readers, otherwise it could be used for DoS attacks (to get the node run out of memory)
-		vpn.logger.Debugf(`vpn.simpleTunnelReaderMap.Set(%v, reader)`, addr)
-		_ = vpn.simpleTunnelReaderMap.Set(key, reader)
+		vpn.logger.Debugf(`vpn.simpleTunnelReaderAddrMap.Set(%v, reader)`, addr)
+		_ = vpn.simpleTunnelReaderAddrMap.Set(key, reader)
 	}
+
+	vpn.logger.Debugf(`vpn.simpleTunnelReaderPeerMap.Set(%v, reader)`, peerAddr.ID)
+	vpn.simpleTunnelReaderPeerMap.Set(peerAddr.ID, reader)
 }
 
 func (vpn *VPN) doStartSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, addrs []*net.UDPAddr) {
@@ -1416,6 +1436,9 @@ func (vpn *VPN) doStartSendingPings(peerAddr AddrInfo, remoteUsualPort uint16, a
 func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
+	vpn.logger.Debugf("considerKnownPeer")
+	defer vpn.logger.Debugf("/considerKnownPeer")
+
 	if !IsDisabledChannel(ChannelTypeDirect) {
 		vpn.requestPortInfo(peerAddr.ID, ChannelTypeDirect)
 	}
@@ -1435,6 +1458,10 @@ func (vpn *VPN) considerKnownPeer(peerAddr AddrInfo) (err error) {
 
 func (vpn *VPN) startSendingPings(peerAddr AddrInfo) (err error) {
 	defer func() { err = errors.Wrap(err) }()
+
+	vpn.logger.Debugf("startSendingPings")
+	defer vpn.logger.Debugf("/startSendingPings")
+
 	var remoteUsualPort uint16
 	var addrs []*net.UDPAddr
 	for _, maddr := range peerAddr.Addrs {
