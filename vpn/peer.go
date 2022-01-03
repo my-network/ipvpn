@@ -880,6 +880,13 @@ func (peer *Peer) startChannel(chType ChannelType) (err error) {
 		panic(errors.Errorf("should not happen: %v", chType))
 	}
 
+	if chType == ChannelTypeIPFS {
+		err = peer.initTunnerConnToWG()
+		if err != nil {
+			return
+		}
+	}
+
 	if chType != ChannelTypeDirect {
 		err = peer.startTunnelWriter(chType)
 		if err != nil {
@@ -1212,10 +1219,10 @@ func (peer *Peer) startTunnelReader(chType ChannelType) (err error) {
 	go peer.LockDo(func() {
 		switch chType {
 		case ChannelTypeIPFS:
-			err = peer.lazyInitTunnerConnToWG()
-			if err != nil {
-				return
+			if peer.IPFSTunnelConnToWG == nil {
+				panic("peer.IPFSTunnelConnToWG == nil")
 			}
+
 			if peer.IPFSForwarderStream == nil || peer.forwarderStreamTunnelReaderRunning {
 				return
 			}
@@ -1591,24 +1598,16 @@ func (peer *Peer) SetSimpleTunnelConn(conn net.Conn) {
 }
 
 // should be already locked
-func (peer *Peer) lazyInitTunnerConnToWG() (err error) {
+func (peer *Peer) initTunnerConnToWG() (err error) {
 	defer func() { err = errors.Wrap(err) }()
 
-	if peer.IPFSTunnelConnToWG != nil {
-		return
-	}
-
-	peer.VPN.logger.Debugf(`peer<%v>.lazyInitTunnerConnToWG`, peer.ID)
-	defer func() { peer.VPN.logger.Debugf(`/peer<%v>.lazyInitTunnerConnToWG -> %v`, peer.ID, err) }()
+	peer.VPN.logger.Debugf(`peer<%v>.initTunnerConnToWG`, peer.ID)
+	defer func() { peer.VPN.logger.Debugf(`/peer<%v>.initTunnerConnToWG -> %v`, peer.ID, err) }()
 
 	peer.IPFSTunnelConnToWG, peer.IPFSTunnelAddrToWG, err = newUDPListener(&net.UDPAddr{
 		IP:   net.ParseIP(`127.0.0.1`),
 		Port: 0, // automatically assign a free port
 	})
-
-	if err != nil {
-		return
-	}
 
 	return
 }
@@ -1628,9 +1627,8 @@ func (peer *Peer) startTunnelWriter(chType ChannelType) (err error) {
 
 		switch chType {
 		case ChannelTypeIPFS:
-			err = peer.lazyInitTunnerConnToWG()
-			if err != nil {
-				return
+			if peer.IPFSTunnelConnToWG == nil {
+				panic("peer.IPFSTunnelConnToWG == nil")
 			}
 
 			if peer.IPFSForwarderStream == nil || peer.forwarderStreamTunnelWriterRunning {
