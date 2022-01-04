@@ -64,7 +64,6 @@ type VPN struct {
 	ifaceNamePrefix              string
 	dirPath                      string
 	peers                        sync.Map
-	buffer                       [bufferSize]byte
 	privKey                      ed25519.PrivateKey
 	psk                          []byte
 	state                        uint32
@@ -192,6 +191,7 @@ func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
 			peerID := stream.Conn().RemotePeer().String()
 			peerConfig := vpn.Peers[peerID]
 			peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
+			vpn.logger.Debugf("handleUpdateDirectPort: setting peer config for %v to %#+v", peerID, peerConfig)
 			vpn.Peers[peerID] = peerConfig
 		})
 		warnErr := vpn.SaveConfig()
@@ -213,7 +213,8 @@ func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
 		vpn.LockDo(func() {
 			peerID := stream.Conn().RemotePeer().String()
 			peerConfig := vpn.Peers[peerID]
-			peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
+			peerConfig.SimpleTunnelPort = binary.LittleEndian.Uint16(payload)
+			vpn.logger.Debugf("handleUpdateSimpleTunnelPort: setting peer config for %v to %#+v", peerID, peerConfig)
 			vpn.Peers[peerID] = peerConfig
 		})
 		warnErr := vpn.SaveConfig()
