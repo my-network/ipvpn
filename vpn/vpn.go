@@ -167,19 +167,20 @@ func (vpn *VPN) SetNetwork(mesh *network.Network) {
 }
 
 func (vpn *VPN) handleRequestDirectPort(stream Stream, payload []byte) {
-	vpn.logger.Debugf(`handleRequestDirectPort`)
+	vpn.logger.Debugf(`handleRequestDirectPort: %d`, vpn.Config.DirectWGPort)
 
 	vpn.notifyPeerAboutMyPort(stream.Conn().RemotePeer(), ChannelTypeDirect, vpn.Config.DirectWGPort)
 }
 
 func (vpn *VPN) handleRequestSimpleTunnelPort(stream Stream, payload []byte) {
-	vpn.logger.Debugf(`handleRequestSimpleTunnelPort`)
+	vpn.logger.Debugf(`handleRequestSimpleTunnelPort: %d`, vpn.Config.SimpleTunnelPort)
 
 	vpn.notifyPeerAboutMyPort(stream.Conn().RemotePeer(), ChannelTypeTunnel, vpn.Config.SimpleTunnelPort)
 }
 
 func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
-	vpn.logger.Debugf(`handleUpdateDirectPort`)
+	newPort := binary.LittleEndian.Uint16(payload)
+	vpn.logger.Debugf(`handleUpdateDirectPort(): %X -> %d`, payload, newPort)
 
 	if len(payload) != 2 {
 		vpn.logger.Error(errors.Wrap(ErrWrongMessageLength, len(payload), payload))
@@ -190,8 +191,9 @@ func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
 		vpn.LockDo(func() {
 			peerID := stream.Conn().RemotePeer().String()
 			peerConfig := vpn.Peers[peerID]
-			peerConfig.DirectWGPort = binary.LittleEndian.Uint16(payload)
-			vpn.logger.Debugf("handleUpdateDirectPort: setting peer config for %v to %#+v", peerID, peerConfig)
+			oldPort := peerConfig.DirectWGPort
+			peerConfig.DirectWGPort = newPort
+			vpn.logger.Debugf("handleUpdateDirectPort: setting peer config for %v to %#+v: %d -> %d", peerID, peerConfig, oldPort, peerConfig.DirectWGPort)
 			vpn.Peers[peerID] = peerConfig
 		})
 		warnErr := vpn.SaveConfig()
@@ -202,7 +204,8 @@ func (vpn *VPN) handleUpdateDirectPort(stream Stream, payload []byte) {
 }
 
 func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
-	vpn.logger.Debugf(`handleUpdateSimpleTunnelPort`)
+	newPort := binary.LittleEndian.Uint16(payload)
+	vpn.logger.Debugf(`handleUpdateSimpleTunnelPort(): %X -> %d`, payload, newPort)
 
 	if len(payload) != 2 {
 		vpn.logger.Error(errors.Wrap(ErrWrongMessageLength, len(payload), payload))
@@ -213,8 +216,9 @@ func (vpn *VPN) handleUpdateSimpleTunnelPort(stream Stream, payload []byte) {
 		vpn.LockDo(func() {
 			peerID := stream.Conn().RemotePeer().String()
 			peerConfig := vpn.Peers[peerID]
-			peerConfig.SimpleTunnelPort = binary.LittleEndian.Uint16(payload)
-			vpn.logger.Debugf("handleUpdateSimpleTunnelPort: setting peer config for %v to %#+v", peerID, peerConfig)
+			oldPort := peerConfig.SimpleTunnelPort
+			peerConfig.SimpleTunnelPort = newPort
+			vpn.logger.Debugf("handleUpdateSimpleTunnelPort: setting peer config for %v to %#+v: %d -> %d", peerID, peerConfig, oldPort, peerConfig.SimpleTunnelPort)
 			vpn.Peers[peerID] = peerConfig
 		})
 		warnErr := vpn.SaveConfig()

@@ -790,7 +790,8 @@ func (mesh *Network) SetMessageHandler(topic string, handler func(Stream, []byte
 var (
 	sendMessageBufferPool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, bufferSize)
+			b := make([]byte, bufferSize)
+			return &b
 		},
 	}
 )
@@ -827,14 +828,15 @@ func (mesh *Network) SendMessage(peerID peer.ID, topic string, msg []byte) (err 
 	}
 	stream := streamI.(Stream)
 
-	buf := sendMessageBufferPool.Get().([]byte)
+	bufPtr := sendMessageBufferPool.Get().(*[]byte)
+	buf := *bufPtr
 	buf[0] = uint8(MessageTypeCustom)
 	binary.LittleEndian.PutUint16(buf[1:], uint16(len(topic)))
 	copy(buf[1+2:], topic)
 	binary.LittleEndian.PutUint16(buf[1+2+len(topic):], uint16(len(msg)))
 	copy(buf[1+2+len(topic)+2:], msg)
 	_, err = stream.Write(buf[:1+2+len(topic)+2+len(msg)])
-	sendMessageBufferPool.Put(buf)
+	sendMessageBufferPool.Put(bufPtr)
 	return err
 }
 
@@ -845,7 +847,7 @@ func (mesh *Network) onReceiveMessageCustom(stream Stream, topic string, payload
 		return
 	}
 	messageHandler := messageHandlerI.(func(Stream, []byte))
-	mesh.logger.Debugf(`found a message handler for topic "%v"`, topic)
+	mesh.logger.Debugf(`found a message handler for topic "%v" and payload: %X`, topic, payload)
 	messageHandler(stream, payload)
 }
 
