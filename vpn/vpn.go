@@ -1089,8 +1089,13 @@ func (vpn *VPN) SaveConfig() (err error) {
 	}
 
 	configPath := filepath.Join(vpn.dirPath, `config.json`)
-	vpn.logger.Debugf("saving the config %v to %v", vpn.Config, configPath)
-	defer vpn.logger.Debugf("endof: saving the config %v to %v", vpn.Config, configPath)
+	vpn.RLockDo(func() {
+		vpn.logger.Debugf("saving the config %v to %v", vpn.Config, configPath)
+	})
+
+	defer vpn.RLockDo(func() {
+		vpn.logger.Debugf("endof: saving the config %v to %v", vpn.Config, configPath)
+	})
 
 	curNetworkSize := vpn.GetNetworkSize()
 	vpn.LockDo(func() {
