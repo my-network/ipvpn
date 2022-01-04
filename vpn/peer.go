@@ -1477,7 +1477,7 @@ func (peer *Peer) getRemoteRealIP(chType ChannelType) (result net.IP) {
 
 func (peer *Peer) GetOptimalChannel(chTypes ...ChannelType) (optimalChannelType ChannelType) {
 	optimalChannelType = ChannelType_undefined
-	minRTT := time.Duration(time.Second)
+	minRTT := time.Duration(5 * time.Second)
 
 	for _, chType := range chTypes {
 		stats := &peer.channelStatistics[chType]
